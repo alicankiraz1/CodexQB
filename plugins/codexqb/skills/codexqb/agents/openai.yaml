@@ -1,4 +1,4 @@
 interface:
   display_name: "CodexQB"
   short_description: "Repo-aware planning, autopsy, and audit handoff"
-  default_prompt: "Use $codexqb to inspect this repo, create a main plan, run an existing-project autopsy, create phase sub-plans, a QA audit, and a gated implementation handoff."
+  default_prompt: "Use $codexqb to inspect this repo and create a main plan."
