@@ -1209,7 +1209,11 @@ class SkillContentTests(unittest.TestCase):
                 env=env,
                 text=True,
                 capture_output=True,
-                timeout=30,
+                # The filesystem package scan is intentionally byte-safe and can
+                # cross the old 30-second test harness limit on hosted Linux.
+                # Keep this harness ceiling above the scanner's own fail-closed
+                # budgets so a healthy scan is not reported as a CI failure.
+                timeout=120,
                 check=False,
             )
 
@@ -1242,7 +1246,7 @@ class SkillContentTests(unittest.TestCase):
                 env=env,
                 text=True,
                 capture_output=True,
-                timeout=30,
+                timeout=120,
                 check=False,
             )
             self.assertNotEqual(path_result.returncode, 0)
