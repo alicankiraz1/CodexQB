@@ -107,21 +107,48 @@ Repository inspection requirements:
 
 Before writing the plan, inspect the repository safely.
 
-Run only read-only or safe local commands such as:
-- pwd
-- git status --short --branch
-- git branch --show-current
-- git log --oneline -n 10
-- find . -maxdepth 3 \( -path './.git' -o -path './node_modules' -o -path './.venv' -o -path './dist' -o -path './build' -o -path './artifacts' \) -prune -o -type f -print | sort | head -300
-- for d in Planner-docs docs configs scripts services packages tests infra .github; do [ -d "$d" ] && find "$d" -maxdepth 2 -type f | sort | head -80; done
-- ls
-- for d in Planner-docs configs scripts services packages tests; do [ -d "$d" ] && ls "$d"; done
-- cat README.md if present
-- cat AGENTS.md if present
-- inspect pyproject.toml, package.json, Makefile, docker-compose files, CI workflow files, docs indexes, architecture docs, runbooks, test files, config examples, Planner-docs/Planing-Ledger.md, Planner-docs/Project-Ontology.md, and Planner-docs/Project-Comprehension.md if present
+Use the mandatory Step 1 repository boundary:
 
-You may use ripgrep/grep to discover important project markers:
-- rg "TODO|FIXME|Phase|phase|roadmap|architecture|runbook|readiness|activation|production|security|policy|worker|scheduler|gateway|adapter|test|smoke|CI|Linear|GitHub|Temporal|LangGraph|LiteLLM|Codex|OpenCode|Claude|Gemini|API|database|Postgres|queue|artifact|approval|review" . --glob '!.git/**' --glob '!node_modules/**' --glob '!.venv/**' --glob '!dist/**' --glob '!build/**' --glob '!artifacts/**'
+```bash
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller repository-io -- request-stdin
+```
+
+Send each request below as one bounded JSON object directly to the child
+process's stdin through the host process API, invoking the fixed command once
+per object:
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["--root",".","inspect","--profile","step1"]}
+```
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["--root",".","search","--profile","step1"]}
+```
+
+Use the inspection receipt as the sole repository/worktree/VCS evidence; do
+not supplement it with raw Git or filesystem commands.
+
+Read a selected evidence file only with the fixed request-stdin command and this
+stdin data request. The receipt supplies the current SHA-256.
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["--root",".","read-model","--path","<repository-relative-path>"]}
+```
+
+Do not use arbitrary content enumeration or matching commands.
+
+Publish `Planner-docs/Main-Planing.md` only with the fixed request-stdin command
+and this stdin data request:
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["--root",".","write-planner","--stage","step1","--path","Planner-docs/Main-Planing.md","--expected-sha256","<CURRENT_SHA256>"],"body":"<planner-markdown-body>"}
+```
+
+Use a separate validated JSON request containing `--expected-missing` instead
+only when the target is confirmed absent. Never materialize the request with
+echo, printf, a pipe, redirection, a heredoc, command substitution, environment
+variables, shell interpolation, or a temporary/repository file. Missing host
+stdin support or a CAS mismatch is `BLOCKED`; there is no generic write fallback.
 
 If the repo is empty or almost empty:
 - Do not fail.
@@ -350,7 +377,13 @@ After creating/updating Planner-docs/Main-Planing.md:
 3. Check that the document follows the language contract: English by default unless the user explicitly requests another content language, with required headings in English.
 4. Check that it does not contain secrets.
 5. If `Planner-docs/Planing-Ledger.md`, `Planner-docs/Project-Ontology.md`, or `Planner-docs/Project-Comprehension.md` exists, confirm the plan used them as supporting evidence.
-6. Run git diff -- Planner-docs/Main-Planing.md and review the diff.
+6. Invoke the fixed repository-io request-stdin command with the following JSON
+   object on host-provided stdin, compare its receipt to the write receipt, and
+   review the safe model projection:
+
+   ```json
+   {"schema":"codexqb.controller-argv/v1","argv":["--root",".","read-model","--path","Planner-docs/Main-Planing.md"]}
+   ```
 7. Provide a final concise summary of:
    - what file was changed;
    - what current-state conclusion was reached;

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -21,18 +20,37 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-VALIDATOR = REPO_ROOT / "plugins/codexqb/skills/codexqb/scripts/validate_planner_docs.py"
-GOAL_RUN = REPO_ROOT / "plugins/codexqb/skills/codexqb/scripts/goal_run.py"
-APPLY_RUN = REPO_ROOT / "plugins/codexqb/skills/codexqb/scripts/apply_run.py"
 
 if REPO_ROOT.as_posix() not in sys.path:
     sys.path.insert(0, REPO_ROOT.as_posix())
 
+from tests.controller_test_support import (  # noqa: E402
+    assert_real_trust_store_unchanged,
+    controller_cli_command,
+    temporary_controller_home,
+)
 from tests.test_validate_planner_docs import write_audit, write_valid_step2_fixture  # noqa: E402
 
 
+_CONTROLLER_TEST_HOME: Path | None = None
+_SAFE_FAILURE_CODES = frozenset(
+    {
+        "apply_command_repository_root_mismatch",
+        "command_failed",
+        "command_unexpected_success",
+        "controller_test_home_not_initialized",
+        "expected_failure_missing",
+        "unhandled_exception",
+    }
+)
+
+
 def fail(message: str) -> None:
-    print(f"downstream_goal_apply_dry_run_failed={message}")
+    candidate = message.partition("=")[0]
+    code = candidate if candidate in _SAFE_FAILURE_CODES else "unspecified"
+    detail_sha256 = hashlib.sha256(message.encode("utf-8", errors="replace")).hexdigest()
+    print(f"downstream_goal_apply_dry_run_failed_code={code.lower()}")
+    print(f"downstream_goal_apply_dry_run_failed_detail_sha256={detail_sha256}")
     raise SystemExit(1)
 
 
@@ -77,6 +95,22 @@ def parse_key(output: str, key: str) -> str:
             return line.split("=", 1)[1]
     fail(f"missing_output_key={key}")
     raise AssertionError("unreachable")
+
+
+def apply_controller_command(root: Path, args: list[str]) -> list[str]:
+    if _CONTROLLER_TEST_HOME is None:
+        fail("controller_test_home_not_initialized")
+    rooted = list(args)
+    root_positions = [index for index, value in enumerate(rooted) if value == "--root"]
+    if not root_positions:
+        rooted.extend(["--root", root.as_posix()])
+    elif (
+        len(root_positions) != 1
+        or root_positions[0] + 1 >= len(rooted)
+        or Path(rooted[root_positions[0] + 1]).resolve() != root.resolve()
+    ):
+        fail("apply_command_repository_root_mismatch")
+    return controller_cli_command("apply", _CONTROLLER_TEST_HOME, rooted)
 
 
 def write_downstream_code(root: Path) -> None:
@@ -170,16 +204,29 @@ def adapt_validation_commands(docs: Path) -> None:
 
 def run_validator(root: Path, mode: str) -> str:
     return run_command(
-        [sys.executable, VALIDATOR.as_posix(), "--root", root.as_posix(), "--mode", mode, "--strict"],
+        controller_cli_command(
+            "planner-validator",
+            None,
+            [
+                "--root",
+                root.as_posix(),
+                "--mode",
+                mode,
+                "--strict",
+            ],
+        ),
         cwd=root,
     )
 
 
 def prepare_goal(root: Path, stage: str, mode: str, suffix: str) -> Path:
+    if _CONTROLLER_TEST_HOME is None:
+        fail("controller_test_home_not_initialized")
     output = run_command(
-        [
-            sys.executable,
-            GOAL_RUN.as_posix(),
+        controller_cli_command(
+            "goal",
+            _CONTROLLER_TEST_HOME,
+            [
             "prepare",
             "--root",
             root.as_posix(),
@@ -189,7 +236,8 @@ def prepare_goal(root: Path, stage: str, mode: str, suffix: str) -> Path:
             mode,
             "--run-id-suffix",
             suffix,
-        ],
+            ],
+        ),
         cwd=root,
     )
     if "goal_run_status=ready" not in output:
@@ -200,15 +248,17 @@ def prepare_goal(root: Path, stage: str, mode: str, suffix: str) -> Path:
     if not goal_run.is_file() or not prompt.is_file():
         fail(f"goal_outputs_missing={stage}:{mode}")
     run_command(
-        [
-            sys.executable,
-            GOAL_RUN.as_posix(),
+        controller_cli_command(
+            "goal",
+            _CONTROLLER_TEST_HOME,
+            [
             "validate",
             "--root",
             root.as_posix(),
             "--goal-run",
             goal_run.as_posix(),
-        ],
+            ],
+        ),
         cwd=root,
     )
     return out_dir
@@ -238,9 +288,9 @@ def git_checkpoint(root: Path) -> None:
 
 def prepare_apply(root: Path) -> Path:
     output = run_command(
-        [
-            sys.executable,
-            APPLY_RUN.as_posix(),
+        apply_controller_command(
+            root,
+            [
             "prepare",
             "--root",
             root.as_posix(),
@@ -248,7 +298,8 @@ def prepare_apply(root: Path) -> Path:
             "subagent_serial",
             "--run-id-suffix",
             "downstream-dry-run",
-        ],
+            ],
+        ),
         cwd=root,
     )
     run_dir = Path(parse_key(output, "run_dir"))
@@ -293,12 +344,15 @@ def first_task(run_dir: Path) -> tuple[str, str, str, str, bool, list[object]]:
 
 
 def run_apply(root: Path, args: list[str]) -> str:
-    return run_command([sys.executable, APPLY_RUN.as_posix(), *args], cwd=root)
+    return run_command(
+        apply_controller_command(root, args),
+        cwd=root,
+    )
 
 
 def run_apply_expect_failure(root: Path, args: list[str], expected: str) -> str:
     return run_command_expect_failure(
-        [sys.executable, APPLY_RUN.as_posix(), *args],
+        apply_controller_command(root, args),
         cwd=root,
         expected=expected,
     )
@@ -872,15 +926,16 @@ def drive_subagent_apply(root: Path, run_dir: Path) -> None:
 
 
 def main() -> int:
+    global _CONTROLLER_TEST_HOME
     with (
+        assert_real_trust_store_unchanged(),
         tempfile.TemporaryDirectory() as temp_dir,
         tempfile.TemporaryDirectory() as direct_dir,
-        tempfile.TemporaryDirectory() as trust_dir,
+        temporary_controller_home() as controller_home,
     ):
         root = Path(temp_dir)
         direct_root = Path(direct_dir)
-        Path(trust_dir).chmod(0o700)
-        os.environ["CODEXQB_TRUST_ROOT"] = trust_dir
+        _CONTROLLER_TEST_HOME = Path(controller_home)
 
         write_downstream_code(direct_root)
         direct_docs = write_valid_step2_fixture(direct_root)
@@ -932,10 +987,15 @@ def main() -> int:
         )
         print("downstream_direct_lane=trusted_verification_and_finalize_rejected")
         print("downstream_serial_lane=controller_evidence_complete_unattested;trusted_verification_rejected")
-        print(f"downstream_direct_rejection_run_dir={direct_run_dir}")
-        print(f"downstream_apply_run_dir={apply_run_dir}")
+        print(f"downstream_direct_rejection_run_id={direct_run_dir.name}")
+        print(f"downstream_apply_run_id={apply_run_dir.name}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:
+        fail(f"unhandled_exception={type(exc).__name__}:{exc}")

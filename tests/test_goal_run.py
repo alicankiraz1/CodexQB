@@ -3,14 +3,22 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from types import ModuleType
 from unittest import mock
 
+from tests.controller_test_support import (
+    controller_cli_command,
+    real_trust_store_snapshot,
+    temporary_controller_home,
+)
+from tests.held_runtime_test_support import held_runtime_test_provider
 from tests.test_validate_planner_docs import write_audit, write_ledger, write_main_plan_with_phases, write_valid_step2_fixture
 
 
@@ -29,15 +37,127 @@ def load_goal_module():
 
 
 GOAL_MODULE = load_goal_module()
+CONTROLLER_STORE_MODULE = sys.modules["controller_store"]
+EXECUTION_CONTROLLER_MODULE = sys.modules["execution_controller"]
 
 
 class GoalRunTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls._real_trust_before = real_trust_store_snapshot()
+        cls.controller_store = temporary_controller_home()
+        cls._home_path = Path(cls.controller_store.name).resolve()
+        cls._home_provider = mock.patch.object(
+            CONTROLLER_STORE_MODULE,
+            "controller_home_directory",
+            return_value=cls._home_path,
+        )
+        cls._home_provider.start()
+        cls._held_runtime_provider = held_runtime_test_provider()
+        cls._held_runtime_provider.__enter__()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._held_runtime_provider.__exit__(None, None, None)
+        cls._home_provider.stop()
+        cls.controller_store.cleanup()
+        if real_trust_store_snapshot() != cls._real_trust_before:
+            raise AssertionError("real_controller_trust_store_changed_during_goal_tests")
+        super().tearDownClass()
+
     def write_goal_fixture(self, root: Path) -> None:
         docs = write_valid_step2_fixture(root)
         write_audit(docs, "PASS")
 
     def init_git_repo(self, root: Path) -> None:
         subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+
+    def test_skill_resource_reader_rejects_arbitrary_path_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            outside = Path(temp_dir) / "outside"
+            outside.write_text("private", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "untrusted_skill_resource_path"):
+                GOAL_MODULE.read_skill_text(outside)
+
+    def test_skill_resource_reader_requires_held_launcher_provider(self) -> None:
+        provider_name = "_codexqb_held_runtime_context_v1"
+        previous = sys.modules.pop(provider_name, None)
+        try:
+            with self.assertRaisesRegex(ValueError, "held_runtime_context_required"):
+                GOAL_MODULE.read_skill_bytes("references/Autopsy-Planner.md")
+        finally:
+            if previous is not None:
+                sys.modules[provider_name] = previous
+
+    def test_skill_resource_reader_rejects_provider_fingerprint_mutation(self) -> None:
+        provider_name = "_codexqb_held_runtime_context_v1"
+        provider = sys.modules[provider_name]
+        original = provider.goal_resources
+        tampered = dict(original)
+        tampered["references/Autopsy-Planner.md"] = b"MALICIOUS_REFERENCE"
+        provider.goal_resources = tuple(sorted(tampered.items()))
+        try:
+            with self.assertRaisesRegex(ValueError, "held_runtime_context_invalid"):
+                GOAL_MODULE.read_skill_bytes("references/Fourth-Planner.md")
+        finally:
+            provider.goal_resources = original
+
+    def test_skill_resource_reader_rejects_forged_module_before_resource_use(self) -> None:
+        provider_name = "_codexqb_held_runtime_context_v1"
+        original = sys.modules.pop(provider_name)
+        forged = ModuleType(provider_name)
+        forged.schema_version = 1
+        forged.assurance = "controller_observed_loader_path_unattested"
+        forged.host_attested = False
+        forged.verified = False
+        forged.finalization_authority = False
+        forged.runtime_sources = original.runtime_sources
+        resources = dict(original.goal_resources)
+        resources["references/Autopsy-Planner.md"] = b"FORGED_REFERENCE"
+        forged.goal_resources = tuple(sorted(resources.items()))
+        sys.modules[provider_name] = forged
+        try:
+            consumed = False
+            try:
+                GOAL_MODULE.read_skill_bytes("references/Fourth-Planner.md")
+            except ValueError as exc:
+                self.assertEqual(str(exc), "held_runtime_context_invalid")
+            else:
+                consumed = True
+            self.assertFalse(consumed)
+        finally:
+            sys.modules.pop(provider_name, None)
+            sys.modules[provider_name] = original
+
+    def test_provider_scalar_comparison_cannot_run_attacker_eq(self) -> None:
+        marker = {"executed": False}
+
+        class AttackerControlledScalar:
+            def __eq__(self, other: object) -> bool:
+                del other
+                marker["executed"] = True
+                return True
+
+        provider = sys.modules["_codexqb_held_runtime_context_v1"]
+        original = provider.schema_version
+        provider.schema_version = AttackerControlledScalar()
+        try:
+            with self.assertRaisesRegex(ValueError, "held_runtime_context_invalid"):
+                GOAL_MODULE.read_skill_bytes("references/Autopsy-Planner.md")
+        finally:
+            provider.schema_version = original
+        self.assertFalse(marker["executed"])
+
+    def test_goal_resource_pin_inventory_matches_all_eleven_exact_bytes(self) -> None:
+        expected = dict(EXECUTION_CONTROLLER_MODULE.GOAL_RESOURCE_SOURCE_SHA256)
+        actual = dict(sys.modules["_codexqb_held_runtime_context_v1"].goal_resources)
+        self.assertEqual(len(expected), 11)
+        self.assertEqual(set(expected), set(actual))
+        self.assertEqual(
+            expected,
+            {name: GOAL_MODULE.sha256_bytes(payload) for name, payload in actual.items()},
+        )
 
     def rewrite_goal_identity(self, run: dict[str, object]) -> None:
         stage = str(run["stage"])
@@ -70,7 +190,10 @@ class GoalRunTests(unittest.TestCase):
             self.assertEqual(first["run"]["goal_spec_digest"], second["run"]["goal_spec_digest"])
             self.assertNotEqual(first["result"]["goal_run_id"], second["result"]["goal_run_id"])
             out_dir = Path(first["output_dir"])
-            self.assertIn("Planner-docs/Goal-Runs", out_dir.as_posix())
+            self.assertNotIn("Planner-docs/Goal-Runs", out_dir.as_posix())
+            self.assertTrue(
+                out_dir.resolve().is_relative_to(Path(self.controller_store.name).resolve())
+            )
             self.assertTrue((out_dir / "Goal-Run.json").is_file())
             self.assertTrue((out_dir / "Goal-Prompt.md").is_file())
             self.assertTrue((out_dir / "Goal-Result.json").is_file())
@@ -108,6 +231,62 @@ class GoalRunTests(unittest.TestCase):
             self.assertIn("Goal Compiler Safety", prompt)
             self.assertEqual(prompt, GOAL_MODULE.render_prompt_from_run(run))
             self.assertEqual(GOAL_MODULE.validate_goal_run(root, run), [])
+
+    def test_goal_model_facing_repository_evidence_is_projected_before_artifacts(self) -> None:
+        fixture = "sk-" + "Q" * 40
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.write_goal_fixture(root)
+            main = root / "Planner-docs" / "Main-Planing.md"
+            main.write_text(
+                main.read_text(encoding="utf-8")
+                + f"\nProject Name: {fixture}\n",
+                encoding="utf-8",
+            )
+            subplan = root / "Planner-docs" / "Faz-1-Plans" / "Faz1.1-local-contract.md"
+            subplan.write_text(
+                subplan.read_text(encoding="utf-8")
+                + f"\n- security requirement: credential {fixture}\n",
+                encoding="utf-8",
+            )
+            audiences: list[tuple[str, object]] = []
+            original = GOAL_MODULE.RepositoryIO.read_text
+
+            def audited_read_text(repository, path, **kwargs):
+                audiences.append((str(path), kwargs.get("audience")))
+                return original(repository, path, **kwargs)
+
+            with mock.patch.object(
+                GOAL_MODULE.RepositoryIO,
+                "read_text",
+                new=audited_read_text,
+            ):
+                compiled = GOAL_MODULE.compile_goal(
+                    root,
+                    "step2",
+                    run_id_suffix="model-projection",
+                )
+
+            run_dir = Path(compiled["output_dir"])
+            rendered = b"\n".join(
+                path.read_bytes()
+                for path in sorted(run_dir.iterdir())
+                if path.is_file()
+            ).decode("utf-8")
+            self.assertNotIn(fixture, rendered)
+            self.assertIn("<redacted:openai_api_key>", rendered)
+            self.assertTrue(
+                any(
+                    path.endswith("Main-Planing.md") and audience == "model"
+                    for path, audience in audiences
+                )
+            )
+            self.assertTrue(
+                any(
+                    path.endswith("Faz1.1-local-contract.md") and audience == "model"
+                    for path, audience in audiences
+                )
+            )
 
     def test_goal_cli_exception_output_redacts_secret(self) -> None:
         fixture = "sk-" + "R" * 40
@@ -155,7 +334,7 @@ class GoalRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_goal_fixture(root)
-            runs_root = root / "Planner-docs" / "Goal-Runs"
+            runs_root = GOAL_MODULE.goal_runs_root(root)
             before = set(runs_root.iterdir()) if runs_root.exists() else set()
             fixture = "sk-" + "S" * 40
             with self.assertRaisesRegex(ValueError, "secret_like_run_id_suffix"):
@@ -171,7 +350,14 @@ class GoalRunTests(unittest.TestCase):
 
     def test_goal_load_rejects_duplicate_escaped_secret_without_echo(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "Goal-Run.json"
+            root = Path(temp_dir)
+            self.write_goal_fixture(root)
+            compiled = GOAL_MODULE.compile_goal(
+                root,
+                "step2",
+                run_id_suffix="duplicate-secret",
+            )
+            path = Path(compiled["output_dir"]) / "Goal-Run.json"
             fixture = "sk-" + "D" * 40
             escaped = "sk-" + "\\u0044" * 40
             path.write_text(
@@ -179,7 +365,7 @@ class GoalRunTests(unittest.TestCase):
                 encoding="utf-8",
             )
             try:
-                GOAL_MODULE.load_goal_run(path)
+                GOAL_MODULE.load_goal_run(path, root)
             except ValueError as exc:
                 self.assertNotIn(fixture, str(exc))
             else:
@@ -266,162 +452,74 @@ class GoalRunTests(unittest.TestCase):
 
             self.assertEqual(list(real_run.iterdir()), [])
 
-    def test_goal_mount_assurance_fails_before_managed_directory_creation(self) -> None:
+    def test_goal_controller_store_rejects_relaxed_repository_state_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir).resolve()
-            output = root / "Planner-docs" / "Goal-Runs" / "blocked"
-            resolution = object()
-
-            with (
-                mock.patch.object(GOAL_MODULE, "resolve_mount_identity", return_value=resolution) as resolve,
-                mock.patch.object(
-                    GOAL_MODULE,
-                    "require_mount_assurance",
-                    side_effect=ValueError("secure_repository_mount_identity_unavailable"),
-                ) as require,
-                mock.patch.object(GOAL_MODULE, "open_or_create_child_directory") as open_child,
-            ):
+            root = Path(temp_dir)
+            self.write_goal_fixture(root)
+            first = GOAL_MODULE.compile_goal(root, "step2", run_id_suffix="permission-base")
+            state_root = Path(first["output_dir"]).parents[1]
+            state_root.chmod(0o755)
+            try:
                 with self.assertRaisesRegex(
                     ValueError,
-                    "^secure_repository_mount_identity_unavailable$",
+                    "controller_store_directory_not_private",
                 ):
-                    with GOAL_MODULE.open_managed_goal_run_directory(
+                    GOAL_MODULE.compile_goal(
                         root,
-                        output,
-                        create=True,
-                        allow_existing=False,
-                    ):
-                        self.fail("low-assurance Goal directory unexpectedly opened")
-
-            resolve.assert_called_once()
-            self.assertEqual(resolve.call_args.kwargs, {"reconcile": True})
-            require.assert_called_once_with(
-                resolution,
-                GOAL_MODULE.NON_DESTRUCTIVE_ARTIFACT_PACKAGE_CREATION,
-            )
-            open_child.assert_not_called()
-            self.assertFalse((root / "Planner-docs").exists())
-            self.assertFalse((root / ".codexqb").exists())
-
-    def test_goal_nested_mount_mismatch_maps_to_directory_identity_changed(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir).resolve()
-            run_dir = root / "Planner-docs" / "Goal-Runs" / "fixed"
-            run_dir.mkdir(parents=True)
-            sentinel = run_dir / "sentinel.txt"
-            sentinel.write_text("preserve me\n", encoding="utf-8")
-            resolution = object()
-            checked_paths: list[str] = []
-
-            def reject_runs_mount(root_resolution, child_fd, relative_path):
-                checked_paths.append(str(relative_path))
-                if relative_path == "Planner-docs/Goal-Runs":
-                    raise ValueError(
-                        "repository_nested_mount_rejected=Planner-docs/Goal-Runs"
+                        "step2",
+                        run_id_suffix="permission-rejected",
                     )
-                return resolution
+            finally:
+                state_root.chmod(0o700)
 
-            with (
-                mock.patch.object(GOAL_MODULE, "resolve_mount_identity", return_value=resolution),
-                mock.patch.object(GOAL_MODULE, "require_mount_assurance"),
-                mock.patch.object(
-                    GOAL_MODULE,
-                    "require_same_mount",
-                    side_effect=reject_runs_mount,
-                ),
-            ):
+
+    def test_goal_legacy_run_content_is_archive_only_and_not_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.write_goal_fixture(root)
+            legacy = root / "Planner-docs" / "Goal-Runs" / "legacy"
+            legacy.mkdir(parents=True)
+            sentinel = legacy / "Goal-Run.json"
+            sentinel.write_bytes(b"\\xffmalformed legacy content")
+            compiled = GOAL_MODULE.compile_goal(
+                root,
+                "step2",
+                run_id_suffix="external-only",
+            )
+            self.assertFalse(Path(compiled["output_dir"]).is_relative_to(root))
+            self.assertEqual(sentinel.read_bytes(), b"\\xffmalformed legacy content")
+
+
+    def test_goal_controller_run_revalidation_rejects_relaxed_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.write_goal_fixture(root)
+            compiled = GOAL_MODULE.compile_goal(
+                root,
+                "step2",
+                run_id_suffix="revalidate-mode",
+            )
+            run_dir = Path(compiled["output_dir"])
+            run_dir.chmod(0o755)
+            try:
                 with self.assertRaisesRegex(
                     ValueError,
-                    "^invalid_goal_output_dir=directory_identity_changed$",
+                    "controller_store_directory_not_private|controller_run_directory_identity_changed",
                 ):
-                    with GOAL_MODULE.open_managed_goal_run_directory(
+                    GOAL_MODULE.render_goal_file(
                         root,
-                        run_dir,
-                        create=False,
-                        allow_existing=True,
-                    ):
-                        self.fail("nested-mount Goal directory unexpectedly opened")
-
-            self.assertEqual(
-                checked_paths,
-                [".", "Planner-docs", "Planner-docs/Goal-Runs"],
-            )
-            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve me\n")
-
-    def test_goal_atomic_write_revalidates_mount_and_path_identity(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir).resolve()
-            run_dir = root / "Planner-docs" / "Goal-Runs" / "fixed"
-            run_dir.mkdir(parents=True)
-            sentinel = run_dir / "sentinel.txt"
-            sentinel.write_text("preserve me\n", encoding="utf-8")
-            resolution = object()
-            reject_mount = False
-            checked_paths: list[str] = []
-
-            def require_current_mount(root_resolution, child_fd, relative_path):
-                checked_paths.append(str(relative_path))
-                if reject_mount and relative_path == "Planner-docs/Goal-Runs/fixed":
-                    raise ValueError(
-                        "repository_nested_mount_rejected=Planner-docs/Goal-Runs/fixed"
+                        run_dir / "Goal-Run.json",
+                        Path("Goal-Prompt.md"),
                     )
-                return resolution
+            finally:
+                run_dir.chmod(0o700)
 
-            with (
-                mock.patch.object(GOAL_MODULE, "resolve_mount_identity", return_value=resolution),
-                mock.patch.object(GOAL_MODULE, "require_mount_assurance") as require,
-                mock.patch.object(
-                    GOAL_MODULE,
-                    "require_same_mount",
-                    side_effect=require_current_mount,
-                ),
-            ):
-                with GOAL_MODULE.open_managed_goal_run_directory(
-                    root,
-                    run_dir,
-                    create=False,
-                    allow_existing=True,
-                ) as (run_fd, revalidate):
-                    self.assertEqual(
-                        checked_paths[:4],
-                        [
-                            ".",
-                            "Planner-docs",
-                            "Planner-docs/Goal-Runs",
-                            "Planner-docs/Goal-Runs/fixed",
-                        ],
-                    )
-                    checked_paths.clear()
-                    reject_mount = True
-                    with self.assertRaisesRegex(
-                        ValueError,
-                        "^artifact_directory_identity_changed$",
-                    ):
-                        GOAL_MODULE.atomic_write_text_at(
-                            run_fd,
-                            "blocked.txt",
-                            "must not persist\n",
-                            revalidate=revalidate,
-                        )
-
-            self.assertGreaterEqual(require.call_count, 2)
-            self.assertEqual(
-                checked_paths,
-                [
-                    ".",
-                    "Planner-docs",
-                    "Planner-docs/Goal-Runs",
-                    "Planner-docs/Goal-Runs/fixed",
-                ],
-            )
-            self.assertFalse((run_dir / "blocked.txt").exists())
-            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve me\n")
 
     def test_goal_prepare_rejects_artifact_symlink_without_touching_victim(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as outside_dir:
             root = Path(temp_dir)
             self.write_goal_fixture(root)
-            fixed = root / "Planner-docs" / "Goal-Runs" / "fixed"
+            fixed = GOAL_MODULE.goal_runs_root(root) / "fixed"
             GOAL_MODULE.compile_goal(root, "step2", output_dir=fixed)
             victim = Path(outside_dir) / "victim.json"
             victim.write_text("preserve goal victim\n", encoding="utf-8")
@@ -438,13 +536,14 @@ class GoalRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_goal_fixture(root)
-            output = root / "Planner-docs" / "Goal-Runs" / "fixed"
+            output = GOAL_MODULE.goal_runs_root(root) / "fixed"
             GOAL_MODULE.compile_goal(root, "step2", output_dir=output, objective="first objective")
             prompt_path = output / "Goal-Prompt.md"
             result_path = output / "Goal-Result.json"
             before_prompt = prompt_path.read_bytes()
             before_result = result_path.read_bytes()
-            artifact_os = GOAL_MODULE.atomic_write_text_at.__globals__["os"]
+            controller_store_module = sys.modules["controller_store"]
+            artifact_os = controller_store_module.atomic_write_text_at.__globals__["os"]
             real_replace = artifact_os.replace
 
             def fail_prompt_replace(source, destination, *args, **kwargs):
@@ -504,7 +603,11 @@ class GoalRunTests(unittest.TestCase):
     def test_default_cli_reports_blocked_status_for_missing_prerequisites(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             result = subprocess.run(
-                [sys.executable, str(GOAL_RUN), "--root", temp_dir, "--stage", "step4"],
+                controller_cli_command(
+                    "goal",
+                    self._home_path,
+                    ["--root", temp_dir, "--stage", "step4"],
+                ),
                 text=True,
                 capture_output=True,
                 check=False,
@@ -723,7 +826,7 @@ class GoalRunTests(unittest.TestCase):
 
             self.assertNotEqual(first["run"]["goal_spec_id"], second["run"]["goal_spec_id"])
             self.assertNotEqual(first["result"]["goal_run_id"], second["result"]["goal_run_id"])
-            fixed = root / "Planner-docs" / "Goal-Runs" / "fixed"
+            fixed = GOAL_MODULE.goal_runs_root(root) / "fixed"
             GOAL_MODULE.compile_goal(root, "step2", mode="wave", objective="A", output_dir=fixed)
             with self.assertRaises(ValueError):
                 GOAL_MODULE.compile_goal(root, "step2", mode="wave", objective="A", output_dir=fixed)
@@ -1163,7 +1266,7 @@ class GoalRunTests(unittest.TestCase):
                 GOAL_MODULE.validate_goal_run(root, run),
             )
 
-    def test_goal_git_evidence_never_executes_configured_external_diff(self) -> None:
+    def test_goal_git_evidence_rejects_configured_external_diff_without_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.init_git_repo(root)
@@ -1202,13 +1305,13 @@ class GoalRunTests(unittest.TestCase):
             )
             tracked.write_text("after\n", encoding="utf-8")
 
-            baseline = GOAL_MODULE.workspace_baseline(root, [])
+            with self.assertRaisesRegex(
+                ValueError,
+                "repository_io_workspace_proof_failed",
+            ):
+                GOAL_MODULE.workspace_baseline(root, [])
 
             self.assertFalse(marker.exists())
-            self.assertNotEqual(
-                baseline["unstaged_diff_hash"],
-                GOAL_MODULE.sha256_bytes(b""),
-            )
 
     def test_missing_mutable_output_is_distinguishable_from_immutable_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

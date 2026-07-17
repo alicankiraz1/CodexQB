@@ -7,10 +7,82 @@ CodexQB generates without editing or normalizing them.
 
 from __future__ import annotations
 
+import sys
+
+if __name__ == "__main__" and not (
+    sys.flags.isolated
+    and sys.flags.no_site
+    and sys.flags.dont_write_bytecode
+    and sys.flags.optimize == 0
+):
+    sys.stderr.write(
+        "codexqb_controller=unsupported "
+        "reason=requires_python_-I_-S_-B_first_process\n"
+    )
+    raise SystemExit(2)
+
+from types import ModuleType
+
+
+def _launcher_admission_is_valid(expected_basename: str) -> bool:
+    context = sys.modules.get("_codexqb_held_runtime_context_v1")
+    if not isinstance(context, ModuleType):
+        return False
+    try:
+        state = ModuleType.__getattribute__(context, "__dict__")
+    except (AttributeError, TypeError):
+        return False
+    runtime_sources = state.get("runtime_sources")
+    if (
+        type(expected_basename) is not str
+        or not expected_basename
+        or type(state.get("__name__")) is not str
+        or state.get("__name__") != "_codexqb_held_runtime_context_v1"
+        or type(state.get("schema_version")) is not int
+        or state.get("schema_version") != 1
+        or type(state.get("assurance")) is not str
+        or state.get("assurance")
+        != "controller_observed_loader_path_unattested"
+        or state.get("host_attested") is not False
+        or state.get("verified") is not False
+        or state.get("finalization_authority") is not False
+        or "runtime_sha256" in state
+        or "goal_sha256" in state
+        or type(runtime_sources) is not tuple
+        or not runtime_sources
+    ):
+        return False
+    source_names: list[str] = []
+    for item in runtime_sources:
+        if type(item) is not tuple or len(item) != 2:
+            return False
+        source_name, source = item
+        if (
+            type(source_name) is not str
+            or not source_name
+            or type(source) is not bytes
+            or not source
+        ):
+            return False
+        source_names.append(source_name)
+    return bool(
+        tuple(source_names) == tuple(sorted(source_names))
+        and len(source_names) == len(set(source_names))
+        and expected_basename in source_names
+    )
+
+if __name__ == "__main__" and not _launcher_admission_is_valid(
+    "validate_planner_docs.py"
+):
+    sys.stderr.write(
+        "codexqb_controller=unsupported reason=launcher_admission_required\n"
+    )
+    raise SystemExit(2)
+
+
 import argparse
 import json
 import re
-import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +98,13 @@ from safety_contracts import (  # noqa: E402
     safe_validation_argv as shared_safe_validation_argv,
     safe_validation_command_item as shared_safe_validation_command_item,
     secret_match_locations,
+)
+from repository_io import (  # noqa: E402
+    RepositoryIO,
+    _controller_canonical_root as canonical_repository_root,
+    _controller_directories as controller_directories,
+    _controller_regular_paths as controller_regular_paths,
+    open_repository_io,
 )
 
 
@@ -388,6 +467,7 @@ class ValidationState:
     root: Path
     mode: str
     strict: bool
+    repository: RepositoryIO
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     metrics: dict[str, int | str] = field(default_factory=dict)
@@ -408,17 +488,54 @@ class ValidationState:
     def warning(self, message: str) -> None:
         self.warnings.append(message)
 
+    def regular_paths(self, profile: str) -> tuple[str, ...]:
+        return controller_regular_paths(self.repository, profile)
+
+    def directories(self, profile: str) -> tuple[str, ...]:
+        return controller_directories(self.repository, profile)
+
+    def path_kind(self, path: Path | str) -> str:
+        relative = path if isinstance(path, str) else self.rel(path)
+        candidate = Path(relative)
+        if (
+            not relative
+            or candidate.is_absolute()
+            or "\\" in relative
+            or candidate.as_posix() != relative
+            or any(part in {"", ".", ".."} for part in candidate.parts)
+        ):
+            raise ValueError("repository_path_must_be_relative")
+        if relative in self.regular_paths("step3"):
+            return "regular"
+        if relative in self.directories("step3"):
+            return "directory"
+        return "missing"
+
+    def file_exists(self, path: Path | str) -> bool:
+        return self.path_kind(path) == "regular"
+
+    def directory_exists(self, path: Path | str) -> bool:
+        return self.path_kind(path) == "directory"
+
 
 def read_text(path: Path, state: ValidationState) -> str | None:
-    if not path.exists():
-        state.error(f"missing_file={state.rel(path)}")
-        return None
     try:
-        return path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        state.error(f"non_utf8_file={state.rel(path)}")
+        evidence = state.repository.read_text(
+            state.rel(path),
+            required=False,
+            audience="internal",
+        )
+        if not evidence.exists:
+            state.error(f"missing_file={state.rel(path)}")
+            return None
+        return evidence.text
+    except ValueError as exc:
+        if str(exc).startswith("repository_io_non_utf8_text="):
+            state.error(f"non_utf8_file={state.rel(path)}")
+        else:
+            state.error(f"read_error={state.rel(path)}:{str(exc).split('=', 1)[0]}")
     except OSError as exc:
-        state.error(f"read_error={state.rel(path)}:{exc}")
+        state.error(f"read_error={state.rel(path)}:{type(exc).__name__}")
     return None
 
 
@@ -592,12 +709,7 @@ def resolve_within_root(root: Path, rel_path: str) -> Path | None:
     target = Path(target_text)
     if target.is_absolute() or ".." in target.parts:
         return None
-    candidate = (root / target).resolve(strict=False)
-    try:
-        candidate.relative_to(root.resolve())
-    except ValueError:
-        return None
-    return candidate
+    return root / target
 
 
 def safe_subplan_path(state: ValidationState, value: str) -> tuple[Path | None, str | None]:
@@ -612,8 +724,10 @@ def safe_subplan_path(state: ValidationState, value: str) -> tuple[Path | None, 
     resolved = resolve_within_root(state.root, target_text)
     if resolved is None:
         return None, "unsafe"
-    if not resolved.exists():
+    if state.path_kind(target_text) == "missing":
         return resolved, "missing"
+    if state.path_kind(target_text) != "regular":
+        return None, "unsafe"
     return resolved, None
 
 
@@ -753,13 +867,17 @@ def extract_main_phase_numbers(text: str) -> list[int]:
 
 def collect_phase_folders(state: ValidationState) -> dict[int, Path]:
     folders: dict[int, Path] = {}
-    if not state.planner_docs.exists():
+    if not state.directory_exists("Planner-docs"):
         state.error("missing_directory=Planner-docs")
         return folders
 
-    for folder in sorted(state.planner_docs.glob("Faz-*-Plans")):
-        if not folder.is_dir():
-            continue
+    directories = state.directories("step3")
+    for relative in sorted(
+        path
+        for path in directories
+        if path.startswith("Planner-docs/Faz-") and path.count("/") == 1
+    ):
+        folder = state.root / relative
         match = FOLDER_RE.match(folder.name)
         if not match:
             state.error(f"invalid_phase_folder={state.rel(folder)}")
@@ -773,12 +891,25 @@ def collect_phase_folders(state: ValidationState) -> dict[int, Path]:
 
 def collect_subplans(state: ValidationState) -> list[tuple[int | None, int | None, Path]]:
     result: list[tuple[int | None, int | None, Path]] = []
-    for folder in sorted(state.planner_docs.glob("Faz-*-Plans")):
-        if not folder.is_dir():
-            continue
+    directories = state.directories("step3")
+    paths = state.regular_paths("step3")
+    folders = sorted(
+        path
+        for path in directories
+        if path.startswith("Planner-docs/Faz-") and path.count("/") == 1
+    )
+    for folder_relative in folders:
+        folder = state.root / folder_relative
         folder_match = FOLDER_RE.match(folder.name)
         folder_phase = int(folder_match.group(1)) if folder_match else None
-        for path in sorted(folder.glob("*.md")):
+        for relative in sorted(
+            path
+            for path in paths
+            if path.startswith(f"{folder_relative}/")
+            and path.count("/") == 2
+            and path.endswith(".md")
+        ):
+            path = state.root / relative
             match = SUBPLAN_RE.match(path.name)
             if not match:
                 state.error(f"invalid_subplan_filename={state.rel(path)}")
@@ -1136,8 +1267,9 @@ def validate_step1(state: ValidationState) -> list[int]:
 
 def validate_autopsy_optional(state: ValidationState) -> None:
     autopsy_path = state.planner_docs / "Autopsy.md"
-    state.metrics["autopsy_exists"] = "true" if autopsy_path.exists() else "false"
-    if not autopsy_path.exists():
+    exists = state.file_exists(autopsy_path)
+    state.metrics["autopsy_exists"] = "true" if exists else "false"
+    if not exists:
         return
 
     text = read_text(autopsy_path, state)
@@ -1149,8 +1281,9 @@ def validate_autopsy_optional(state: ValidationState) -> None:
 
 def validate_autopsy_required(state: ValidationState) -> None:
     autopsy_path = state.planner_docs / "Autopsy.md"
-    state.metrics["autopsy_exists"] = "true" if autopsy_path.exists() else "false"
-    if not autopsy_path.exists():
+    exists = state.file_exists(autopsy_path)
+    state.metrics["autopsy_exists"] = "true" if exists else "false"
+    if not exists:
         state.error("missing_file=Planner-docs/Autopsy.md")
         return
 
@@ -1195,8 +1328,9 @@ def validate_ontology_provenance_tables(text: str, path: Path, state: Validation
 
 def validate_optional_comprehension_doc(state: ValidationState) -> None:
     path = state.planner_docs / "Project-Comprehension.md"
-    state.metrics["comprehension_exists"] = "true" if path.exists() else "false"
-    if not path.exists():
+    exists = state.file_exists(path)
+    state.metrics["comprehension_exists"] = "true" if exists else "false"
+    if not exists:
         return
 
     text = read_text(path, state)
@@ -1426,11 +1560,13 @@ def validate_optional_continuity_docs(state: ValidationState) -> None:
     ontology_path = state.planner_docs / "Project-Ontology.md"
     ledger_path = state.planner_docs / "Planing-Ledger.md"
 
-    state.metrics["ontology_exists"] = "true" if ontology_path.exists() else "false"
-    state.metrics["ledger_exists"] = "true" if ledger_path.exists() else "false"
-    state.metrics["comprehension_exists"] = "true" if (state.planner_docs / "Project-Comprehension.md").exists() else "false"
+    ontology_exists = state.file_exists(ontology_path)
+    ledger_exists = state.file_exists(ledger_path)
+    state.metrics["ontology_exists"] = "true" if ontology_exists else "false"
+    state.metrics["ledger_exists"] = "true" if ledger_exists else "false"
+    state.metrics["comprehension_exists"] = "true" if state.file_exists("Planner-docs/Project-Comprehension.md") else "false"
 
-    if ontology_path.exists():
+    if ontology_exists:
         text = read_text(ontology_path, state)
         if text is not None:
             validate_artifact_frontmatter(text, ontology_path, state)
@@ -1438,7 +1574,7 @@ def validate_optional_continuity_docs(state: ValidationState) -> None:
             validate_ontology_competency_questions(text, ontology_path, state)
             validate_ontology_provenance_tables(text, ontology_path, state)
 
-    if ledger_path.exists():
+    if ledger_exists:
         text = read_text(ledger_path, state)
         if text is not None:
             validate_artifact_frontmatter(text, ledger_path, state)
@@ -1976,10 +2112,11 @@ def validate_step2(state: ValidationState) -> None:
 def validate_step3_preflight(state: ValidationState) -> None:
     validate_step2(state)
     audit_path = state.planner_docs / "Sub-Planing-Audit.md"
-    state.metrics["audit_exists"] = "true" if audit_path.exists() else "false"
-    if state.mode == "all" and not audit_path.exists():
+    audit_exists = state.file_exists(audit_path)
+    state.metrics["audit_exists"] = "true" if audit_exists else "false"
+    if state.mode == "all" and not audit_exists:
         state.error("missing_file=Planner-docs/Sub-Planing-Audit.md")
-    if audit_path.exists():
+    if audit_exists:
         text = read_text(audit_path, state)
         if text is not None:
             validate_heading_order(text, AUDIT_HEADINGS, audit_path, state)
@@ -2184,13 +2321,17 @@ def validate_step4_readiness(state: ValidationState) -> None:
 
 def scan_secrets(state: ValidationState) -> None:
     secret_findings = 0
-    root = state.planner_docs if state.planner_docs.exists() else state.root
-    for path in sorted(root.rglob("*")):
-        if not path.is_file() or ".git" in path.parts:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
+    profile = "step3" if state.directory_exists("Planner-docs") else "intake"
+    try:
+        paths = state.regular_paths(profile)
+    except (OSError, TypeError, ValueError) as exc:
+        state.error(f"repository_secret_scan_failed={str(exc).split('=', 1)[0]}")
+        state.metrics["secret_findings"] = 0
+        return
+    for relative in paths:
+        path = state.root / relative
+        text = read_text(path, state)
+        if text is None:
             continue
         for name, offset in secret_match_locations(text):
             secret_findings += 1
@@ -2242,29 +2383,43 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def run_validation(root: Path, mode: str, strict: bool = False) -> int:
-    state = ValidationState(root=root.resolve(), mode=mode, strict=strict)
+    try:
+        with open_repository_io(root) as repository:
+            state = ValidationState(
+                root=canonical_repository_root(repository),
+                mode=mode,
+                strict=strict,
+                repository=repository,
+            )
 
-    if mode == "step1":
-        validate_step1(state)
-    elif mode == "autopsy":
-        validate_step1(state)
-        validate_autopsy_required(state)
-        validate_optional_continuity_docs(state)
-    elif mode == "step2":
-        validate_step2(state)
-    elif mode == "step3-preflight":
-        validate_step3_preflight(state)
-    elif mode == "step3":
-        validate_step3_post_audit(state)
-    elif mode == "all":
-        validate_step3_post_audit(state)
-    elif mode == "step4":
-        validate_step4_readiness(state)
-    else:
-        state.error(f"unknown_mode={mode}")
+            if mode == "step1":
+                validate_step1(state)
+            elif mode == "autopsy":
+                validate_step1(state)
+                validate_autopsy_required(state)
+                validate_optional_continuity_docs(state)
+            elif mode == "step2":
+                validate_step2(state)
+            elif mode == "step3-preflight":
+                validate_step3_preflight(state)
+            elif mode == "step3":
+                validate_step3_post_audit(state)
+            elif mode == "all":
+                validate_step3_post_audit(state)
+            elif mode == "step4":
+                validate_step4_readiness(state)
+            else:
+                state.error(f"unknown_mode={mode}")
 
-    scan_secrets(state)
-    return finalize(state)
+            scan_secrets(state)
+            return finalize(state)
+    except (OSError, TypeError, ValueError) as exc:
+        reason = str(exc).split("=", 1)[0].split(":", 1)[0]
+        print("planner_docs_validation=failed")
+        print("validation_status=failed")
+        print(f"mode={mode}")
+        print(f"error=repository_io_failed={safe_log_text(reason)}")
+        return 2
 
 
 def main(argv: list[str]) -> int:

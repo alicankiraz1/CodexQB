@@ -15,6 +15,11 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+from tests.controller_test_support import (
+    controller_cli_command,
+    real_trust_store_snapshot,
+)
+from tests.held_runtime_test_support import held_runtime_test_provider
 from tests.test_validate_planner_docs import write_audit, write_ledger, write_valid_step2_fixture
 
 
@@ -33,14 +38,30 @@ def load_apply_module():
 
 
 APPLY_MODULE = load_apply_module()
+EXECUTION_MODULE = sys.modules["execution_controller"]
+CONTROLLER_STORE_MODULE = sys.modules["controller_store"]
+SAFETY_MODULE = sys.modules["safety_contracts"]
+SAFE_TEST_HOME_PARENT = Path(
+    CONTROLLER_STORE_MODULE.pwd.getpwuid(
+        CONTROLLER_STORE_MODULE.controller_effective_uid()
+    ).pw_dir
+).resolve()
 VALIDATION_OUTPUT_SHA256 = APPLY_MODULE.sha256_bytes(b"validation passed\n")
 
 
-def append_event_worker(run_dir: str, index: int, barrier) -> None:
+def temporary_safe_home() -> tempfile.TemporaryDirectory[str]:
+    return tempfile.TemporaryDirectory(
+        prefix=".codexqb-test-home-",
+        dir=SAFE_TEST_HOME_PARENT,
+    )
+
+
+def append_event_worker(root: str, run_dir: str, index: int, barrier) -> None:
     barrier.wait()
     APPLY_MODULE.append_event(
         Path(run_dir),
         {"event_type": "parallel_probe", "actor": f"worker-{index}"},
+        root=Path(root),
     )
 
 
@@ -80,19 +101,128 @@ class ApplyRunTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls._trust_directory = tempfile.TemporaryDirectory()
-        os.chmod(cls._trust_directory.name, 0o700)
-        cls._trust_environment = mock.patch.dict(
-            os.environ,
-            {APPLY_MODULE.CODEXQB_TRUST_ROOT_ENV: cls._trust_directory.name},
+        cls._real_trust_store_before_class = real_trust_store_snapshot()
+        cls._home_directory = temporary_safe_home()
+        cls._home_path = Path(cls._home_directory.name).resolve()
+        os.chmod(cls._home_path, 0o700)
+        cls._controller_store_module = CONTROLLER_STORE_MODULE
+        cls._home_provider = mock.patch.object(
+            cls._controller_store_module,
+            "controller_home_directory",
+            return_value=cls._home_path,
         )
-        cls._trust_environment.start()
+        cls._home_provider.start()
+        cls._held_runtime_provider = held_runtime_test_provider()
+        cls._held_runtime_provider.__enter__()
 
     @classmethod
     def tearDownClass(cls) -> None:
-        cls._trust_environment.stop()
-        cls._trust_directory.cleanup()
-        super().tearDownClass()
+        try:
+            cls._held_runtime_provider.__exit__(None, None, None)
+            cls._home_provider.stop()
+            cls._home_directory.cleanup()
+            if real_trust_store_snapshot() != cls._real_trust_store_before_class:
+                raise AssertionError("real_controller_trust_store_changed_during_apply_tests")
+        finally:
+            super().tearDownClass()
+
+    def setUp(self) -> None:
+        self._real_trust_store_before_test = real_trust_store_snapshot()
+
+    def tearDown(self) -> None:
+        if real_trust_store_snapshot() != self._real_trust_store_before_test:
+            raise AssertionError("real_controller_trust_store_changed_during_apply_test")
+
+    def test_stdin_request_keeps_agent_report_out_of_shell_and_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            marker = root / "SHELL_MARKER"
+            hostile = "reviewer's note'; touch SHELL_MARKER; #"
+            report = json.dumps(
+                {
+                    "status": "DONE",
+                    "task_id": "TASK-001",
+                    "implementer_agent_id": "agent-001",
+                    "files_changed": [hostile],
+                    "concerns": [],
+                },
+                sort_keys=True,
+            )
+            request = json.dumps(
+                {
+                    "schema": "codexqb.controller-argv/v1",
+                    "argv": [
+                        "normalize-writer",
+                        "--root",
+                        ".",
+                        "--run-dir",
+                        "missing-run",
+                        "--task-id",
+                        "TASK-001",
+                        "--role",
+                        "implementer",
+                        "--agent-id",
+                        "agent-001",
+                        "--report-json",
+                        report,
+                        "--actor",
+                        "controller",
+                    ],
+                },
+                sort_keys=True,
+            )
+            completed = subprocess.run(
+                controller_cli_command(
+                    "apply", self._home_path, ["request-stdin"]
+                ),
+                cwd=root,
+                input=request,
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 1)
+            self.assertFalse(marker.exists())
+            self.assertEqual(completed.stdout, "")
+            self.assertEqual(
+                completed.stderr,
+                "apply_run_status=failed\nerror=controller_request_failed\n",
+            )
+            self.assertNotIn(hostile, completed.stderr)
+            self.assertNotIn(request, completed.stderr)
+
+    def test_stdin_request_rejects_duplicate_recursive_and_oversize_envelopes(self) -> None:
+        cases = (
+            '{"schema":"codexqb.controller-argv/v1","schema":"duplicate","argv":[]}',
+            json.dumps(
+                {
+                    "schema": "codexqb.controller-argv/v1",
+                    "argv": ["request-stdin"],
+                }
+            ),
+            "x" * (APPLY_MODULE.MAX_CONTROLLER_STDIN_REQUEST_BYTES + 1),
+        )
+        for request in cases:
+            with self.subTest(prefix=request[:24]), tempfile.TemporaryDirectory() as temp_dir:
+                completed = subprocess.run(
+                    controller_cli_command(
+                        "apply", self._home_path, ["request-stdin"]
+                    ),
+                    cwd=temp_dir,
+                    input=request,
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(completed.stdout, "")
+                self.assertEqual(
+                    completed.stderr,
+                    "apply_run_status=failed\nerror=controller_request_rejected\n",
+                )
+                self.assertNotIn(request[:128], completed.stderr)
 
     def write_apply_fixture(self, root: Path) -> None:
         docs = write_valid_step2_fixture(root)
@@ -117,6 +247,20 @@ class ApplyRunTests(unittest.TestCase):
             encoding="utf-8",
         )
         write_audit(docs, "PASS")
+
+    def test_create_apply_run_rejects_group_writable_repository_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "repository"
+            root.mkdir()
+            root.chmod(0o777)
+            try:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "repository_io_owner_controlled_root_failed",
+                ):
+                    self.create_apply_run(root, "subagent_serial")
+            finally:
+                root.chmod(0o700)
 
     def write_no_action_fixture(self, root: Path) -> None:
         docs = write_valid_step2_fixture(root)
@@ -143,7 +287,12 @@ class ApplyRunTests(unittest.TestCase):
         progress = json.loads((run_dir / "Progress.json").read_text(encoding="utf-8"))
         return progress["tasks"][0]["task_id"]
 
-    def mark_task_verified(self, run_dir: Path, security: str = "not_required") -> None:
+    def mark_task_verified(
+        self,
+        root: Path,
+        run_dir: Path,
+        security: str = "not_required",
+    ) -> None:
         """Write an intentionally untrusted VERIFIED claim for negative tests."""
 
         progress = json.loads((run_dir / "Progress.json").read_text(encoding="utf-8"))
@@ -177,6 +326,7 @@ class ApplyRunTests(unittest.TestCase):
                     "evidence": ["synthetic negative fixture"],
                     "writer_lock": None,
                 },
+            root=root,
             )
         brief_hash = task["brief_sha256"]
         patch = "\n".join(
@@ -255,11 +405,12 @@ class ApplyRunTests(unittest.TestCase):
         task = progress["tasks"][0]
         task_id = task["task_id"]
 
-        APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller")
+        APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller", root=root)
         APPLY_MODULE.record_agent_status(
-            run_dir, task_id, "implementer", "impl-1", "spawned", "controller"
+            run_dir, task_id, "implementer", "impl-1", "spawned", "controller",
+            root=root
         )
-        APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-1")
+        APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-1", root=root)
         (root / "src").mkdir(exist_ok=True)
         (root / "tests").mkdir(exist_ok=True)
         (root / "src" / "feature_1_1.py").write_text("VALUE = 1\n", encoding="utf-8")
@@ -282,6 +433,7 @@ class ApplyRunTests(unittest.TestCase):
                 "concerns": [],
             },
             "controller",
+        root=root,
         )
         APPLY_MODULE.record_agent_status(
             run_dir,
@@ -291,9 +443,10 @@ class ApplyRunTests(unittest.TestCase):
             "completed",
             "controller",
             summary="implementation complete",
+        root=root,
         )
-        APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTED", "impl-1")
-        APPLY_MODULE.capture_task_change_set(run_dir, task_id, "controller")
+        APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTED", "impl-1", root=root)
+        APPLY_MODULE.capture_task_change_set(run_dir, task_id, "controller", root=root)
 
         with tempfile.TemporaryDirectory() as command_bin:
             python_link = Path(command_bin) / "python3"
@@ -303,7 +456,8 @@ class ApplyRunTests(unittest.TestCase):
                 progress = json.loads((run_dir / "Progress.json").read_text(encoding="utf-8"))
                 for command in progress["tasks"][0]["validation_commands"]:
                     receipt = APPLY_MODULE.execute_planned_validation(
-                        run_dir, task_id, command["id"], "controller"
+                        run_dir, task_id, command["id"], "controller",
+                        root=root
                     )
                     self.assertEqual(receipt["exit_code"], 0)
 
@@ -330,14 +484,16 @@ class ApplyRunTests(unittest.TestCase):
                 "diff_sha256": APPLY_MODULE.sha256_bytes(patch.encode("utf-8")),
             },
             "controller",
+        root=root,
         )
-        APPLY_MODULE.transition_task_state(run_dir, task_id, "TASK_REVIEW", "controller")
+        APPLY_MODULE.transition_task_state(run_dir, task_id, "TASK_REVIEW", "controller", root=root)
         if stop_before_reviews:
             return
 
         def complete_review(role: str, phase: str, agent_id: str) -> None:
             APPLY_MODULE.prepare_dispatch_packet(
-                run_dir, task_id, role, "controller", review_phase=phase
+                run_dir, task_id, role, "controller", review_phase=phase,
+                root=root
             )
             APPLY_MODULE.record_agent_status(
                 run_dir,
@@ -347,6 +503,7 @@ class ApplyRunTests(unittest.TestCase):
                 "spawned",
                 "controller",
                 review_phase=phase,
+            root=root,
             )
             APPLY_MODULE.normalize_review_report(
                 run_dir,
@@ -362,6 +519,7 @@ class ApplyRunTests(unittest.TestCase):
                     "evidence": [f"{phase} review completed"],
                 },
                 "controller",
+            root=root,
             )
             APPLY_MODULE.record_agent_status(
                 run_dir,
@@ -372,19 +530,20 @@ class ApplyRunTests(unittest.TestCase):
                 "controller",
                 summary=f"{phase} review complete",
                 review_phase=phase,
+            root=root,
             )
-            APPLY_MODULE.publish_review_completion(run_dir, task_id, phase, "controller")
+            APPLY_MODULE.publish_review_completion(run_dir, task_id, phase, "controller", root=root)
 
         complete_review("task_reviewer", "spec", "spec-review-1")
         complete_review("task_reviewer", "quality", "quality-review-1")
         if stop_after_quality:
             return
         if task.get("security_review_required") is True:
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "SECURITY_REVIEW", "controller")
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "SECURITY_REVIEW", "controller", root=root)
             complete_review("security_reviewer", "security", "security-review-1")
         complete_review("final_reviewer", "final", "final-review-1")
         if transition_verified:
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "VERIFIED", "controller")
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "VERIFIED", "controller", root=root)
 
     def prepare_task_for_validation(
         self,
@@ -393,12 +552,14 @@ class ApplyRunTests(unittest.TestCase):
     ) -> tuple[Path, str]:
         run_dir = Path(self.create_apply_run(root, "subagent_serial")["run_dir"])
         task_id = self.first_task_id(run_dir)
-        APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller")
+        APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller", root=root)
         APPLY_MODULE.record_agent_status(
-            run_dir, task_id, "implementer", "validation-impl", "spawned", "controller"
+            run_dir, task_id, "implementer", "validation-impl", "spawned", "controller",
+            root=root
         )
         APPLY_MODULE.transition_task_state(
-            run_dir, task_id, "IMPLEMENTING", "validation-impl"
+            run_dir, task_id, "IMPLEMENTING", "validation-impl",
+            root=root
         )
         (root / "src").mkdir(exist_ok=True)
         (root / "tests").mkdir(exist_ok=True)
@@ -417,6 +578,7 @@ class ApplyRunTests(unittest.TestCase):
                 "concerns": [],
             },
             "controller",
+        root=root,
         )
         APPLY_MODULE.record_agent_status(
             run_dir,
@@ -425,11 +587,13 @@ class ApplyRunTests(unittest.TestCase):
             "validation-impl",
             "completed",
             "controller",
+        root=root,
         )
         APPLY_MODULE.transition_task_state(
-            run_dir, task_id, "IMPLEMENTED", "validation-impl"
+            run_dir, task_id, "IMPLEMENTED", "validation-impl",
+            root=root
         )
-        APPLY_MODULE.capture_task_change_set(run_dir, task_id, "controller")
+        APPLY_MODULE.capture_task_change_set(run_dir, task_id, "controller", root=root)
         return run_dir, task_id
 
     def test_init_subagent_serial_creates_safe_artifacts(self) -> None:
@@ -461,6 +625,7 @@ class ApplyRunTests(unittest.TestCase):
             self.assertEqual(run["max_writer_agents"], 1)
             self.assertEqual(run["max_subagent_depth"], 1)
             self.assertEqual(run["budget_contract"]["max_selected_tasks"], 4)
+
             self.assertEqual(run["budget_contract"]["max_agent_attempts_per_role"], 2)
             self.assertEqual(run["budget_contract"]["max_fix_cycles"], 2)
             self.assertEqual(run["token_usage"]["status"], "not_observed")
@@ -513,7 +678,130 @@ class ApplyRunTests(unittest.TestCase):
             self.assertIn("security_review_required: true", brief)
             self.assertIn("validation_command_ids: VAL-01", brief)
             self.assertIn('"id":"VAL-01"', brief)
-            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir), [])
+            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir, root=root), [])
+
+    def test_apply_model_facing_repository_evidence_is_projected_before_artifacts(self) -> None:
+        fixture = "sk-" + "Q" * 40
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.write_apply_fixture(root)
+            audit = root / "Planner-docs" / "Sub-Planing-Audit.md"
+            audit.write_text(
+                audit.read_text(encoding="utf-8").replace(
+                    "| none | independent | Contract complete",
+                    f"| none | dependency-{fixture} | Contract complete",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            subplan = root / "Planner-docs" / "Faz-1-Plans" / "Faz1.1-local-contract.md"
+            subplan.write_text(
+                subplan.read_text(encoding="utf-8")
+                + f"\n- security requirement: credential {fixture}\n",
+                encoding="utf-8",
+            )
+            audiences: list[tuple[str, object]] = []
+            original = APPLY_MODULE.RepositoryIO.read_text
+
+            def audited_read_text(repository, path, **kwargs):
+                audiences.append((str(path), kwargs.get("audience")))
+                return original(repository, path, **kwargs)
+
+            validation = {
+                "validator_status": "passed",
+                "execution_queue_state": "READY",
+                "validator_output_sha256": "a" * 64,
+            }
+            with (
+                mock.patch.object(
+                    APPLY_MODULE.RepositoryIO,
+                    "read_text",
+                    new=audited_read_text,
+                ),
+                mock.patch.object(
+                    APPLY_MODULE,
+                    "validate_step4_queue",
+                    return_value=validation,
+                ),
+            ):
+                result = self.create_apply_run(
+                    root,
+                    "subagent_serial",
+                    run_id_suffix="model-projection",
+                )
+
+            run_dir = Path(result["run_dir"])
+            rendered = b"\n".join(
+                path.read_bytes()
+                for path in sorted(run_dir.rglob("*"))
+                if path.is_file()
+            ).decode("utf-8")
+            self.assertNotIn(fixture, rendered)
+            self.assertIn("<redacted:openai_api_key>", rendered)
+            self.assertTrue(
+                any(
+                    path.endswith("Sub-Planing-Audit.md") and audience == "model"
+                    for path, audience in audiences
+                )
+            )
+            self.assertTrue(
+                any(
+                    path.endswith("Faz1.1-local-contract.md") and audience == "model"
+                    for path, audience in audiences
+                )
+            )
+
+    def test_model_projection_cannot_create_readiness_or_contract_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.write_apply_fixture(root)
+            audit = root / "Planner-docs" / "Sub-Planing-Audit.md"
+            audit.write_text(
+                audit.read_text(encoding="utf-8").replace(
+                    " | READY | ", " | R&#69;ADY | ", 1
+                ),
+                encoding="utf-8",
+            )
+            with APPLY_MODULE.open_repository_io(root) as repository:
+                internal = APPLY_MODULE.repository_internal_text(
+                    root,
+                    "Planner-docs/Sub-Planing-Audit.md",
+                    required=True,
+                    repository=repository,
+                )
+                projected = APPLY_MODULE.repository_model_text(
+                    root,
+                    "Planner-docs/Sub-Planing-Audit.md",
+                    required=True,
+                    repository=repository,
+                )
+                self.assertIn("R&#69;ADY", internal or "")
+                self.assertNotIn("R&#69;ADY", projected or "")
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "repository_model_projection_semantic_mismatch",
+                ):
+                    APPLY_MODULE.extract_ready_queue(root, repository)
+
+            subplan = root / "Planner-docs" / "Faz-1-Plans" / "Faz1.1-local-contract.md"
+            subplan.write_text(
+                subplan.read_text(encoding="utf-8").replace(
+                    '"contract_version"',
+                    "&#34;contract_version&#34;",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            with APPLY_MODULE.open_repository_io(root) as repository:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "repository_model_projection_semantic_mismatch",
+                ):
+                    APPLY_MODULE.repository_contract_binding(
+                        root,
+                        "Planner-docs/Faz-1-Plans/Faz1.1-local-contract.md",
+                        repository=repository,
+                    )
 
     def test_apply_rejects_policy_envelope_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -584,7 +872,7 @@ class ApplyRunTests(unittest.TestCase):
             task_id = self.first_task_id(run_dir)
 
             for attempt in range(1, 3):
-                APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller", [f"packet {attempt}"])
+                APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller", [f"packet {attempt}"], root=root)
                 APPLY_MODULE.record_agent_status(
                     run_dir,
                     task_id,
@@ -593,6 +881,7 @@ class ApplyRunTests(unittest.TestCase):
                     "spawned",
                     "controller",
                     [f"spawn {attempt}"],
+                root=root,
                 )
                 APPLY_MODULE.record_agent_status(
                     run_dir,
@@ -603,10 +892,11 @@ class ApplyRunTests(unittest.TestCase):
                     "controller",
                     [f"failure {attempt}"],
                     "recoverable setup failure",
+                root=root,
                 )
 
             with self.assertRaisesRegex(ValueError, f"budget_max_agent_attempts_exceeded={task_id}:implementer"):
-                APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller", ["third packet"])
+                APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller", ["third packet"], root=root)
 
     def test_apply_validator_rejects_attempt_and_fix_cycle_over_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -761,7 +1051,7 @@ class ApplyRunTests(unittest.TestCase):
             result = self.create_apply_run(root, "subagent_serial")
             run_dir = Path(result["run_dir"])
             task_id = self.first_task_id(run_dir)
-            APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller", ["packet ready"])
+            APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller", ["packet ready"], root=root)
             packet_path = run_dir / task_id / "Dispatch-Packet.json"
             packet = json.loads(packet_path.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -827,6 +1117,7 @@ class ApplyRunTests(unittest.TestCase):
                         "implementer",
                         "controller",
                         ["probe"],
+                    root=root,
                     )
 
             self.assertTrue(swapped["done"])
@@ -841,7 +1132,7 @@ class ApplyRunTests(unittest.TestCase):
             self.write_apply_fixture(root)
             result = self.create_apply_run(root, "direct")
             run_dir = Path(result["run_dir"])
-            self.mark_task_verified(run_dir, "pass")
+            self.mark_task_verified(root, run_dir, "pass")
             task_id = self.first_task_id(run_dir)
             report_path = run_dir / task_id / "Implementer-Report.json"
             report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -875,8 +1166,11 @@ class ApplyRunTests(unittest.TestCase):
             errors = APPLY_MODULE.validate_apply_run(run_dir, root)
 
             self.assertIn(f"invalid_artifact_file={task_id}_implementer_report", errors)
-            with self.assertRaisesRegex(ValueError, "invalid_artifact_file"):
-                APPLY_MODULE.finalize_apply_run(run_dir, "controller", ["probe"])
+            with self.assertRaisesRegex(
+                ValueError,
+                "invalid_artifact_file|apply_run_provenance_unverified",
+            ):
+                APPLY_MODULE.finalize_apply_run(run_dir, "controller", ["probe"], root=root)
             self.assertEqual((run_dir / "Events.jsonl").read_bytes(), before_events)
 
     def test_validate_rejects_symlinked_verified_review_patch(self) -> None:
@@ -885,7 +1179,7 @@ class ApplyRunTests(unittest.TestCase):
             self.write_apply_fixture(root)
             result = self.create_apply_run(root, "direct")
             run_dir = Path(result["run_dir"])
-            self.mark_task_verified(run_dir)
+            self.mark_task_verified(root, run_dir)
             task_id = self.first_task_id(run_dir)
             patch_path = run_dir / task_id / "Review-Package.patch"
             victim = Path(outside_dir) / "review-package-victim.patch"
@@ -906,7 +1200,7 @@ class ApplyRunTests(unittest.TestCase):
             task_id = self.first_task_id(run_dir)
 
             with self.assertRaisesRegex(ValueError, "subagent_dispatch_packet_missing"):
-                APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-1", ["started"])
+                APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-1", ["started"], root=root)
 
             prepared = APPLY_MODULE.prepare_dispatch_packet(
                 run_dir,
@@ -914,6 +1208,7 @@ class ApplyRunTests(unittest.TestCase):
                 "implementer",
                 "controller",
                 ["controller prepared fresh implementer dispatch"],
+            root=root,
             )
             packet_path = Path(prepared["packet_path"])
             packet = json.loads(packet_path.read_text(encoding="utf-8"))
@@ -926,7 +1221,7 @@ class ApplyRunTests(unittest.TestCase):
             self.assertIn('"outputs": [', packet["spawn_request"]["message"])
             self.assertIsNone(packet["model_override"])
             with self.assertRaisesRegex(ValueError, "subagent_dispatch_spawn_required"):
-                APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-1", ["started"])
+                APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-1", ["started"], root=root)
             APPLY_MODULE.record_agent_status(
                 run_dir,
                 task_id,
@@ -935,10 +1230,11 @@ class ApplyRunTests(unittest.TestCase):
                 "spawned",
                 "controller",
                 ["spawned implementer"],
+            root=root,
             )
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-1", ["started"])
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-1", ["started"], root=root)
             with self.assertRaisesRegex(ValueError, "subagent_dispatch_completion_required"):
-                APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTED", "impl-1", ["done"])
+                APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTED", "impl-1", ["done"], root=root)
             APPLY_MODULE.normalize_writer_report(
                 run_dir,
                 task_id,
@@ -952,6 +1248,7 @@ class ApplyRunTests(unittest.TestCase):
                     "concerns": [],
                 },
                 "controller",
+            root=root,
             )
             APPLY_MODULE.record_agent_status(
                 run_dir,
@@ -962,9 +1259,10 @@ class ApplyRunTests(unittest.TestCase):
                 "controller",
                 ["implementer completed"],
                 "implementation finished",
+            root=root,
             )
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTED", "impl-1", ["done"])
-            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir), [])
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTED", "impl-1", ["done"], root=root)
+            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir, root=root), [])
 
     def test_failed_subagent_dispatch_can_be_redispatched_before_implementation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -974,7 +1272,7 @@ class ApplyRunTests(unittest.TestCase):
             run_dir = Path(result["run_dir"])
             task_id = self.first_task_id(run_dir)
 
-            APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller", ["first packet"])
+            APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller", ["first packet"], root=root)
             APPLY_MODULE.record_agent_status(
                 run_dir,
                 task_id,
@@ -983,6 +1281,7 @@ class ApplyRunTests(unittest.TestCase):
                 "spawned",
                 "controller",
                 ["first spawn"],
+            root=root,
             )
             APPLY_MODULE.record_agent_status(
                 run_dir,
@@ -993,8 +1292,9 @@ class ApplyRunTests(unittest.TestCase):
                 "controller",
                 ["agent failed before code changes"],
                 "spawn failed before implementation",
+            root=root,
             )
-            second = APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller", ["second packet"])
+            second = APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller", ["second packet"], root=root)
             packet = json.loads(Path(second["packet_path"]).read_text(encoding="utf-8"))
             APPLY_MODULE.record_agent_status(
                 run_dir,
@@ -1004,6 +1304,7 @@ class ApplyRunTests(unittest.TestCase):
                 "spawned",
                 "controller",
                 ["second spawn"],
+            root=root,
             )
 
             progress = json.loads((run_dir / "Progress.json").read_text(encoding="utf-8"))
@@ -1012,7 +1313,7 @@ class ApplyRunTests(unittest.TestCase):
             self.assertEqual(packet["attempt"], 2)
             self.assertEqual([run["status"] for run in task["agent_runs"]], ["failed", "spawned"])
             self.assertEqual(task["dispatch"]["agent_id"], "agent-impl-2")
-            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir), [])
+            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir, root=root), [])
 
     def test_no_action_mode_has_no_queue(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1076,7 +1377,7 @@ class ApplyRunTests(unittest.TestCase):
 
             for candidate in (root.parent, Path.home(), Path(root.anchor)):
                 with self.subTest(candidate=candidate):
-                    with self.assertRaisesRegex(ValueError, "output_dir must be inside the target repository"):
+                    with self.assertRaisesRegex(ValueError, "invalid_apply_run_output_dir"):
                         APPLY_MODULE.resolve_managed_apply_run_dir(root.resolve(), candidate, lexical_root=root)
 
     def test_apply_replace_rejects_managed_parent_nested_and_markerless_directories(self) -> None:
@@ -1085,16 +1386,25 @@ class ApplyRunTests(unittest.TestCase):
             with self.subTest(candidate=candidate), tempfile.TemporaryDirectory() as temp_dir:
                 root = Path(temp_dir)
                 self.write_no_action_fixture(root)
-                managed_parent = root / ".codexqb" / "apply-runs"
+                managed_parent = APPLY_MODULE.managed_apply_runs_root(root)
+                bootstrap = managed_parent / "bootstrap"
+                self.create_apply_run(
+                    root,
+                    "no_action",
+                    bootstrap,
+                    run_id_suffix="bootstrap",
+                )
                 if candidate == "managed-parent":
                     target = managed_parent
                 elif candidate == "nested-child":
-                    target = managed_parent / "fixed" / "nested"
+                    target = bootstrap / "nested"
                 else:
                     target = managed_parent / "markerless"
-                target.mkdir(parents=True, exist_ok=True)
+                target.mkdir(parents=True, exist_ok=True, mode=0o700)
+                target.chmod(0o700)
                 sentinel = target / "sentinel.txt"
                 sentinel.write_text("preserve me\n", encoding="utf-8")
+                sentinel.chmod(0o600)
 
                 with mock.patch.object(
                     shutil,
@@ -1115,8 +1425,18 @@ class ApplyRunTests(unittest.TestCase):
             victim.mkdir()
             sentinel = victim / "sentinel.txt"
             sentinel.write_text("preserve me\n", encoding="utf-8")
-            managed_parent = root / ".codexqb" / "apply-runs"
-            managed_parent.mkdir(parents=True)
+            with mock.patch.object(
+                self._controller_store_module,
+                "controller_home_directory",
+                return_value=self._home_path,
+            ):
+                with self._controller_store_module.open_controller_runs_root(
+                    root,
+                    self._controller_store_module.APPLY_RUN_COMPONENTS,
+                    create=True,
+                ) as (_runs_fd, managed_parent):
+                    pass
+            self.assertTrue(managed_parent.is_relative_to(self._home_path))
             linked_run = managed_parent / "linked"
             linked_run.symlink_to(victim, target_is_directory=True)
 
@@ -1130,22 +1450,29 @@ class ApplyRunTests(unittest.TestCase):
 
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve me\n")
 
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as outside_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            indirect = root / "indirect-codexqb"
-            (indirect / "apply-runs" / "fixed").mkdir(parents=True)
-            sentinel = indirect / "apply-runs" / "fixed" / "sentinel.txt"
+            indirect = Path(outside_dir) / "indirect-controller-store"
+            indirect.mkdir(mode=0o700)
+            sentinel = indirect / "sentinel.txt"
             sentinel.write_text("preserve me\n", encoding="utf-8")
-            (root / ".codexqb").symlink_to(indirect, target_is_directory=True)
+            linked_store = Path(outside_dir) / "controller-store-link"
+            linked_store.symlink_to(indirect, target_is_directory=True)
 
-            with mock.patch.object(
-                shutil,
-                "rmtree",
-                side_effect=AssertionError("unsafe recursive delete reached"),
+            with mock.patch.dict(
+                os.environ,
+                {"CODEXQB_CONTROLLER_STORE_ROOT": str(linked_store)},
+            ), mock.patch.object(
+                self._controller_store_module,
+                "controller_home_directory",
+                return_value=self._home_path,
             ):
-                with self.assertRaisesRegex(ValueError, "invalid_apply_run_output_dir=indirect_target_rejected"):
-                    self.create_apply_run(root, "no_action", root / ".codexqb" / "apply-runs" / "fixed", replace=True)
+                with self._controller_store_module.open_controller_store(create=True) as (
+                    _fd,
+                    opened_store,
+                ):
+                    self.assertTrue(opened_store.is_relative_to(self._home_path))
 
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve me\n")
 
@@ -1153,7 +1480,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
             self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
             marker = fixed / ".codexqb-apply-run.json"
             self.assertTrue(marker.is_file())
@@ -1170,7 +1497,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
             self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
             marker = fixed / ".codexqb-apply-run.json"
             marker_target = root / "marker-target.json"
@@ -1188,7 +1515,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            legitimate = root / ".codexqb" / "apply-runs" / "legitimate"
+            legitimate = APPLY_MODULE.managed_apply_runs_root(root) / "legitimate"
             self.create_apply_run(root, "no_action", legitimate, run_id_suffix="first")
             forged = root / "src"
             forged.mkdir()
@@ -1211,7 +1538,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            managed_parent = root / ".codexqb" / "apply-runs"
+            managed_parent = APPLY_MODULE.managed_apply_runs_root(root)
             fixed = managed_parent / "fixed"
             first = self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
             stale = fixed / "stale.txt"
@@ -1231,7 +1558,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
             victim = root / "arbitrary-victim"
             victim.mkdir()
             sentinel = victim / "sentinel.txt"
@@ -1251,7 +1578,10 @@ class ApplyRunTests(unittest.TestCase):
                 "create_apply_run_registration",
                 side_effect=swap_before_registration,
             ):
-                with self.assertRaisesRegex(ValueError, "indirect_target_rejected"):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "indirect_target_rejected|replace_apply_run_tree_contains_indirect_target",
+                ):
                     self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
 
             self.assertTrue(state["swapped"])
@@ -1267,7 +1597,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
 
             with mock.patch.object(
                 APPLY_MODULE,
@@ -1308,7 +1638,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
             self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
             sentinel = fixed / "sentinel.txt"
             sentinel.write_text("preserve current run\n", encoding="utf-8")
@@ -1352,7 +1682,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
             self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
             registration = (
                 fixed.parent
@@ -1372,7 +1702,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
             self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
             sentinel = fixed / "sentinel.txt"
             sentinel.write_text("preserve run\n", encoding="utf-8")
@@ -1420,7 +1750,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
             self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
             mounted = fixed / "mounted"
             mounted.mkdir()
@@ -1441,7 +1771,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            managed_parent = root / ".codexqb" / "apply-runs"
+            managed_parent = APPLY_MODULE.managed_apply_runs_root(root)
             fixed = managed_parent / "fixed"
             self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
             nested = fixed / ".000-nested"
@@ -1494,14 +1824,14 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
             self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
             target = fixed / ".000-target.txt"
             target.write_text("preserve original\n", encoding="utf-8")
             external_victim = root / "external-victim.txt"
             external_victim.write_text("preserve external victim\n", encoding="utf-8")
             original_quarantine_rename = APPLY_MODULE.atomic_rename_no_replace
-            original_rename = APPLY_MODULE.os.rename
+            original_rename = os.rename
             state = {"swapped": False}
 
             def swap_then_quarantine(
@@ -1582,7 +1912,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            managed_parent = root / ".codexqb" / "apply-runs"
+            managed_parent = APPLY_MODULE.managed_apply_runs_root(root)
             fixed = managed_parent / "fixed"
             self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
             sentinel = fixed / "sentinel.txt"
@@ -1604,14 +1934,14 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
             self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
             target = fixed / ".000-target.txt"
             target.write_text("preserve original\n", encoding="utf-8")
             external_victim = root / "external-victim.txt"
             external_victim.write_text("preserve external victim\n", encoding="utf-8")
             original_quarantine_rename = APPLY_MODULE.atomic_rename_no_replace
-            original_rename = APPLY_MODULE.os.rename
+            original_rename = os.rename
             state = {"source_swapped": False, "restore_conflicted": False}
 
             def race_source_and_restore(
@@ -1682,7 +2012,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            managed_parent = root / ".codexqb" / "apply-runs"
+            managed_parent = APPLY_MODULE.managed_apply_runs_root(root)
             fixed = managed_parent / "fixed"
             self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
             sentinel = fixed / "sentinel.txt"
@@ -1742,10 +2072,10 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            legitimate = root / ".codexqb" / "apply-runs" / "legitimate"
+            legitimate = APPLY_MODULE.managed_apply_runs_root(root) / "legitimate"
             self.create_apply_run(root, "no_action", legitimate, run_id_suffix="legitimate")
             synthetic_run = json.loads((legitimate / "Apply-Run.json").read_text(encoding="utf-8"))
-            forged = root / ".codexqb" / "apply-runs" / "forged"
+            forged = APPLY_MODULE.managed_apply_runs_root(root) / "forged"
             forged.mkdir(mode=0o700)
             marker = APPLY_MODULE.apply_run_marker_payload(root, forged, synthetic_run)
             (forged / "Apply-Run.json").write_text(json.dumps(synthetic_run), encoding="utf-8")
@@ -1758,7 +2088,7 @@ class ApplyRunTests(unittest.TestCase):
                 "registration_version": APPLY_MODULE.APPLY_RUN_REGISTRATION_VERSION,
                 "registration_id": synthetic_run["apply_run_registration_id"],
                 "run_name": forged.name,
-                "run_dir": forged.relative_to(root).as_posix(),
+                "run_dir": APPLY_MODULE.apply_run_logical_path(root, forged),
                 "run_device": forged_metadata.st_dev,
                 "run_inode": forged_metadata.st_ino,
                 "manifest_claim_sha256": APPLY_MODULE.apply_run_manifest_claim_digest(synthetic_run),
@@ -1792,7 +2122,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
             self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
             sentinel = fixed / "sentinel.txt"
             sentinel.write_text("preserve me\n", encoding="utf-8")
@@ -1813,7 +2143,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
             self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
             sentinel = fixed / "sentinel.txt"
             sentinel.write_text("preserve me\n", encoding="utf-8")
@@ -1830,88 +2160,136 @@ class ApplyRunTests(unittest.TestCase):
                 self.create_apply_run(root, "no_action", fixed, replace=True, run_id_suffix="second")
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve me\n")
 
+    def test_apply_registration_mac_is_domain_separated(self) -> None:
+        key = b"K" * APPLY_MODULE.CODEXQB_TRUST_KEY_BYTES
+        proof = mock.Mock(
+            repository_identity_sha256="a" * 64,
+            root_device=17,
+            root_inode=23,
+        )
+        with mock.patch.object(
+            APPLY_MODULE,
+            "load_or_create_apply_run_trust_key",
+            return_value=key,
+        ):
+            signed = APPLY_MODULE.signed_apply_run_registration(
+                proof,
+                {"run_name": "fixed"},
+                create_key=False,
+            )
+            self.assertTrue(APPLY_MODULE.trusted_apply_run_registration(proof, signed))
+            unsigned = {
+                name: value
+                for name, value in signed.items()
+                if name != "registration_mac"
+            }
+            encoded = json.dumps(
+                unsigned,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            legacy = dict(signed)
+            legacy["registration_mac"] = APPLY_MODULE.hmac.new(
+                key,
+                encoded,
+                APPLY_MODULE.hashlib.sha256,
+            ).hexdigest()
+            self.assertFalse(APPLY_MODULE.trusted_apply_run_registration(proof, legacy))
+
     def test_apply_replace_fails_closed_when_external_trust_key_is_not_private(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as trust_dir:
+        with tempfile.TemporaryDirectory() as temp_dir, temporary_safe_home() as home_dir:
             root = Path(temp_dir)
-            trust_root = Path(trust_dir)
-            trust_root.chmod(0o700)
+            home = Path(home_dir).resolve()
+            home.chmod(0o700)
+            trust_root = home / ".codex" / "codexqb-trust"
             self.write_no_action_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
-            with mock.patch.dict(
-                os.environ,
-                {APPLY_MODULE.CODEXQB_TRUST_ROOT_ENV: str(trust_root)},
+            with mock.patch.object(
+                self._controller_store_module,
+                "controller_home_directory",
+                return_value=home,
             ):
-                self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
-                sentinel = fixed / "sentinel.txt"
-                sentinel.write_text("preserve me\n", encoding="utf-8")
+                APPLY_MODULE.load_or_create_apply_run_trust_key(create=True)
                 (trust_root / APPLY_MODULE.CODEXQB_TRUST_KEY_NAME).chmod(0o644)
 
                 with self.assertRaisesRegex(ValueError, "codexqb_trust_key_permissions_invalid"):
-                    self.create_apply_run(root, "no_action", fixed, replace=True, run_id_suffix="second")
-
-                self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve me\n")
+                    APPLY_MODULE.load_or_create_apply_run_trust_key(create=False)
 
     def test_missing_initialized_trust_key_requires_recovery_instead_of_rotation(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as trust_dir:
+        with tempfile.TemporaryDirectory() as temp_dir, temporary_safe_home() as home_dir:
             root = Path(temp_dir)
-            trust_root = Path(trust_dir)
-            trust_root.chmod(0o700)
+            home = Path(home_dir).resolve()
+            home.chmod(0o700)
+            trust_root = home / ".codex" / "codexqb-trust"
             self.write_no_action_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
-            second = root / ".codexqb" / "apply-runs" / "second"
-            with mock.patch.dict(
-                os.environ,
-                {APPLY_MODULE.CODEXQB_TRUST_ROOT_ENV: str(trust_root)},
+            with mock.patch.object(
+                self._controller_store_module,
+                "controller_home_directory",
+                return_value=home,
             ):
-                self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
-                sentinel = fixed / "sentinel.txt"
-                sentinel.write_text("preserve first run\n", encoding="utf-8")
+                APPLY_MODULE.load_or_create_apply_run_trust_key(create=True)
                 self.assertTrue((trust_root / APPLY_MODULE.CODEXQB_TRUST_STATE_NAME).is_file())
                 (trust_root / APPLY_MODULE.CODEXQB_TRUST_KEY_NAME).unlink()
 
                 with self.assertRaisesRegex(ValueError, "codexqb_trust_key_recovery_required"):
-                    self.create_apply_run(root, "no_action", second, run_id_suffix="second")
+                    APPLY_MODULE.load_or_create_apply_run_trust_key(create=True)
 
-                self.assertFalse(second.exists())
-                self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve first run\n")
+    def test_preseeded_or_crash_orphan_trust_key_is_never_adopted(self) -> None:
+        with temporary_safe_home() as home_dir:
+            home = Path(home_dir).resolve()
+            home.chmod(0o700)
+            trust_root = home / ".codex" / "codexqb-trust"
+            with mock.patch.object(
+                self._controller_store_module,
+                "controller_home_directory",
+                return_value=home,
+            ):
+                trust_fd = APPLY_MODULE.open_codexqb_trust_root_fd(create=True)
+                try:
+                    APPLY_MODULE.create_apply_run_trust_key(trust_fd)
+                finally:
+                    os.close(trust_fd)
+                self.assertFalse(
+                    (trust_root / APPLY_MODULE.CODEXQB_TRUST_STATE_NAME).exists()
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "codexqb_trust_key_recovery_required",
+                ):
+                    APPLY_MODULE.load_or_create_apply_run_trust_key(create=True)
+                self.assertFalse(
+                    (trust_root / APPLY_MODULE.CODEXQB_TRUST_STATE_NAME).exists()
+                )
 
     def test_trust_root_fstat_failure_closes_open_descriptor(self) -> None:
-        with tempfile.TemporaryDirectory() as trust_dir:
-            trust_root = Path(trust_dir)
-            trust_root.chmod(0o700)
-            original_open = os.open
-            original_fstat = os.fstat
-            opened = {"fd": None}
-
-            def track_trust_root_open(path, flags, *args, **kwargs):
-                descriptor = original_open(path, flags, *args, **kwargs)
-                if Path(path) == trust_root and kwargs.get("dir_fd") is None:
-                    opened["fd"] = descriptor
-                return descriptor
-
-            def fail_trust_root_fstat(descriptor):
-                if descriptor == opened["fd"]:
-                    raise OSError("synthetic_trust_root_fstat_failure")
-                return original_fstat(descriptor)
-
-            with mock.patch.dict(
-                os.environ,
-                {APPLY_MODULE.CODEXQB_TRUST_ROOT_ENV: str(trust_root)},
-            ), mock.patch.object(
-                APPLY_MODULE.os,
-                "open",
-                side_effect=track_trust_root_open,
-            ), mock.patch.object(
-                APPLY_MODULE.os,
-                "fstat",
-                side_effect=fail_trust_root_fstat,
-            ):
+        with mock.patch.object(
+            APPLY_MODULE,
+            "open_controller_trust_root_fd",
+            side_effect=OSError("synthetic_trust_root_open_failure"),
+        ):
                 with self.assertRaisesRegex(ValueError, "codexqb_trust_store_unavailable"):
                     APPLY_MODULE.open_codexqb_trust_root_fd(create=False)
 
-            self.assertIsNotNone(opened["fd"])
-            with self.assertRaises(OSError):
-                original_fstat(opened["fd"])
+    def test_trust_root_environment_overrides_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as hostile_dir:
+            hostile = Path(hostile_dir).resolve()
+            hostile.chmod(0o700)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": str(hostile),
+                    "CODEXQB_TRUST_ROOT": str(hostile),
+                    "CODEXQB_CONTROLLER_STORE_ROOT": str(hostile),
+                },
+            ):
+                descriptor = APPLY_MODULE.open_codexqb_trust_root_fd(create=True)
+                try:
+                    opened = os.fstat(descriptor)
+                    expected = (
+                        self._home_path / ".codex" / "codexqb-trust"
+                    ).stat()
+                    self.assertEqual((opened.st_dev, opened.st_ino), (expected.st_dev, expected.st_ino))
+                finally:
+                    os.close(descriptor)
 
     def test_child_open_helpers_close_descriptor_when_fstat_fails(self) -> None:
         cases = (("directory", APPLY_MODULE.open_child_directory), ("regular", APPLY_MODULE.open_regular_child))
@@ -1941,12 +2319,12 @@ class ApplyRunTests(unittest.TestCase):
 
                 try:
                     with mock.patch.object(
-                        APPLY_MODULE.os,
-                        "open",
+                        APPLY_MODULE,
+                        "controller_open",
                         side_effect=track_child_open,
                     ), mock.patch.object(
-                        APPLY_MODULE.os,
-                        "fstat",
+                        APPLY_MODULE,
+                        "controller_fstat",
                         side_effect=fail_child_fstat,
                     ):
                         with self.assertRaisesRegex(OSError, "synthetic_child_fstat_failure"):
@@ -1960,7 +2338,7 @@ class ApplyRunTests(unittest.TestCase):
     def test_registry_parent_fstat_failure_closes_registry_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            managed_parent = root / ".codexqb" / "apply-runs"
+            managed_parent = APPLY_MODULE.managed_apply_runs_root(root)
             registry = managed_parent / APPLY_MODULE.APPLY_RUN_REGISTRY_DIR_NAME
             registry.mkdir(parents=True, mode=0o700)
             parent_fd = os.open(managed_parent, APPLY_MODULE.secure_directory_open_flags())
@@ -1981,12 +2359,12 @@ class ApplyRunTests(unittest.TestCase):
 
             try:
                 with mock.patch.object(
-                    APPLY_MODULE.os,
-                    "open",
+                    APPLY_MODULE,
+                    "controller_open",
                     side_effect=track_registry_open,
                 ), mock.patch.object(
-                    APPLY_MODULE.os,
-                    "fstat",
+                    APPLY_MODULE,
+                    "controller_fstat",
                     side_effect=fail_parent_fstat,
                 ):
                     with self.assertRaisesRegex(OSError, "synthetic_registry_parent_fstat_failure"):
@@ -2001,7 +2379,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
             self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
             sentinel = fixed / "sentinel.txt"
             sentinel.write_text("preserve me\n", encoding="utf-8")
@@ -2022,11 +2400,13 @@ class ApplyRunTests(unittest.TestCase):
             root_b = container / "repo-b"
             root_a.mkdir()
             root_b.mkdir()
+            fixed_by_label: dict[str, Path] = {}
             for root, label in ((root_a, "A"), (root_b, "B")):
                 self.write_no_action_fixture(root)
-                fixed = root / ".codexqb" / "apply-runs" / "fixed"
+                fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
                 self.create_apply_run(root, "no_action", fixed, run_id_suffix=f"first-{label}")
                 (fixed / "sentinel.txt").write_text(label, encoding="utf-8")
+                fixed_by_label[label] = fixed
             stashed_a = container / "repo-a-stashed"
             original_open = APPLY_MODULE.open_managed_apply_runs_root_fd
             state = {"swapped": False}
@@ -2056,26 +2436,25 @@ class ApplyRunTests(unittest.TestCase):
                 "open_managed_apply_runs_root_fd",
                 side_effect=swap_before_managed_open,
             ):
-                with self.assertRaisesRegex(ValueError, "root_identity_changed"):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "root_identity_changed|apply_run_controller_state_missing",
+                ):
                     self.create_apply_run(
                         root_a,
                         "no_action",
-                        root_a / ".codexqb" / "apply-runs" / "fixed",
+                        APPLY_MODULE.managed_apply_runs_root(root_a) / "fixed",
                         replace=True,
                         run_id_suffix="second",
                     )
 
             self.assertTrue(state["swapped"])
             self.assertEqual(
-                (stashed_a / ".codexqb" / "apply-runs" / "fixed" / "sentinel.txt").read_text(
-                    encoding="utf-8"
-                ),
+                (fixed_by_label["A"] / "sentinel.txt").read_text(encoding="utf-8"),
                 "A",
             )
             self.assertEqual(
-                (root_a / ".codexqb" / "apply-runs" / "fixed" / "sentinel.txt").read_text(
-                    encoding="utf-8"
-                ),
+                (fixed_by_label["B"] / "sentinel.txt").read_text(encoding="utf-8"),
                 "B",
             )
 
@@ -2083,14 +2462,14 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
             self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
             sentinel = fixed / "sentinel.txt"
             sentinel.write_text("preserve me\n", encoding="utf-8")
             original_match = APPLY_MODULE.opened_directory_matches_path
 
             def reject_late_parent(path, metadata, *, reject_mount):
-                if Path(path).name == "apply-runs" and reject_mount:
+                if Path(path).name == "fixed" and reject_mount:
                     return False
                 return original_match(path, metadata, reject_mount=reject_mount)
 
@@ -2099,7 +2478,10 @@ class ApplyRunTests(unittest.TestCase):
                 "opened_directory_matches_path",
                 side_effect=reject_late_parent,
             ):
-                with self.assertRaisesRegex(ValueError, "indirect_target_rejected"):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "indirect_target_rejected|replace_apply_run_tree_contains_indirect_target",
+                ):
                     self.create_apply_run(root, "no_action", fixed, replace=True, run_id_suffix="second")
 
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve me\n")
@@ -2108,7 +2490,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
             self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
             sentinel = fixed / "sentinel.txt"
             sentinel.write_text("preserve me\n", encoding="utf-8")
@@ -2145,7 +2527,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_no_action_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
             self.create_apply_run(root, "no_action", fixed, run_id_suffix="first")
             mounted = fixed / "mounted"
             mounted.mkdir()
@@ -2189,7 +2571,7 @@ class ApplyRunTests(unittest.TestCase):
             created = self.create_apply_run(root, "no_action", run_id_suffix="mount-revalidate")
             run_dir = Path(str(created["run_dir"]))
 
-            with APPLY_MODULE.open_verified_apply_run_for_mutation(run_dir) as handle:
+            with APPLY_MODULE.open_verified_apply_run_for_mutation(run_dir, root=root) as handle:
                 with mock.patch.object(
                     APPLY_MODULE,
                     "require_same_mount",
@@ -2333,7 +2715,7 @@ class ApplyRunTests(unittest.TestCase):
             run["agent_profiles"]["task_reviewer"]["sandbox"] = "workspace-write"
             (run_dir / "Apply-Run.json").write_text(json.dumps(run), encoding="utf-8")
 
-            errors = APPLY_MODULE.validate_apply_run(run_dir)
+            errors = APPLY_MODULE.validate_apply_run(run_dir, root=root)
 
             self.assertIn("agent_profile_mismatch=task_reviewer:sandbox", errors)
 
@@ -2347,6 +2729,8 @@ class ApplyRunTests(unittest.TestCase):
             code = APPLY_MODULE.main(
                 [
                     "transition",
+                    "--root",
+                    str(root),
                     "--run-dir",
                     str(run_dir),
                     "--task-id",
@@ -2367,9 +2751,9 @@ class ApplyRunTests(unittest.TestCase):
             self.assertEqual(progress["active_writer_locks"][0]["task_id"], task_id)
 
             with self.assertRaisesRegex(ValueError, "invalid_transition=IMPLEMENTING->VERIFIED"):
-                APPLY_MODULE.transition_task_state(run_dir, task_id, "VERIFIED", "impl-1", [])
+                APPLY_MODULE.transition_task_state(run_dir, task_id, "VERIFIED", "impl-1", [], root=root)
 
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTED", "impl-1", ["implementation complete"])
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTED", "impl-1", ["implementation complete"], root=root)
             self.assertFalse((run_dir / "Writer-Lock.json").exists())
             events = [
                 json.loads(line)
@@ -2379,7 +2763,7 @@ class ApplyRunTests(unittest.TestCase):
             self.assertEqual([event["sequence"] for event in events], [1, 2, 3])
             self.assertEqual(events[-1]["from"], "IMPLEMENTING")
             self.assertEqual(events[-1]["to"], "IMPLEMENTED")
-            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir), [])
+            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir, root=root), [])
 
     def test_runtime_predictable_temp_symlink_cannot_modify_victim(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as outside_dir:
@@ -2394,12 +2778,14 @@ class ApplyRunTests(unittest.TestCase):
             progress_path = run_dir / "Progress.json"
             progress = json.loads(progress_path.read_text(encoding="utf-8"))
             progress["resume_cursor"] = {"probe": "secure-write"}
+            before_progress = progress_path.read_bytes()
 
-            APPLY_MODULE.atomic_write_json(progress_path, progress)
+            with self.assertRaisesRegex(ValueError, "apply_run_provenance_unverified"):
+                APPLY_MODULE.atomic_write_json(progress_path, progress, root=root)
 
             self.assertEqual(victim.read_text(encoding="utf-8"), "preserve apply victim\n")
             self.assertFalse(progress_path.is_symlink())
-            self.assertEqual(json.loads(progress_path.read_text(encoding="utf-8"))["resume_cursor"], {"probe": "secure-write"})
+            self.assertEqual(progress_path.read_bytes(), before_progress)
 
     def test_event_append_rejects_symlink_without_touching_victim(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as outside_dir:
@@ -2414,7 +2800,7 @@ class ApplyRunTests(unittest.TestCase):
             events.symlink_to(victim)
 
             with self.assertRaises(ValueError):
-                APPLY_MODULE.append_event(run_dir, {"event_type": "probe", "actor": "test"})
+                APPLY_MODULE.append_event(run_dir, {"event_type": "probe", "actor": "test"}, root=root)
 
             self.assertEqual(victim.read_text(encoding="utf-8"), "preserve events victim\n")
             errors: list[str] = []
@@ -2439,7 +2825,7 @@ class ApplyRunTests(unittest.TestCase):
 
             with mock.patch.object(artifact_os, "replace", side_effect=fail_event_replace):
                 with self.assertRaisesRegex(OSError, "synthetic event replace failure"):
-                    APPLY_MODULE.append_event(run_dir, {"event_type": "probe", "actor": "test"})
+                    APPLY_MODULE.append_event(run_dir, {"event_type": "probe", "actor": "test"}, root=root)
 
             self.assertEqual(events_path.read_bytes(), before_events)
             self.assertEqual(
@@ -2469,6 +2855,7 @@ class ApplyRunTests(unittest.TestCase):
                 record = APPLY_MODULE.append_event(
                     run_dir,
                     {"event_type": "probe", "actor": "test"},
+                root=root,
                 )
 
             events, errors = APPLY_MODULE.parse_chained_event_log(
@@ -2494,11 +2881,19 @@ class ApplyRunTests(unittest.TestCase):
                     raise OSError("synthetic persistent directory fsync failure")
                 return real_fsync(file_descriptor)
 
-            with mock.patch.object(artifact_os, "fsync", side_effect=fail_run_directory_fsync):
+            with (
+                mock.patch.object(artifact_os, "fsync", side_effect=fail_run_directory_fsync),
+                mock.patch.object(
+                    APPLY_MODULE,
+                    "controller_fsync",
+                    side_effect=fail_run_directory_fsync,
+                ),
+            ):
                 with self.assertRaisesRegex(ValueError, "^event_log_commit_state_unknown$"):
                     APPLY_MODULE.append_event(
                         run_dir,
                         {"event_type": "probe", "actor": "test"},
+                    root=root,
                     )
 
             events, errors = APPLY_MODULE.parse_chained_event_log(
@@ -2523,7 +2918,14 @@ class ApplyRunTests(unittest.TestCase):
                     raise OSError("synthetic persistent directory fsync failure")
                 return real_fsync(file_descriptor)
 
-            with mock.patch.object(artifact_os, "fsync", side_effect=fail_run_directory_fsync):
+            with (
+                mock.patch.object(artifact_os, "fsync", side_effect=fail_run_directory_fsync),
+                mock.patch.object(
+                    APPLY_MODULE,
+                    "controller_fsync",
+                    side_effect=fail_run_directory_fsync,
+                ),
+            ):
                 with self.assertRaisesRegex(ValueError, "^event_log_commit_state_unknown$"):
                     APPLY_MODULE.transition_task_state(
                         run_dir,
@@ -2531,6 +2933,7 @@ class ApplyRunTests(unittest.TestCase):
                         "BLOCKED",
                         "test",
                         ["synthetic durability fault"],
+                    root=root,
                     )
 
             progress = json.loads((run_dir / "Progress.json").read_text(encoding="utf-8"))
@@ -2561,6 +2964,7 @@ class ApplyRunTests(unittest.TestCase):
                         "actor": fixture,
                         "summary": {"evidence": [fixture]},
                     },
+                root=root,
                 )
             except ValueError as exc:
                 if fixture in str(exc):
@@ -2683,11 +3087,12 @@ class ApplyRunTests(unittest.TestCase):
             self.write_apply_fixture(root)
             run_dir = Path(self.create_apply_run(root, "subagent_serial")["run_dir"])
             task_id = self.first_task_id(run_dir)
-            APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller")
+            APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller", root=root)
             APPLY_MODULE.record_agent_status(
-                run_dir, task_id, "implementer", "impl-secret", "spawned", "controller"
+                run_dir, task_id, "implementer", "impl-secret", "spawned", "controller",
+                root=root
             )
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-secret")
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-secret", root=root)
             report_path = run_dir / task_id / "Implementer-Report.json"
             events_path = run_dir / "Events.jsonl"
             progress_path = run_dir / "Progress.json"
@@ -2707,6 +3112,7 @@ class ApplyRunTests(unittest.TestCase):
                         "concerns": [fixture],
                     },
                     "controller",
+                root=root,
                 )
             except ValueError as exc:
                 self.assertNotIn(fixture, str(exc))
@@ -2723,11 +3129,12 @@ class ApplyRunTests(unittest.TestCase):
             self.write_apply_fixture(root)
             run_dir = Path(self.create_apply_run(root, "subagent_serial")["run_dir"])
             task_id = self.first_task_id(run_dir)
-            APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller")
+            APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller", root=root)
             APPLY_MODULE.record_agent_status(
-                run_dir, task_id, "implementer", "impl-schema", "spawned", "controller"
+                run_dir, task_id, "implementer", "impl-schema", "spawned", "controller",
+                root=root
             )
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-schema")
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-schema", root=root)
             report_path = run_dir / task_id / "Implementer-Report.json"
             events_path = run_dir / "Events.jsonl"
             progress_path = run_dir / "Progress.json"
@@ -2748,6 +3155,7 @@ class ApplyRunTests(unittest.TestCase):
                         "unexpected_writer_field": "must fail",
                     },
                     "controller",
+                root=root,
                 )
             self.assertEqual(
                 (report_path.read_bytes(), events_path.read_bytes(), progress_path.read_bytes()),
@@ -2782,7 +3190,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_apply_fixture(root)
-            runs_root = root / ".codexqb" / "apply-runs"
+            runs_root = APPLY_MODULE.managed_apply_runs_root(root)
             before = set(runs_root.iterdir()) if runs_root.exists() else set()
             fixture = "gl" + "pat-" + "L" * 32
             with self.assertRaisesRegex(ValueError, "secret_like_run_id_suffix"):
@@ -2802,7 +3210,7 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_apply_fixture(root)
-            fixed = root / ".codexqb" / "apply-runs" / "fixed-secret-preflight"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed-secret-preflight"
             self.create_apply_run(root, "subagent_serial", fixed, run_id_suffix="first")
             sentinel = fixed / "sentinel.txt"
             sentinel.write_text("preserve existing run\n", encoding="utf-8")
@@ -2839,7 +3247,7 @@ class ApplyRunTests(unittest.TestCase):
             before_events = (copied / "Events.jsonl").read_text(encoding="utf-8")
 
             with self.assertRaises(ValueError):
-                APPLY_MODULE.transition_task_state(copied, task_id, "IMPLEMENTING", "impl-1", ["probe"])
+                APPLY_MODULE.transition_task_state(copied, task_id, "IMPLEMENTING", "impl-1", ["probe"], root=root)
 
             self.assertEqual((copied / "Events.jsonl").read_text(encoding="utf-8"), before_events)
             progress = json.loads((copied / "Progress.json").read_text(encoding="utf-8"))
@@ -2856,7 +3264,10 @@ class ApplyRunTests(unittest.TestCase):
             context = multiprocessing.get_context("fork")
             barrier = context.Barrier(worker_count)
             processes = [
-                context.Process(target=append_event_worker, args=(str(run_dir), index, barrier))
+                context.Process(
+                    target=append_event_worker,
+                    args=(str(root), str(run_dir), index, barrier),
+                )
                 for index in range(worker_count)
             ]
             for process in processes:
@@ -2889,13 +3300,14 @@ class ApplyRunTests(unittest.TestCase):
             root = Path(temp_dir)
             self.write_apply_fixture(root)
             run_dir = Path(self.create_apply_run(root, "direct")["run_dir"])
-            APPLY_MODULE.append_event(run_dir, {"event_type": "probe-one", "actor": "test"})
-            APPLY_MODULE.append_event(run_dir, {"event_type": "probe-two", "actor": "test"})
+            APPLY_MODULE.append_event(run_dir, {"event_type": "probe-one", "actor": "test"}, root=root)
+            APPLY_MODULE.append_event(run_dir, {"event_type": "probe-two", "actor": "test"}, root=root)
 
             with self.assertRaisesRegex(ValueError, "event_reserved_field_forbidden"):
                 APPLY_MODULE.append_event(
                     run_dir,
                     {"event_type": "probe-three", "actor": "test", "sequence": 99},
+                root=root,
                 )
 
             events_path = run_dir / "Events.jsonl"
@@ -2908,7 +3320,7 @@ class ApplyRunTests(unittest.TestCase):
 
             self.assertIn("invalid_event_hash=line-2", APPLY_MODULE.validate_apply_run(run_dir, root))
             with self.assertRaisesRegex(ValueError, "invalid_event_hash=line-2"):
-                APPLY_MODULE.append_event(run_dir, {"event_type": "must-not-append", "actor": "test"})
+                APPLY_MODULE.append_event(run_dir, {"event_type": "must-not-append", "actor": "test"}, root=root)
 
     def test_event_chain_rejects_rehashed_schema_invalid_core_fields(self) -> None:
         cases = (
@@ -2934,6 +3346,7 @@ class ApplyRunTests(unittest.TestCase):
                     APPLY_MODULE.append_event(
                         run_dir,
                         {"event_type": "must-not-append", "actor": "test"},
+                    root=root,
                     )
 
     def test_event_chain_binds_initial_event_to_run_envelope(self) -> None:
@@ -2954,6 +3367,7 @@ class ApplyRunTests(unittest.TestCase):
                 APPLY_MODULE.append_event(
                     run_dir,
                     {"event_type": "must-not-append", "actor": "test"},
+                root=root,
                 )
 
     def test_event_append_rejects_schema_invalid_optional_fields_before_write(self) -> None:
@@ -2971,7 +3385,7 @@ class ApplyRunTests(unittest.TestCase):
                 before = events_path.read_bytes()
 
                 with self.assertRaisesRegex(ValueError, f"^{expected}$"):
-                    APPLY_MODULE.append_event(run_dir, event)
+                    APPLY_MODULE.append_event(run_dir, event, root=root)
 
                 self.assertEqual(events_path.read_bytes(), before)
 
@@ -2995,7 +3409,7 @@ class ApplyRunTests(unittest.TestCase):
                 self.assertIn(expected, APPLY_MODULE.validate_apply_run(run_dir, root))
                 before = events_path.read_bytes()
                 with self.assertRaisesRegex(ValueError, expected):
-                    APPLY_MODULE.append_event(run_dir, {"event_type": "must-not-append", "actor": "test"})
+                    APPLY_MODULE.append_event(run_dir, {"event_type": "must-not-append", "actor": "test"}, root=root)
                 self.assertEqual(events_path.read_bytes(), before)
 
     def test_event_log_rejects_duplicate_key_blank_line_broken_link_and_invalid_utf8(self) -> None:
@@ -3020,14 +3434,14 @@ class ApplyRunTests(unittest.TestCase):
                 self.assertIn(expected, APPLY_MODULE.validate_apply_run(run_dir, root))
                 before = events_path.read_bytes()
                 with self.assertRaisesRegex(ValueError, expected):
-                    APPLY_MODULE.append_event(run_dir, {"event_type": "must-not-append", "actor": "test"})
+                    APPLY_MODULE.append_event(run_dir, {"event_type": "must-not-append", "actor": "test"}, root=root)
                 self.assertEqual(events_path.read_bytes(), before)
 
         with self.subTest(label="broken-previous-hash"), tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.write_apply_fixture(root)
             run_dir = Path(self.create_apply_run(root, "direct")["run_dir"])
-            APPLY_MODULE.append_event(run_dir, {"event_type": "probe", "actor": "test"})
+            APPLY_MODULE.append_event(run_dir, {"event_type": "probe", "actor": "test"}, root=root)
             events_path = run_dir / "Events.jsonl"
             events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
             events[1]["previous_event_sha256"] = "f" * 64
@@ -3040,7 +3454,7 @@ class ApplyRunTests(unittest.TestCase):
             expected = "invalid_event_previous_hash=line-2"
             self.assertIn(expected, APPLY_MODULE.validate_apply_run(run_dir, root))
             with self.assertRaisesRegex(ValueError, expected):
-                APPLY_MODULE.append_event(run_dir, {"event_type": "must-not-append", "actor": "test"})
+                APPLY_MODULE.append_event(run_dir, {"event_type": "must-not-append", "actor": "test"}, root=root)
 
         with self.subTest(label="invalid-utf8"), tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -3051,7 +3465,7 @@ class ApplyRunTests(unittest.TestCase):
             before = events_path.read_bytes()
             self.assertIn("invalid_events_jsonl_file", APPLY_MODULE.validate_apply_run(run_dir, root))
             with self.assertRaisesRegex(ValueError, "^invalid_event_log_utf8$"):
-                APPLY_MODULE.append_event(run_dir, {"event_type": "must-not-append", "actor": "test"})
+                APPLY_MODULE.append_event(run_dir, {"event_type": "must-not-append", "actor": "test"}, root=root)
             self.assertEqual(events_path.read_bytes(), before)
 
     def test_unkeyed_event_chain_does_not_claim_valid_tail_truncation_detection(self) -> None:
@@ -3059,8 +3473,8 @@ class ApplyRunTests(unittest.TestCase):
             root = Path(temp_dir)
             self.write_apply_fixture(root)
             run_dir = Path(self.create_apply_run(root, "direct")["run_dir"])
-            APPLY_MODULE.append_event(run_dir, {"event_type": "probe-one", "actor": "test"})
-            APPLY_MODULE.append_event(run_dir, {"event_type": "probe-two", "actor": "test"})
+            APPLY_MODULE.append_event(run_dir, {"event_type": "probe-one", "actor": "test"}, root=root)
+            APPLY_MODULE.append_event(run_dir, {"event_type": "probe-two", "actor": "test"}, root=root)
             events_path = run_dir / "Events.jsonl"
             complete_lines = events_path.read_text(encoding="utf-8").splitlines()
             events_path.write_text("\n".join(complete_lines[:-1]) + "\n", encoding="utf-8")
@@ -3083,7 +3497,7 @@ class ApplyRunTests(unittest.TestCase):
             progress["tasks"][0]["state"] = "IMPLEMENTED"
             (run_dir / "Progress.json").write_text(json.dumps(progress), encoding="utf-8")
 
-            errors = APPLY_MODULE.validate_apply_run(run_dir)
+            errors = APPLY_MODULE.validate_apply_run(run_dir, root=root)
 
             self.assertIn(f"task_state_missing_transition_event={task_id}", errors)
 
@@ -3094,10 +3508,10 @@ class ApplyRunTests(unittest.TestCase):
             result = self.create_apply_run(root, "direct")
             run_dir = Path(result["run_dir"])
             task_id = self.first_task_id(run_dir)
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-1", ["started"])
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-1", ["started"], root=root)
             (run_dir / "Writer-Lock.json").unlink()
 
-            errors = APPLY_MODULE.validate_apply_run(run_dir)
+            errors = APPLY_MODULE.validate_apply_run(run_dir, root=root)
 
             self.assertIn("active_writer_lock_missing_file", errors)
 
@@ -3108,7 +3522,7 @@ class ApplyRunTests(unittest.TestCase):
             result = self.create_apply_run(root, "direct")
             run_dir = Path(result["run_dir"])
             task_id = self.first_task_id(run_dir)
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-1", ["started"])
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-1", ["started"], root=root)
 
             lock_path = run_dir / "Writer-Lock.json"
             stale_lock = json.loads(lock_path.read_text(encoding="utf-8"))
@@ -3119,13 +3533,14 @@ class ApplyRunTests(unittest.TestCase):
             progress["tasks"][0]["writer_lock"] = stale_lock
             (run_dir / "Progress.json").write_text(json.dumps(progress), encoding="utf-8")
 
-            self.assertIn(f"writer_lock_expired={task_id}", APPLY_MODULE.validate_apply_run(run_dir))
+            self.assertIn(f"writer_lock_expired={task_id}", APPLY_MODULE.validate_apply_run(run_dir, root=root))
             event = APPLY_MODULE.recover_stale_writer_lock(
                 run_dir,
                 task_id,
                 "NEEDS_CONTEXT",
                 "controller",
                 ["implementation worker abandoned stale lock"],
+            root=root,
             )
             progress = json.loads((run_dir / "Progress.json").read_text(encoding="utf-8"))
 
@@ -3134,7 +3549,7 @@ class ApplyRunTests(unittest.TestCase):
             self.assertEqual(event["to"], "NEEDS_CONTEXT")
             self.assertFalse(lock_path.exists())
             self.assertEqual(progress["tasks"][0]["state"], "NEEDS_CONTEXT")
-            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir), [])
+            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir, root=root), [])
 
     def test_recover_stale_writer_lock_rejects_unmanaged_copy_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as outside_dir:
@@ -3143,7 +3558,7 @@ class ApplyRunTests(unittest.TestCase):
             result = self.create_apply_run(root, "direct")
             run_dir = Path(result["run_dir"])
             task_id = self.first_task_id(run_dir)
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-1", ["started"])
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-1", ["started"], root=root)
 
             lock_path = run_dir / "Writer-Lock.json"
             stale_lock = json.loads(lock_path.read_text(encoding="utf-8"))
@@ -3166,6 +3581,7 @@ class ApplyRunTests(unittest.TestCase):
                     "NEEDS_CONTEXT",
                     "controller",
                     ["probe"],
+                root=root,
                 )
 
             self.assertTrue((copied / "Writer-Lock.json").is_file())
@@ -3179,7 +3595,7 @@ class ApplyRunTests(unittest.TestCase):
             result = self.create_apply_run(root, "direct")
             run_dir = Path(result["run_dir"])
             task_id = self.first_task_id(run_dir)
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-1", ["started"])
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-1", ["started"], root=root)
 
             lock_path = run_dir / "Writer-Lock.json"
             stale_lock = json.loads(lock_path.read_text(encoding="utf-8"))
@@ -3203,6 +3619,7 @@ class ApplyRunTests(unittest.TestCase):
                     "NEEDS_CONTEXT",
                     "controller",
                     ["probe"],
+                root=root,
                 )
 
             self.assertTrue(lock_path.is_symlink())
@@ -3226,7 +3643,7 @@ class ApplyRunTests(unittest.TestCase):
                 "re_review_required": True,
             }
             (run_dir / task_id / "Task-Review.json").write_text(json.dumps(review), encoding="utf-8")
-            errors = APPLY_MODULE.validate_apply_run(run_dir)
+            errors = APPLY_MODULE.validate_apply_run(run_dir, root=root)
             self.assertIn(f"re_review_requires_fix_report={task_id}", errors)
 
     def test_apply_run_rejects_non_ready_p0_p1_and_policy_violations(self) -> None:
@@ -3245,7 +3662,7 @@ class ApplyRunTests(unittest.TestCase):
             (run_dir / "Progress.json").write_text(json.dumps(progress), encoding="utf-8")
             task_id = progress["tasks"][0]["task_id"]
 
-            errors = APPLY_MODULE.validate_apply_run(run_dir)
+            errors = APPLY_MODULE.validate_apply_run(run_dir, root=root)
 
             self.assertIn("only_one_writer_permitted", errors)
             self.assertIn("recursive_subagents_rejected", errors)
@@ -3272,7 +3689,7 @@ class ApplyRunTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            errors = APPLY_MODULE.validate_apply_run(run_dir)
+            errors = APPLY_MODULE.validate_apply_run(run_dir, root=root)
 
             self.assertIn(f"security_review_receipt_missing={task_id}", errors)
             self.assertIn(f"security_reviewer_agent_run_missing={task_id}", errors)
@@ -3281,7 +3698,7 @@ class ApplyRunTests(unittest.TestCase):
             trusted = self.create_apply_run(root, "subagent_serial", run_id_suffix="trusted-review")
             trusted_dir = Path(trusted["run_dir"])
             self.complete_subagent_serial_verification(root, trusted_dir)
-            self.assertEqual(APPLY_MODULE.validate_apply_run(trusted_dir), [])
+            self.assertEqual(APPLY_MODULE.validate_apply_run(trusted_dir, root=root), [])
 
     def test_finalize_rejects_controller_evidence_without_host_agent_attestation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3291,11 +3708,11 @@ class ApplyRunTests(unittest.TestCase):
             run_dir = Path(result["run_dir"])
 
             with self.assertRaisesRegex(ValueError, "finalize_requires_all_tasks_verified"):
-                APPLY_MODULE.finalize_apply_run(run_dir, "controller", ["attempted early finalize"])
+                APPLY_MODULE.finalize_apply_run(run_dir, "controller", ["attempted early finalize"], root=root)
 
             self.complete_subagent_serial_verification(root, run_dir)
             task_id = self.first_task_id(run_dir)
-            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir), [])
+            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir, root=root), [])
             with self.assertRaisesRegex(
                 ValueError,
                 f"trusted_verified_requires_host_agent_attestation={task_id}",
@@ -3306,14 +3723,15 @@ class ApplyRunTests(unittest.TestCase):
                     "VERIFIED",
                     "controller",
                     ["controller evidence complete but unattested"],
+                root=root,
                 )
             with self.assertRaisesRegex(ValueError, "finalize_requires_all_tasks_verified"):
-                APPLY_MODULE.finalize_apply_run(run_dir, "controller", ["host proof absent"])
+                APPLY_MODULE.finalize_apply_run(run_dir, "controller", ["host proof absent"], root=root)
             result_payload = json.loads((run_dir / "Result.json").read_text(encoding="utf-8"))
 
             self.assertEqual(result_payload["status"], "initialized")
             self.assertEqual(result_payload["completed_tasks"], [])
-            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir), [])
+            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir, root=root), [])
 
     def test_finalize_rejects_result_symlink_before_publishing_event(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as outside_dir:
@@ -3331,7 +3749,7 @@ class ApplyRunTests(unittest.TestCase):
             result_path.symlink_to(victim)
 
             with self.assertRaises(ValueError):
-                APPLY_MODULE.finalize_apply_run(run_dir, "controller", ["probe"])
+                APPLY_MODULE.finalize_apply_run(run_dir, "controller", ["probe"], root=root)
 
             self.assertTrue(result_path.is_symlink())
             self.assertEqual(victim.read_bytes(), before_victim)
@@ -3351,7 +3769,7 @@ class ApplyRunTests(unittest.TestCase):
 
             self.assertIn("source_snapshot_mismatch", errors)
 
-    def test_apply_validation_requires_root_for_source_binding_when_not_inferred(self) -> None:
+    def test_apply_validation_rejects_unmanaged_copy_before_artifact_read(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as outside_dir:
             root = Path(temp_dir)
             self.write_apply_fixture(root)
@@ -3360,8 +3778,41 @@ class ApplyRunTests(unittest.TestCase):
             copied = Path(outside_dir) / "copied-apply-run"
             shutil.copytree(run_dir, copied)
 
-            self.assertIn("source_binding_root_required", APPLY_MODULE.validate_apply_run(copied))
-            self.assertIn("apply_run_provenance_unverified", APPLY_MODULE.validate_apply_run(copied, root))
+            with mock.patch.object(
+                APPLY_MODULE,
+                "load_json",
+                side_effect=AssertionError("unmanaged artifact was read"),
+            ) as reader:
+                errors = APPLY_MODULE.validate_apply_run(copied, root=root)
+            reader.assert_not_called()
+            self.assertTrue(
+                any(
+                    error.startswith("repository_io_failed=invalid_apply_run_output_dir")
+                    for error in errors
+                )
+            )
+
+    def test_repository_local_legacy_apply_run_is_archive_only_and_unread(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.write_apply_fixture(root)
+            legacy = root / ".codexqb" / "apply-runs" / "legacy-run"
+            legacy.mkdir(parents=True)
+            (legacy / "Apply-Run.json").write_text(
+                '{"sentinel":"must-not-be-read"}\n',
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                APPLY_MODULE,
+                "load_json",
+                side_effect=AssertionError("legacy artifact was read"),
+            ) as reader:
+                errors = APPLY_MODULE.validate_apply_run(legacy, root=root)
+            reader.assert_not_called()
+            self.assertIn(
+                "repository_io_failed=legacy_apply_run_archive_only",
+                errors,
+            )
 
     def test_apply_run_workspace_baseline_detects_non_git_source_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3444,13 +3895,13 @@ class ApplyRunTests(unittest.TestCase):
             )
             tracked.write_text("after\n", encoding="utf-8")
 
-            baseline = APPLY_MODULE.workspace_baseline(root)
+            with self.assertRaisesRegex(
+                ValueError,
+                "repository_io_workspace_proof_failed",
+            ):
+                APPLY_MODULE.workspace_baseline(root)
 
             self.assertFalse(marker.exists())
-            self.assertNotEqual(
-                baseline["unstaged_diff_sha256"],
-                APPLY_MODULE.sha256_bytes(b""),
-            )
 
     def test_apply_run_allows_contract_bound_tracked_implementation_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3542,7 +3993,7 @@ class ApplyRunTests(unittest.TestCase):
             (run_dir / "Progress.json").write_text(json.dumps(progress), encoding="utf-8")
             task_id = progress["tasks"][0]["task_id"]
 
-            errors = APPLY_MODULE.validate_apply_run(run_dir)
+            errors = APPLY_MODULE.validate_apply_run(run_dir, root=root)
 
             self.assertIn(f"verified_task_not_redispatched={task_id}", errors)
 
@@ -3552,25 +4003,25 @@ class ApplyRunTests(unittest.TestCase):
             self.write_apply_fixture(root)
             result = self.create_apply_run(root, "external_superpowers")
             run_dir = Path(result["run_dir"])
-            self.assertIn("external_superpowers_readiness_not_checked", APPLY_MODULE.validate_apply_run(run_dir))
+            self.assertIn("external_superpowers_readiness_not_checked", APPLY_MODULE.validate_apply_run(run_dir, root=root))
             run = json.loads((run_dir / "Apply-Run.json").read_text(encoding="utf-8"))
             run["external_superpowers"]["availability"] = "unavailable"
             run["external_superpowers"]["fallback_mode"] = "direct"
             (run_dir / "Apply-Run.json").write_text(json.dumps(run), encoding="utf-8")
 
-            errors = APPLY_MODULE.validate_apply_run(run_dir)
+            errors = APPLY_MODULE.validate_apply_run(run_dir, root=root)
 
             self.assertIn("external_superpowers_unavailable_requires_subagent_serial_fallback", errors)
             self.assertIn("external_superpowers_unavailable_must_reconcile_mode", errors)
             run["external_superpowers"]["fallback_mode"] = "subagent_serial"
             (run_dir / "Apply-Run.json").write_text(json.dumps(run), encoding="utf-8")
-            self.assertIn("external_superpowers_unavailable_must_reconcile_mode", APPLY_MODULE.validate_apply_run(run_dir))
-            reconciled = APPLY_MODULE.reconcile_external_superpowers(run_dir)
+            self.assertIn("external_superpowers_unavailable_must_reconcile_mode", APPLY_MODULE.validate_apply_run(run_dir, root=root))
+            reconciled = APPLY_MODULE.reconcile_external_superpowers(run_dir, root=root)
 
             self.assertEqual(reconciled["state"], "reconciled")
             run = json.loads((run_dir / "Apply-Run.json").read_text(encoding="utf-8"))
             self.assertEqual(run["mode"], "subagent_serial")
-            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir), [])
+            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir, root=root), [])
             replacement = self.create_apply_run(
                 root,
                 "direct",
@@ -3598,10 +4049,10 @@ class ApplyRunTests(unittest.TestCase):
             )
             run_path.write_text(json.dumps(run), encoding="utf-8")
 
-            reconciled = APPLY_MODULE.reconcile_external_superpowers(run_dir)
+            reconciled = APPLY_MODULE.reconcile_external_superpowers(run_dir, root=root)
 
             self.assertEqual(reconciled, {"state": "ready", "mode": "external_superpowers"})
-            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir), [])
+            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir, root=root), [])
             replacement = self.create_apply_run(
                 root,
                 "direct",
@@ -3638,14 +4089,14 @@ class ApplyRunTests(unittest.TestCase):
                 side_effect=fail_registration_refresh_once,
             ):
                 with self.assertRaisesRegex(OSError, "synthetic_registration_refresh_failure"):
-                    APPLY_MODULE.reconcile_external_superpowers(run_dir)
+                    APPLY_MODULE.reconcile_external_superpowers(run_dir, root=root)
 
-            recovered = APPLY_MODULE.reconcile_external_superpowers(run_dir)
+            recovered = APPLY_MODULE.reconcile_external_superpowers(run_dir, root=root)
 
             self.assertTrue(state["failed"])
             self.assertEqual(recovered["state"], "reconciled")
             self.assertTrue(recovered["recovered"])
-            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir), [])
+            self.assertEqual(APPLY_MODULE.validate_apply_run(run_dir, root=root), [])
             replacement = self.create_apply_run(
                 root,
                 "direct",
@@ -3665,7 +4116,7 @@ class ApplyRunTests(unittest.TestCase):
             progress["tasks"] = [{"task_id": "../../outside-task", "state": "BRIEFED", "readiness_status": "READY"}]
             (run_dir / "Progress.json").write_text(json.dumps(progress), encoding="utf-8")
 
-            errors = APPLY_MODULE.validate_apply_run(run_dir)
+            errors = APPLY_MODULE.validate_apply_run(run_dir, root=root)
 
             self.assertIn("no_action_must_not_have_tasks", errors)
             self.assertIn("invalid_task_id=../../outside-task", errors)
@@ -3683,7 +4134,7 @@ class ApplyRunTests(unittest.TestCase):
             self.assertEqual(first_run["apply_spec_id"], second_run["apply_spec_id"])
             self.assertNotEqual(first["apply_run_id"], second["apply_run_id"])
 
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
             fixed_result = self.create_apply_run(root, "direct", fixed)
             with self.assertRaises(ValueError):
                 self.create_apply_run(root, "direct", fixed)
@@ -3696,7 +4147,7 @@ class ApplyRunTests(unittest.TestCase):
             with self.subTest(legacy_version=legacy_version), tempfile.TemporaryDirectory() as temp_dir:
                 root = Path(temp_dir)
                 self.write_apply_fixture(root)
-                fixed = root / ".codexqb" / "apply-runs" / "fixed"
+                fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
                 with mock.patch.object(APPLY_MODULE, "APPLY_RUN_SCHEMA_VERSION", legacy_version):
                     self.create_apply_run(root, "direct", fixed)
                 run_path = fixed / "Apply-Run.json"
@@ -3711,7 +4162,7 @@ class ApplyRunTests(unittest.TestCase):
                     ValueError,
                     r"(?:invalid_apply_run_schema_version|apply_run_provenance_unverified)",
                 ):
-                    APPLY_MODULE.finalize_apply_run(fixed, "controller")
+                    APPLY_MODULE.finalize_apply_run(fixed, "controller", root=root)
 
                 del run["apply_run_registration_id"]
                 run_path.write_text(json.dumps(run), encoding="utf-8")
@@ -3739,7 +4190,7 @@ class ApplyRunTests(unittest.TestCase):
             run["apply_spec_inputs"]["workspace_baseline"]["untracked_count"] = 999
             run_path.write_text(json.dumps(run), encoding="utf-8")
 
-            errors = APPLY_MODULE.validate_apply_run(run_dir)
+            errors = APPLY_MODULE.validate_apply_run(run_dir, root=root)
 
             self.assertIn("stored_apply_spec_digest_mismatch", errors)
             self.assertIn("stored_apply_spec_id_mismatch", errors)
@@ -3763,7 +4214,7 @@ class ApplyRunTests(unittest.TestCase):
             )
             (run_dir / "Final-Review.json").write_text(json.dumps({"status": "pass"}), encoding="utf-8")
 
-            errors = APPLY_MODULE.validate_apply_run(run_dir)
+            errors = APPLY_MODULE.validate_apply_run(run_dir, root=root)
 
             self.assertIn(f"verified_requires_files_changed={task_id}", errors)
             self.assertIn(f"verified_missing_validation_receipt={task_id}:VAL-01", errors)
@@ -3899,6 +4350,7 @@ class ApplyRunTests(unittest.TestCase):
             first_receipt_path = first_dir / first_task_id / first_reference["path"]
             copied_receipt_path = second_dir / second_task_id / first_reference["path"]
             copied_receipt_path.write_bytes(first_receipt_path.read_bytes())
+            copied_receipt_path.chmod(0o600)
             second_progress["tasks"][0]["validation_receipts"][0] = first_reference
             second_progress_path.write_text(json.dumps(second_progress), encoding="utf-8")
 
@@ -3978,6 +4430,7 @@ class ApplyRunTests(unittest.TestCase):
                         task_id,
                         "VAL-01",
                         "controller",
+                    root=root,
                     )
             self.assertEqual(failed["exit_code"], 1)
 
@@ -3990,7 +4443,7 @@ class ApplyRunTests(unittest.TestCase):
             progress["tasks"][0]["validation_receipts"] = [old_reference]
             progress_path.write_text(json.dumps(progress), encoding="utf-8")
 
-            with APPLY_MODULE.open_verified_apply_run_for_mutation(run_dir) as handle:
+            with APPLY_MODULE.open_verified_apply_run_for_mutation(run_dir, root=root) as handle:
                 live_progress = APPLY_MODULE.secure_read_regular_json_at(
                     handle.run_fd,
                     "Progress.json",
@@ -4029,6 +4482,7 @@ class ApplyRunTests(unittest.TestCase):
                 "final_reviewer",
                 "controller",
                 review_phase="final",
+            root=root,
             )
             APPLY_MODULE.record_agent_status(
                 run_dir,
@@ -4038,6 +4492,7 @@ class ApplyRunTests(unittest.TestCase):
                 "spawned",
                 "controller",
                 review_phase="final",
+            root=root,
             )
             APPLY_MODULE.normalize_review_report(
                 run_dir,
@@ -4053,6 +4508,7 @@ class ApplyRunTests(unittest.TestCase):
                     "evidence": ["newer final review failed"],
                 },
                 "controller",
+            root=root,
             )
             APPLY_MODULE.record_agent_status(
                 run_dir,
@@ -4063,8 +4519,9 @@ class ApplyRunTests(unittest.TestCase):
                 "controller",
                 summary="newer final review failed",
                 review_phase="final",
+            root=root,
             )
-            APPLY_MODULE.publish_review_completion(run_dir, task_id, "final", "controller")
+            APPLY_MODULE.publish_review_completion(run_dir, task_id, "final", "controller", root=root)
 
             new_progress = json.loads((run_dir / "Progress.json").read_text(encoding="utf-8"))
             new_reference = new_progress["tasks"][0]["review_receipts"]["final"]
@@ -4085,7 +4542,7 @@ class ApplyRunTests(unittest.TestCase):
             self.write_apply_fixture(root)
             result = self.create_apply_run(root, "subagent_serial")
             run_dir = Path(result["run_dir"])
-            self.mark_task_verified(run_dir, security="pass")
+            self.mark_task_verified(root, run_dir, security="pass")
             task_id = self.first_task_id(run_dir)
 
             errors = APPLY_MODULE.validate_apply_run(run_dir, root)
@@ -4134,7 +4591,8 @@ class ApplyRunTests(unittest.TestCase):
                 clear=False,
             ):
                 receipt = APPLY_MODULE.execute_planned_validation(
-                    run_dir, task_id, "VAL-01", "controller"
+                    run_dir, task_id, "VAL-01", "controller",
+                    root=root
                 )
 
             self.assertEqual(receipt["exit_code"], 0)
@@ -4161,17 +4619,17 @@ class ApplyRunTests(unittest.TestCase):
 
             with mock.patch.dict(os.environ, {"PATH": inherited_path}, clear=False):
                 with mock.patch.object(
-                    APPLY_MODULE,
+                    EXECUTION_MODULE,
                     "MAX_VALIDATION_OUTPUT_BYTES",
                     1024,
-                    create=True,
                 ):
                     with self.assertRaisesRegex(
                         ValueError,
                         f"validation_output_limit_exceeded={task_id}:VAL-01",
                     ):
                         APPLY_MODULE.execute_planned_validation(
-                            run_dir, task_id, "VAL-01", "controller"
+                            run_dir, task_id, "VAL-01", "controller",
+                            root=root
                         )
 
             progress = json.loads((run_dir / "Progress.json").read_text(encoding="utf-8"))
@@ -4257,13 +4715,14 @@ class ApplyRunTests(unittest.TestCase):
                 return real_popen(*args, **kwargs)
 
             with mock.patch.object(
-                APPLY_MODULE.subprocess,
+                EXECUTION_MODULE.subprocess,
                 "Popen",
                 side_effect=swap_cwd_at_validation_launch,
             ):
                 with self.assertRaises(ValueError):
                     APPLY_MODULE.execute_planned_validation(
-                        run_dir, task_id, "VAL-01", "controller"
+                        run_dir, task_id, "VAL-01", "controller",
+                        root=root
                     )
 
             self.assertTrue(swapped)
@@ -4290,25 +4749,28 @@ class ApplyRunTests(unittest.TestCase):
             root = Path(temp_dir)
             cwd = root / "tests"
             cwd.mkdir()
-            real_open_child = APPLY_MODULE.open_child_directory
+            repository_io_globals = (
+                EXECUTION_MODULE._controller_validation_cwd.__wrapped__.__globals__
+            )
+            real_require_same_mount = repository_io_globals["require_same_repository_mount"]
 
-            def cross_device_child(parent_fd, name):
-                child_fd, metadata = real_open_child(parent_fd, name)
-                return child_fd, mock.Mock(st_dev=metadata.st_dev + 1)
+            def reject_cross_device_child(anchor, child_fd, relative_path):
+                if relative_path == "tests":
+                    raise ValueError("repository_nested_mount_rejected=tests")
+                return real_require_same_mount(anchor, child_fd, relative_path)
 
             with (
-                mock.patch.object(
-                    APPLY_MODULE,
-                    "open_child_directory",
-                    side_effect=cross_device_child,
+                mock.patch.dict(
+                    repository_io_globals,
+                    {"require_same_repository_mount": reject_cross_device_child},
                 ),
-                mock.patch.object(APPLY_MODULE.subprocess, "Popen") as popen,
+                mock.patch.object(EXECUTION_MODULE.subprocess, "Popen") as popen,
             ):
                 with self.assertRaisesRegex(
                     ValueError,
-                    "validation_cwd_identity_changed",
+                    "validation_cwd_nested_mount_rejected",
                 ):
-                    APPLY_MODULE.run_bounded_validation_process(
+                    EXECUTION_MODULE.run_bounded_validation_process(
                         ["/usr/bin/true"],
                         cwd=cwd,
                         root=root,
@@ -4325,7 +4787,10 @@ class ApplyRunTests(unittest.TestCase):
             root_metadata = os.stat(root, follow_symlinks=False)
             nested_metadata = os.stat(nested, follow_symlinks=False)
             self.assertEqual(root_metadata.st_dev, nested_metadata.st_dev)
-            mount_globals = APPLY_MODULE.require_same_repository_mount.__globals__
+            repository_io_globals = (
+                EXECUTION_MODULE._controller_validation_cwd.__wrapped__.__globals__
+            )
+            mount_globals = repository_io_globals["require_same_repository_mount"].__globals__
             real_mount_identity = mount_globals["_descriptor_mount_identity"]
 
             def simulated_bind_mount(file_fd: int):
@@ -4339,13 +4804,13 @@ class ApplyRunTests(unittest.TestCase):
                     mount_globals,
                     {"_descriptor_mount_identity": simulated_bind_mount},
                 ),
-                mock.patch.object(APPLY_MODULE.subprocess, "Popen") as popen,
+                mock.patch.object(EXECUTION_MODULE.subprocess, "Popen") as popen,
             ):
                 with self.assertRaisesRegex(
                     ValueError,
                     "validation_cwd_nested_mount_rejected",
                 ):
-                    APPLY_MODULE.run_bounded_validation_process(
+                    EXECUTION_MODULE.run_bounded_validation_process(
                         ["/usr/bin/true"],
                         cwd=nested,
                         root=root,
@@ -4358,14 +4823,14 @@ class ApplyRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             with (
-                mock.patch.object(APPLY_MODULE.threading, "active_count", return_value=2),
-                mock.patch.object(APPLY_MODULE.subprocess, "Popen") as popen,
+                mock.patch.object(EXECUTION_MODULE.threading, "active_count", return_value=2),
+                mock.patch.object(EXECUTION_MODULE.subprocess, "Popen") as popen,
             ):
                 with self.assertRaisesRegex(
                     ValueError,
                     "secure_validation_process_isolation_not_supported",
                 ):
-                    APPLY_MODULE.run_bounded_validation_process(
+                    EXECUTION_MODULE.run_bounded_validation_process(
                         ["/usr/bin/true"],
                         cwd=root,
                         root=root,
@@ -4483,7 +4948,8 @@ class ApplyRunTests(unittest.TestCase):
             )
 
             receipt = APPLY_MODULE.execute_planned_validation(
-                run_dir, task_id, "VAL-01", "controller"
+                run_dir, task_id, "VAL-01", "controller",
+                root=root
             )
             time.sleep(0.75)
 
@@ -4503,15 +4969,15 @@ class ApplyRunTests(unittest.TestCase):
                 return process
 
             with (
-                mock.patch.object(APPLY_MODULE.subprocess, "Popen", side_effect=record_popen),
+                mock.patch.object(EXECUTION_MODULE.subprocess, "Popen", side_effect=record_popen),
                 mock.patch.object(
-                    APPLY_MODULE.selectors,
+                    EXECUTION_MODULE.selectors,
                     "DefaultSelector",
                     side_effect=KeyboardInterrupt,
                 ),
             ):
                 with self.assertRaises(KeyboardInterrupt):
-                    APPLY_MODULE.run_bounded_validation_process(
+                    EXECUTION_MODULE.run_bounded_validation_process(
                         [sys.executable, "-c", "import time; time.sleep(30)"],
                         cwd=root,
                         root=root,
@@ -4551,9 +5017,9 @@ class ApplyRunTests(unittest.TestCase):
 
     def test_validation_containment_rejects_unknown_linux_architecture(self) -> None:
         with (
-            mock.patch.object(APPLY_MODULE.sys, "platform", "linux"),
+            mock.patch.object(EXECUTION_MODULE.sys, "platform", "linux"),
             mock.patch.object(
-                APPLY_MODULE.os,
+                EXECUTION_MODULE.os,
                 "uname",
                 return_value=mock.Mock(machine="mips64"),
             ),
@@ -4562,7 +5028,7 @@ class ApplyRunTests(unittest.TestCase):
                 ValueError,
                 "secure_validation_process_isolation_not_supported",
             ):
-                APPLY_MODULE._validation_containment_command(["/usr/bin/true"])
+                EXECUTION_MODULE._containment_command(["/usr/bin/true"])
 
     def test_failed_validation_rerun_invalidates_prior_receipts_and_reviews(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as command_bin:
@@ -4590,13 +5056,14 @@ class ApplyRunTests(unittest.TestCase):
                 {"PATH": f"{command_bin}:{os.environ.get('PATH', '')}"},
                 clear=False,
             ):
-                with mock.patch.object(APPLY_MODULE, "MAX_VALIDATION_OUTPUT_BYTES", 1024):
+                with mock.patch.object(EXECUTION_MODULE, "MAX_VALIDATION_OUTPUT_BYTES", 1024):
                     with self.assertRaisesRegex(
                         ValueError,
                         f"validation_output_limit_exceeded={task_id}:VAL-01",
                     ):
                         APPLY_MODULE.execute_planned_validation(
-                            run_dir, task_id, "VAL-01", "controller"
+                            run_dir, task_id, "VAL-01", "controller",
+                            root=root
                         )
 
             after = json.loads(progress_path.read_text(encoding="utf-8"))
@@ -4607,7 +5074,7 @@ class ApplyRunTests(unittest.TestCase):
             # the durable newer start event invalidates the older publication.
             after["tasks"][0]["validation_receipts"] = [old_reference]
             progress_path.write_text(json.dumps(after), encoding="utf-8")
-            with APPLY_MODULE.open_verified_apply_run_for_mutation(run_dir) as handle:
+            with APPLY_MODULE.open_verified_apply_run_for_mutation(run_dir, root=root) as handle:
                 live_progress = APPLY_MODULE.secure_read_regular_json_at(
                     handle.run_fd, "Progress.json"
                 )
@@ -4656,7 +5123,8 @@ class ApplyRunTests(unittest.TestCase):
             run_dir = Path(result["run_dir"])
             task_id = self.first_task_id(run_dir)
             APPLY_MODULE.prepare_dispatch_packet(
-                run_dir, task_id, "implementer", "controller"
+                run_dir, task_id, "implementer", "controller",
+                root=root
             )
             APPLY_MODULE.record_agent_status(
                 run_dir,
@@ -4665,9 +5133,11 @@ class ApplyRunTests(unittest.TestCase):
                 "mutating-impl",
                 "spawned",
                 "controller",
+            root=root,
             )
             APPLY_MODULE.transition_task_state(
-                run_dir, task_id, "IMPLEMENTING", "mutating-impl"
+                run_dir, task_id, "IMPLEMENTING", "mutating-impl",
+                root=root
             )
             source = root / "src" / "feature_1_1.py"
             source.parent.mkdir(parents=True, exist_ok=True)
@@ -4695,6 +5165,7 @@ class ApplyRunTests(unittest.TestCase):
                     "concerns": [],
                 },
                 "controller",
+            root=root,
             )
             APPLY_MODULE.record_agent_status(
                 run_dir,
@@ -4703,11 +5174,13 @@ class ApplyRunTests(unittest.TestCase):
                 "mutating-impl",
                 "completed",
                 "controller",
+            root=root,
             )
             APPLY_MODULE.transition_task_state(
-                run_dir, task_id, "IMPLEMENTED", "mutating-impl"
+                run_dir, task_id, "IMPLEMENTED", "mutating-impl",
+                root=root
             )
-            APPLY_MODULE.capture_task_change_set(run_dir, task_id, "controller")
+            APPLY_MODULE.capture_task_change_set(run_dir, task_id, "controller", root=root)
 
             with tempfile.TemporaryDirectory() as command_bin:
                 python_wrapper = Path(command_bin) / "python3"
@@ -4725,7 +5198,8 @@ class ApplyRunTests(unittest.TestCase):
                         f"validation_command_mutated_repository={task_id}:VAL-01",
                     ):
                         APPLY_MODULE.execute_planned_validation(
-                            run_dir, task_id, "VAL-01", "controller"
+                            run_dir, task_id, "VAL-01", "controller",
+                            root=root
                         )
 
             progress = json.loads((run_dir / "Progress.json").read_text(encoding="utf-8"))
@@ -4734,6 +5208,19 @@ class ApplyRunTests(unittest.TestCase):
                 list((run_dir / task_id).glob("Validation-Receipt-*.json")),
                 [],
             )
+            events = [
+                json.loads(line)
+                for line in (run_dir / "Events.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            validation_events = [
+                event.get("event_type")
+                for event in events
+                if event.get("validation_id") == "VAL-01"
+            ]
+            self.assertIn("validation_execution_started", validation_events)
+            self.assertNotIn("validation_execution_observed", validation_events)
+            self.assertNotIn("validation_receipt_published", validation_events)
 
     def test_validation_secret_output_is_rejected_before_receipt_or_raw_output_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4741,11 +5228,12 @@ class ApplyRunTests(unittest.TestCase):
             self.write_apply_fixture(root)
             run_dir = Path(self.create_apply_run(root, "subagent_serial")["run_dir"])
             task_id = self.first_task_id(run_dir)
-            APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller")
+            APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller", root=root)
             APPLY_MODULE.record_agent_status(
-                run_dir, task_id, "implementer", "output-impl", "spawned", "controller"
+                run_dir, task_id, "implementer", "output-impl", "spawned", "controller",
+                root=root
             )
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "output-impl")
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "output-impl", root=root)
             (root / "src").mkdir(exist_ok=True)
             (root / "tests").mkdir(exist_ok=True)
             (root / "src" / "feature_1_1.py").write_text("VALUE = 1\n", encoding="utf-8")
@@ -4766,12 +5254,14 @@ class ApplyRunTests(unittest.TestCase):
                     "concerns": [],
                 },
                 "controller",
+            root=root,
             )
             APPLY_MODULE.record_agent_status(
-                run_dir, task_id, "implementer", "output-impl", "completed", "controller"
+                run_dir, task_id, "implementer", "output-impl", "completed", "controller",
+                root=root
             )
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTED", "output-impl")
-            APPLY_MODULE.capture_task_change_set(run_dir, task_id, "controller")
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTED", "output-impl", root=root)
+            APPLY_MODULE.capture_task_change_set(run_dir, task_id, "controller", root=root)
             fixture = "xox" + "b-" + "N" * 32
             completed = APPLY_MODULE.ValidationProcessResult(
                 exit_code=0,
@@ -4789,7 +5279,8 @@ class ApplyRunTests(unittest.TestCase):
                     return_value=completed,
                 ):
                     APPLY_MODULE.execute_planned_validation(
-                        run_dir, task_id, "VAL-01", "controller"
+                        run_dir, task_id, "VAL-01", "controller",
+                        root=root
                     )
             except ValueError as exc:
                 self.assertNotIn(fixture, str(exc))
@@ -5020,6 +5511,7 @@ class ApplyRunTests(unittest.TestCase):
                         task_id,
                         "VERIFIED",
                         "controller",
+                    root=root,
                     )
                 self.assertIn("workspace_baseline_mismatch=", str(blocked.exception))
 
@@ -5058,6 +5550,7 @@ class ApplyRunTests(unittest.TestCase):
                 "final_reviewer",
                 "controller",
                 review_phase="final",
+            root=root,
             )
             APPLY_MODULE.record_agent_status(
                 run_dir,
@@ -5067,6 +5560,7 @@ class ApplyRunTests(unittest.TestCase):
                 "spawned",
                 "controller",
                 review_phase="final",
+            root=root,
             )
             with self.assertRaises(ValueError) as normalize_error:
                 APPLY_MODULE.normalize_review_report(
@@ -5083,6 +5577,7 @@ class ApplyRunTests(unittest.TestCase):
                         "evidence": ["tamper regression probe"],
                     },
                     "controller",
+                root=root,
                 )
             self.assertRegex(
                 str(normalize_error.exception),
@@ -5095,6 +5590,7 @@ class ApplyRunTests(unittest.TestCase):
                     task_id,
                     "final",
                     "controller",
+                root=root,
                 )
             self.assertRegex(
                 str(publish_error.exception),
@@ -5107,6 +5603,7 @@ class ApplyRunTests(unittest.TestCase):
                     task_id,
                     "VERIFIED",
                     "controller",
+                root=root,
                 )
             self.assertRegex(
                 str(verified_error.exception),
@@ -5134,7 +5631,13 @@ class ApplyRunTests(unittest.TestCase):
                 "task_reviewer",
                 "controller",
                 review_phase="spec",
+            root=root,
             )
+            packet_text = (run_dir / task_id / "Dispatch-Packet.json").read_text(encoding="utf-8")
+            self.assertGreater(len(packet_text), 10_000)
+            scan_started = time.perf_counter()
+            self.assertEqual(SAFETY_MODULE.secret_findings(packet_text), [])
+            self.assertLess(time.perf_counter() - scan_started, 1.0)
             APPLY_MODULE.record_agent_status(
                 run_dir,
                 task_id,
@@ -5143,6 +5646,7 @@ class ApplyRunTests(unittest.TestCase):
                 "spawned",
                 "controller",
                 review_phase="spec",
+            root=root,
             )
             APPLY_MODULE.normalize_review_report(
                 run_dir,
@@ -5158,6 +5662,7 @@ class ApplyRunTests(unittest.TestCase):
                     "evidence": ["identity separation regression probe"],
                 },
                 "controller",
+            root=root,
             )
 
             with self.assertRaises(ValueError):
@@ -5169,6 +5674,7 @@ class ApplyRunTests(unittest.TestCase):
                     "completed",
                     "controller",
                     review_phase="spec",
+                root=root,
                 )
             with self.assertRaises(ValueError):
                 APPLY_MODULE.publish_review_completion(
@@ -5176,6 +5682,7 @@ class ApplyRunTests(unittest.TestCase):
                     task_id,
                     "spec",
                     "controller",
+                root=root,
                 )
             with self.assertRaises(ValueError):
                 APPLY_MODULE.transition_task_state(
@@ -5183,6 +5690,7 @@ class ApplyRunTests(unittest.TestCase):
                     task_id,
                     "VERIFIED",
                     "controller",
+                root=root,
                 )
 
             progress = json.loads((run_dir / "Progress.json").read_text(encoding="utf-8"))
@@ -5206,6 +5714,7 @@ class ApplyRunTests(unittest.TestCase):
                 "task_reviewer",
                 "controller",
                 review_phase="spec",
+            root=root,
             )
             APPLY_MODULE.record_agent_status(
                 run_dir,
@@ -5215,6 +5724,7 @@ class ApplyRunTests(unittest.TestCase):
                 "spawned",
                 "controller",
                 review_phase="spec",
+            root=root,
             )
             report = {
                 "status": "COMPLETE",
@@ -5241,6 +5751,7 @@ class ApplyRunTests(unittest.TestCase):
                     "completed",
                     "controller",
                     review_phase="spec",
+                root=root,
                 )
 
             normalized = APPLY_MODULE.normalize_review_report(
@@ -5250,6 +5761,7 @@ class ApplyRunTests(unittest.TestCase):
                 "spec-review-1",
                 report,
                 "controller",
+            root=root,
             )
             self.assertEqual(normalized["event"]["host_completion_proof"], "not_observed")
             completed = APPLY_MODULE.record_agent_status(
@@ -5260,6 +5772,7 @@ class ApplyRunTests(unittest.TestCase):
                 "completed",
                 "controller",
                 review_phase="spec",
+            root=root,
             )
             self.assertEqual(completed["status"], "completed")
 
@@ -5270,12 +5783,12 @@ class ApplyRunTests(unittest.TestCase):
             result = self.create_apply_run(root, "direct")
             run_dir = Path(result["run_dir"])
             task_id = self.first_task_id(run_dir)
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "controller")
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTED", "controller")
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "TASK_REVIEW", "controller")
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "controller", root=root)
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTED", "controller", root=root)
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "TASK_REVIEW", "controller", root=root)
 
             with self.assertRaisesRegex(ValueError, "verified_requires_subagent_reviewer_receipts"):
-                APPLY_MODULE.transition_task_state(run_dir, task_id, "VERIFIED", "controller")
+                APPLY_MODULE.transition_task_state(run_dir, task_id, "VERIFIED", "controller", root=root)
 
     def test_receipt_cli_rejects_direct_reviewer_and_unplanned_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5289,6 +5802,8 @@ class ApplyRunTests(unittest.TestCase):
                 dispatch_status = APPLY_MODULE.main(
                     [
                         "dispatch",
+                        "--root",
+                        str(root),
                         "--run-dir",
                         str(run_dir),
                         "--task-id",
@@ -5303,7 +5818,7 @@ class ApplyRunTests(unittest.TestCase):
                 )
             self.assertEqual(dispatch_status, 1)
 
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "controller")
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "controller", root=root)
             source = root / "src" / "feature_1_1.py"
             source.parent.mkdir(parents=True, exist_ok=True)
             source.write_text("VALUE = 1\n", encoding="utf-8")
@@ -5313,12 +5828,14 @@ class ApplyRunTests(unittest.TestCase):
                 "from src.feature_1_1 import VALUE\n\ndef test_value():\n    assert VALUE == 1\n",
                 encoding="utf-8",
             )
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTED", "controller")
-            APPLY_MODULE.capture_task_change_set(run_dir, task_id, "controller")
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTED", "controller", root=root)
+            APPLY_MODULE.capture_task_change_set(run_dir, task_id, "controller", root=root)
             with mock.patch.object(sys, "stderr"):
                 validation_status = APPLY_MODULE.main(
                     [
                         "run-validation",
+                        "--root",
+                        str(root),
                         "--run-dir",
                         str(run_dir),
                         "--task-id",
@@ -5350,7 +5867,7 @@ class ApplyRunTests(unittest.TestCase):
             content = subplan.read_text(encoding="utf-8")
             self.assertIn(canonical, content)
             subplan.write_text(content.replace(canonical, unsafe, 1), encoding="utf-8")
-            fixed = root / ".codexqb" / "apply-runs" / "fixed"
+            fixed = APPLY_MODULE.managed_apply_runs_root(root) / "fixed"
 
             with self.assertRaisesRegex(ValueError, "step4_validator_failed="):
                 self.create_apply_run(root, "direct", fixed)
@@ -5456,9 +5973,9 @@ class ApplyRunTests(unittest.TestCase):
 
             self.assertIn("workspace_baseline_mismatch=workspace_file_inventory_sha256", errors)
             with self.assertRaisesRegex(ValueError, "workspace_baseline_mismatch=workspace_file_inventory_sha256"):
-                APPLY_MODULE.publish_review_completion(run_dir, task_id, "final", "controller")
+                APPLY_MODULE.publish_review_completion(run_dir, task_id, "final", "controller", root=root)
             with self.assertRaisesRegex(ValueError, "workspace_baseline_mismatch=workspace_file_inventory_sha256"):
-                APPLY_MODULE.transition_task_state(run_dir, task_id, "VERIFIED", "controller")
+                APPLY_MODULE.transition_task_state(run_dir, task_id, "VERIFIED", "controller", root=root)
 
     def test_git_ignored_untracked_cannot_hide_contract_external_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5503,9 +6020,9 @@ class ApplyRunTests(unittest.TestCase):
 
             self.assertIn("workspace_baseline_mismatch=workspace_file_inventory_sha256", errors)
             with self.assertRaisesRegex(ValueError, "workspace_baseline_mismatch=workspace_file_inventory_sha256"):
-                APPLY_MODULE.publish_review_completion(run_dir, task_id, "final", "controller")
+                APPLY_MODULE.publish_review_completion(run_dir, task_id, "final", "controller", root=root)
             with self.assertRaisesRegex(ValueError, "workspace_baseline_mismatch=workspace_file_inventory_sha256"):
-                APPLY_MODULE.transition_task_state(run_dir, task_id, "VERIFIED", "controller")
+                APPLY_MODULE.transition_task_state(run_dir, task_id, "VERIFIED", "controller", root=root)
 
     def test_unreadable_contract_external_directory_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5543,21 +6060,29 @@ class ApplyRunTests(unittest.TestCase):
                     any(
                         error.startswith("workspace_baseline_mismatch=workspace_file_")
                         or error.startswith("workspace_scope_validation_unavailable=workspace_inventory_walk_failed")
+                        or error.startswith(
+                            "workspace_scope_validation_unavailable=repository_io_inventory_failed="
+                        )
                         or error
                         == "workspace_scope_validation_unavailable=repository_path_parent_identity_changed"
+                        or error
+                        == "workspace_scope_validation_unavailable=repository_io_workspace_proof_failed"
                         for error in errors
                     ),
                     errors,
                 )
                 rejection = (
                     r"workspace_(?:baseline_mismatch|inventory_walk_failed)"
+                    r"|repository_io_inventory_failed=repository_inventory_walk_failed"
+                    r"|repository_io_workspace_proof_failed"
                     r"|workspace_scope_validation_unavailable="
-                    r"(?:workspace_inventory_walk_failed|repository_path_parent_identity_changed)"
+                    r"(?:workspace_inventory_walk_failed|repository_path_parent_identity_changed"
+                    r"|repository_io_inventory_failed=repository_inventory_walk_failed)"
                 )
                 with self.assertRaisesRegex(ValueError, rejection):
-                    APPLY_MODULE.publish_review_completion(run_dir, task_id, "final", "controller")
+                    APPLY_MODULE.publish_review_completion(run_dir, task_id, "final", "controller", root=root)
                 with self.assertRaisesRegex(ValueError, rejection):
-                    APPLY_MODULE.transition_task_state(run_dir, task_id, "VERIFIED", "controller")
+                    APPLY_MODULE.transition_task_state(run_dir, task_id, "VERIFIED", "controller", root=root)
             finally:
                 hidden.chmod(0o700)
 
@@ -5568,11 +6093,12 @@ class ApplyRunTests(unittest.TestCase):
             result = self.create_apply_run(root, "subagent_serial")
             run_dir = Path(result["run_dir"])
             task_id = self.first_task_id(run_dir)
-            APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller")
+            APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller", root=root)
             APPLY_MODULE.record_agent_status(
-                run_dir, task_id, "implementer", "impl-1", "spawned", "controller"
+                run_dir, task_id, "implementer", "impl-1", "spawned", "controller",
+                root=root
             )
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-1")
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "impl-1", root=root)
             (root / "src").mkdir(exist_ok=True)
             (root / "tests").mkdir(exist_ok=True)
             (root / "src" / "feature_1_1.py").write_text("VALUE = 1\n", encoding="utf-8")
@@ -5593,9 +6119,11 @@ class ApplyRunTests(unittest.TestCase):
                     "concerns": [],
                 },
                 "controller",
+            root=root,
             )
             APPLY_MODULE.record_agent_status(
-                run_dir, task_id, "implementer", "impl-1", "completed", "controller"
+                run_dir, task_id, "implementer", "impl-1", "completed", "controller",
+                root=root
             )
             progress_path = run_dir / "Progress.json"
             progress = json.loads(progress_path.read_text(encoding="utf-8"))
@@ -5608,7 +6136,7 @@ class ApplyRunTests(unittest.TestCase):
             agent_path.write_text(json.dumps(artifact), encoding="utf-8")
 
             with self.assertRaisesRegex(ValueError, "controller_asserted_writer_identity_required"):
-                APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTED", "impl-1")
+                APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTED", "impl-1", root=root)
 
     def test_finalize_rechecks_live_host_attestation_after_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5636,7 +6164,7 @@ class ApplyRunTests(unittest.TestCase):
                     ValueError,
                     "trusted_verified_requires_host_agent_attestation",
                 ):
-                    APPLY_MODULE.finalize_apply_run(run_dir, "controller")
+                    APPLY_MODULE.finalize_apply_run(run_dir, "controller", root=root)
 
     def test_fix_cycle_requires_current_fixer_and_binds_new_receipts_to_fixer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5646,13 +6174,14 @@ class ApplyRunTests(unittest.TestCase):
             run_dir = Path(result["run_dir"])
             task_id = self.first_task_id(run_dir)
             self.complete_subagent_serial_verification(root, run_dir, stop_after_quality=True)
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "FIXING", "controller")
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "FIXING", "controller", root=root)
             with self.assertRaisesRegex(ValueError, "current_fixer_completion_required"):
-                APPLY_MODULE.transition_task_state(run_dir, task_id, "RE_REVIEW", "controller")
+                APPLY_MODULE.transition_task_state(run_dir, task_id, "RE_REVIEW", "controller", root=root)
 
-            APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "fixer", "controller")
+            APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "fixer", "controller", root=root)
             APPLY_MODULE.record_agent_status(
-                run_dir, task_id, "fixer", "fixer-1", "spawned", "controller"
+                run_dir, task_id, "fixer", "fixer-1", "spawned", "controller",
+                root=root
             )
             (root / "src" / "feature_1_1.py").write_text("VALUE = 2\n", encoding="utf-8")
             (root / "tests" / "test_feature_1_1.py").write_text(
@@ -5680,12 +6209,14 @@ class ApplyRunTests(unittest.TestCase):
                     "evidence": ["focused behavior updated"],
                 },
                 "controller",
+            root=root,
             )
             APPLY_MODULE.record_agent_status(
-                run_dir, task_id, "fixer", "fixer-1", "completed", "controller"
+                run_dir, task_id, "fixer", "fixer-1", "completed", "controller",
+                root=root
             )
-            APPLY_MODULE.transition_task_state(run_dir, task_id, "RE_REVIEW", "controller")
-            APPLY_MODULE.capture_task_change_set(run_dir, task_id, "controller")
+            APPLY_MODULE.transition_task_state(run_dir, task_id, "RE_REVIEW", "controller", root=root)
+            APPLY_MODULE.capture_task_change_set(run_dir, task_id, "controller", root=root)
             with tempfile.TemporaryDirectory() as command_bin:
                 python_wrapper = Path(command_bin) / "python3"
                 python_wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -5697,7 +6228,8 @@ class ApplyRunTests(unittest.TestCase):
                     progress = json.loads((run_dir / "Progress.json").read_text(encoding="utf-8"))
                     for command in progress["tasks"][0]["validation_commands"]:
                         APPLY_MODULE.execute_planned_validation(
-                            run_dir, task_id, command["id"], "controller"
+                            run_dir, task_id, command["id"], "controller",
+                            root=root
                         )
 
             progress = json.loads((run_dir / "Progress.json").read_text(encoding="utf-8"))

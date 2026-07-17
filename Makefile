@@ -2,6 +2,8 @@ SHELL := /bin/bash
 PYTHON ?= python3
 NO_BYTECODE = PYTHONDONTWRITEBYTECODE=1
 PLATFORM_POLICY ?= auto
+CODEXQB_SKILL_ROOT := $(abspath plugins/codexqb/skills/codexqb)
+CODEXQB_LAUNCHER := $(CODEXQB_SKILL_ROOT)/scripts/skill_launcher.py
 
 .PHONY: check check-fast check-static check-unit check-platform check-schema check-behavior check-package check-public-privacy check-release test export-plugin export-source export-plugin-worktree export-source-worktree export-source-package export-sanitized export-sanitized-worktree export-sanitized-source-package
 
@@ -27,8 +29,8 @@ check-platform:
 	@set -euo pipefail; \
 	tmpdir="$$(mktemp -d)"; \
 	trap 'rm -rf "$$tmpdir"' EXIT; \
-	$(NO_BYTECODE) $(PYTHON) plugins/codexqb/skills/codexqb/scripts/doctor.py --json > "$$tmpdir/doctor.json"; \
-	$(NO_BYTECODE) $(PYTHON) plugins/codexqb/skills/codexqb/scripts/doctor.py; \
+	$(NO_BYTECODE) $(PYTHON) -I -S -B "$(CODEXQB_LAUNCHER)" --active-skill-md "$(CODEXQB_SKILL_ROOT)/SKILL.md" --controller doctor -- --json > "$$tmpdir/doctor.json"; \
+	$(NO_BYTECODE) $(PYTHON) -I -S -B "$(CODEXQB_LAUNCHER)" --active-skill-md "$(CODEXQB_SKILL_ROOT)/SKILL.md" --controller doctor --; \
 	probe_output="$$( $(NO_BYTECODE) $(PYTHON) tests/platform/run_mount_identity_probe.py )"; \
 	echo "$$probe_output"; \
 	if [[ "$(PLATFORM_POLICY)" == "required" && "$$probe_output" != *"status=ready "* ]]; then \
@@ -71,7 +73,7 @@ check-release:
 	$(NO_BYTECODE) $(PYTHON) scripts/verify_package_manifest.py --root "$$tmpdir/plugin" --strict-artifact --expected-artifact-type plugin; \
 	test -f "$$tmpdir/plugin/.codex-plugin/plugin.json"; \
 	$(NO_BYTECODE) $(PYTHON) scripts/verify_package_manifest.py --root "$$tmpdir/source/CodexQB" --strict-artifact --expected-artifact-type source; \
-	cd "$$tmpdir/source/CodexQB" && CODEXQB_VALIDATE_SKIP_UNITTESTS=1 CODEXQB_VALIDATE_SKIP_BEHAVIOR_SMOKE=1 bash scripts/validate.sh
+	$(NO_BYTECODE) $(PYTHON) -I -S -B scripts/run_extracted_validation.py --expected-head "$$(git rev-parse --verify HEAD)" --zip "$$tmpdir/CodexQB-source-release.zip" --root "$$tmpdir/source/CodexQB" --profile static --skip-unit-tests --skip-behavior-smoke
 
 # Legacy full discovery remains available for maintainers. Gate-aware CI uses
 # the explicit targets above so schema/package/platform behavior cannot drift.

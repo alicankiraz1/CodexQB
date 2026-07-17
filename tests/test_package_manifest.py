@@ -326,6 +326,9 @@ class PackageManifestTests(unittest.TestCase):
             "LPT²",
             "LPT³.log",
             "illegal:name.txt",
+            "scripts/issue_trusted_source_authority.py",
+            "scripts/run_extracted_validation.py",
+            "scripts/validate.sh",
         ):
             with self.subTest(artifact_type="source", path=path):
                 self.assertIsNotNone(
@@ -349,6 +352,42 @@ class PackageManifestTests(unittest.TestCase):
                     VERIFY_MODULE.denied_path_reason(path, "plugin")
                 )
 
+    def test_source_package_rejects_manifest_bound_controller_entrypoints(self) -> None:
+        for relative in (
+            "scripts/issue_trusted_source_authority.py",
+            "scripts/run_extracted_validation.py",
+            "scripts/validate.sh",
+        ):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as temp_dir:
+                base = Path(temp_dir)
+                _root, source = create_source_package(base)
+                crafted = base / "crafted-controller.zip"
+                append_manifest_bound_file(
+                    source,
+                    crafted,
+                    artifact_type="source",
+                    relative_path=relative,
+                    data=b"#!/bin/sh\nexit 0\n",
+                    mode="0755",
+                )
+
+                self.assertTrue(
+                    any(
+                        issue.startswith("package_manifest_denied_path")
+                        for issue in VERIFY_MODULE.verify_zip(crafted)
+                    ),
+                    relative,
+                )
+                extracted = base / "crafted-root"
+                extract_with_modes(crafted, extracted)
+                self.assertIn(
+                    "package_directory_denied_path",
+                    VERIFY_MODULE.verify_directory(
+                        extracted / "CodexQB",
+                        strict_artifact=True,
+                        expected_artifact_type="source",
+                    ),
+                )
     def test_portable_paths_have_bounded_depth_and_encoded_lengths(self) -> None:
         self.assertIsNone(
             VERIFY_MODULE.canonical_relative_path("/".join(["a"] * 65))
@@ -1781,6 +1820,7 @@ class PackageManifestTests(unittest.TestCase):
         joined_fixture = "sk-" + "J" * 40
         neutral_join_tail = "N" * 40
         neutral_join_fixture = "sk-" + neutral_join_tail
+        non_ascii_assignment = "password=" + "密碼值" * 16
         fixtures = (
             ("payload.bin", b"\xff" + ("sk-" + "C" * 40).encode("ascii"), None),
             ("payload-utf32.bin", utf32_fixture.encode("utf-32-be"), utf32_fixture),
@@ -1852,6 +1892,148 @@ class PackageManifestTests(unittest.TestCase):
                 ).encode("utf-8"),
                 neutral_join_fixture,
             ),
+            (
+                "credential-pair.md",
+                ("release failure: password, '" + credential + "'\n").encode("utf-8"),
+                credential,
+            ),
+            (
+                "credential-table.md",
+                (
+                    "| Field | Value |\n| --- | --- |\n| password | "
+                    + credential
+                    + " |\n"
+                ).encode("utf-8"),
+                credential,
+            ),
+            (
+                "credential-failure.txt",
+                ("failure=('password', {'value': '" + credential + "'})\n").encode("utf-8"),
+                credential,
+            ),
+            (
+                "credential-record.yaml",
+                (
+                    "- name: AWS_SECRET_ACCESS_KEY\n  value: "
+                    + credential
+                    + "\n"
+                ).encode("utf-8"),
+                credential,
+            ),
+            (
+                "opaque-pair",
+                ("failure=('password','" + credential + "')\n").encode("utf-8"),
+                credential,
+            ),
+            (
+                "opaque-record",
+                json.dumps({"name": "password", "value": credential}).encode("utf-8"),
+                credential,
+            ),
+            (
+                "opaque-block",
+                ("name: password\nvalue: " + credential + "\n").encode("utf-8"),
+                credential,
+            ),
+            (
+                "opaque-table",
+                ("| password | " + credential + " |\n").encode("utf-8"),
+                credential,
+            ),
+            (
+                "opaque-wide-block",
+                b"\x81" * 61
+                + b"\xff\xfe"
+                + ("name: password\nvalue: " + credential + "\n").encode(
+                    "utf-16-le"
+                ),
+                credential,
+            ),
+            (
+                "credential-concat.txt",
+                ("failure=('password', '" + credential + "' + '')\n").encode("utf-8"),
+                credential,
+            ),
+            (
+                "credential-concat-terminator",
+                (
+                    "failure=('password', ('$PASSWORD' + '') and '"
+                    + credential
+                    + "')\n"
+                ).encode("utf-8"),
+                credential,
+            ),
+            (
+                "credential-fstring.txt",
+                ("failure=('password', f'" + credential + "' + '')\n").encode("utf-8"),
+                credential,
+            ),
+            (
+                "credential-concat-boundary.txt",
+                (
+                    "failure=('password', '$PASSWORD'"
+                    + (" " * 4084)
+                    + "+ '"
+                    + credential
+                    + "')\n"
+                ).encode("utf-8"),
+                credential,
+            ),
+            (
+                "credential-rendered.md",
+                (
+                    "| Field | Value |\n| --- | --- |\n| pass&#119;ord | "
+                    + credential
+                    + " |\n"
+                ).encode("utf-8"),
+                credential,
+            ),
+            (
+                "credential-rendered-direct.md",
+                ("**password**=" + credential + "\n").encode("utf-8"),
+                credential,
+            ),
+            (
+                "credential-rendered.rst",
+                ("``password``=" + credential + "\n").encode("utf-8"),
+                credential,
+            ),
+            (
+                "credential-rendered.html",
+                ("<b>password</b>=" + credential + "\n").encode("utf-8"),
+                credential,
+            ),
+            (
+                "credential-rendered.xml",
+                ("<label>password</label>=" + credential + "\n").encode("utf-8"),
+                credential,
+            ),
+            (
+                "credential-structural.html",
+                (
+                    "<table><tr><td>password</td><td>"
+                    + credential
+                    + "</td></tr></table>\n"
+                ).encode("utf-8"),
+                credential,
+            ),
+            (
+                "credential-structural.xml",
+                (
+                    "<record><name>password</name><value>"
+                    + credential
+                    + "</value></record>\n"
+                ).encode("utf-8"),
+                credential,
+            ),
+            (
+                "credential-rendered.txt",
+                ("pass&#119;ord=" + credential + "\n").encode("utf-8"),
+                credential,
+            ),
+            ("payload-utf8", non_ascii_assignment.encode("utf-8"), non_ascii_assignment),
+            ("payload-utf16", non_ascii_assignment.encode("utf-16-le"), non_ascii_assignment),
+            ("payload-opaque", b"password=" + b"\xff" * 40, None),
         )
         for relative_path, data, fixture in fixtures:
             with self.subTest(path=relative_path), tempfile.TemporaryDirectory() as temp_dir:
@@ -1889,7 +2071,11 @@ class PackageManifestTests(unittest.TestCase):
 
     def test_zip_and_extracted_verifiers_reject_secret_paths_and_accept_bytes_placeholder(self) -> None:
         fixture = "sk-" + "P" * 40
-        variants = (f"{fixture}.txt", f"safe/{fixture}/payload.txt")
+        variants = (
+            f"{fixture}.txt",
+            f"safe/{fixture}/payload.txt",
+            f".env/{fixture}.txt",
+        )
         for relative_path in variants:
             with self.subTest(path_hash=hashlib.sha256(relative_path.encode()).hexdigest()), tempfile.TemporaryDirectory() as temp_dir:
                 base = Path(temp_dir)
@@ -1920,6 +2106,21 @@ class PackageManifestTests(unittest.TestCase):
                     directory_errors,
                 )
                 self.assertNotIn(fixture, repr(zip_errors) + repr(directory_errors))
+                if relative_path.startswith(".env/"):
+                    self.assertTrue(
+                        any(
+                            error.startswith("package_manifest_secret_path=")
+                            for error in zip_errors
+                        ),
+                        zip_errors,
+                    )
+                    self.assertFalse(
+                        any(
+                            error.startswith("package_manifest_denied_path=")
+                            for error in zip_errors
+                        ),
+                        zip_errors,
+                    )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)

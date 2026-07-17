@@ -18,7 +18,7 @@ Goal Run Contract:
 
 Resume / Recovery Protocol:
 1. Re-read this canonical Goal Run Contract.
-2. Read current git status and branch.
+2. Revalidate the controller-owned workspace proof and baseline bound to the current Apply run. If it is absent, stale, or reports an unsafe posture, stop; never reconstruct branch or dirty state with raw Git or shell reads.
 3. Re-read the active audit, ledger, plan snapshot, and selected sub-plan.
 4. Reconcile ledger state with repository evidence.
 5. Do not repeat a slice whose controller evidence is already complete; do not relabel it `VERIFIED` without host attestation.
@@ -44,7 +44,7 @@ Step 4 apply modes:
 For each implementation slice:
 1. Name the active phase/sub-plan and the specific acceptance criterion being targeted.
 2. Read AGENTS.md, README.md, Makefile, repo instructions, the audit, the index, optional ontology/ledger files as needed, only the active sub-plan, and only the `Project-Comprehension.md` CQ/TRACE/ARC/HYP rows relevant to the active slice.
-3. Run git status and stop if unrelated dirty changes or conflicts exist.
+3. Revalidate the Apply controller's workspace proof and baseline; stop if that evidence reports unrelated dirty changes, conflicts, or source drift.
 4. Inspect relevant files before editing.
 5. For non-trivial work, start a fresh-slice implementer/worker context when available. The implementer must return one structured JSON payload with one of: `DONE`, `DONE_WITH_CONCERNS`, `NEEDS_CONTEXT`, or `BLOCKED`, plus changed files and concerns; it must not write `Implementer-Report.json`, `Fix-Report.json`, or any other Apply artifact. After recording the spawned lifecycle, the controller must persist the initial writer return with `normalize-writer` before `record-agent --status completed` and before advancing from `IMPLEMENTING` to `IMPLEMENTED` (or from `FIXING` to `RE_REVIEW`). Do not accept a free-text agent ID or self-reported command hash as proof. Do not inherit unresolved assumptions from an earlier slice without restating evidence.
 6. Prefer adding or adjusting a focused failing test first when practical.

@@ -9,6 +9,77 @@ systems.
 
 from __future__ import annotations
 
+import sys
+
+if __name__ == "__main__" and not (
+    sys.flags.isolated
+    and sys.flags.no_site
+    and sys.flags.dont_write_bytecode
+    and sys.flags.optimize == 0
+):
+    sys.stderr.write(
+        "codexqb_controller=unsupported "
+        "reason=requires_python_-I_-S_-B_first_process\n"
+    )
+    raise SystemExit(2)
+
+from types import ModuleType
+
+
+def _launcher_admission_is_valid(expected_basename: str) -> bool:
+    context = sys.modules.get("_codexqb_held_runtime_context_v1")
+    if not isinstance(context, ModuleType):
+        return False
+    try:
+        state = ModuleType.__getattribute__(context, "__dict__")
+    except (AttributeError, TypeError):
+        return False
+    runtime_sources = state.get("runtime_sources")
+    if (
+        type(expected_basename) is not str
+        or not expected_basename
+        or type(state.get("__name__")) is not str
+        or state.get("__name__") != "_codexqb_held_runtime_context_v1"
+        or type(state.get("schema_version")) is not int
+        or state.get("schema_version") != 1
+        or type(state.get("assurance")) is not str
+        or state.get("assurance")
+        != "controller_observed_loader_path_unattested"
+        or state.get("host_attested") is not False
+        or state.get("verified") is not False
+        or state.get("finalization_authority") is not False
+        or "runtime_sha256" in state
+        or "goal_sha256" in state
+        or type(runtime_sources) is not tuple
+        or not runtime_sources
+    ):
+        return False
+    source_names: list[str] = []
+    for item in runtime_sources:
+        if type(item) is not tuple or len(item) != 2:
+            return False
+        source_name, source = item
+        if (
+            type(source_name) is not str
+            or not source_name
+            or type(source) is not bytes
+            or not source
+        ):
+            return False
+        source_names.append(source_name)
+    return bool(
+        tuple(source_names) == tuple(sorted(source_names))
+        and len(source_names) == len(set(source_names))
+        and expected_basename in source_names
+    )
+
+if __name__ == "__main__" and not _launcher_admission_is_valid("apply_run.py"):
+    sys.stderr.write(
+        "codexqb_controller=unsupported reason=launcher_admission_required\n"
+    )
+    raise SystemExit(2)
+
+
 import argparse
 import base64
 from contextlib import contextmanager
@@ -20,15 +91,9 @@ import errno
 import hashlib
 import hmac
 import json
-import os
 import re
 import secrets
-import selectors
-import signal
 import stat
-import subprocess
-import sys
-import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -44,7 +109,7 @@ from safety_contracts import (  # noqa: E402
     budget_limit,
     canonical_json_digest,
     default_budget_contract,
-    implementation_contract_source_binding,
+    implementation_contract_binding_from_bytes,
     implementation_contract_validation_command_ids,
     has_secret_like,
     parse_safe_persistent_json,
@@ -55,19 +120,6 @@ from safety_contracts import (  # noqa: E402
     token_usage_not_observed,
     validate_budget_contract,
     validate_token_usage,
-)
-from artifact_io import (  # noqa: E402
-    atomic_write_bytes_at as secure_atomic_write_bytes_at,
-    atomic_write_json_at as secure_atomic_write_json_at,
-    atomic_write_text_at as secure_atomic_write_text_at,
-    directory_entry_matches as secure_directory_entry_matches,
-    locked_directory,
-    read_regular_bytes_at as secure_read_regular_bytes_at,
-    read_regular_unvalidated_bytes_at as secure_read_regular_unvalidated_bytes_at,
-    read_regular_json_at as secure_read_regular_json_at,
-    read_regular_text_at as secure_read_regular_text_at,
-    regular_target_metadata_at,
-    unlink_regular_at as secure_unlink_regular_at,
 )
 from evidence_contracts import (  # noqa: E402
     CONTROLLER_OBSERVER,
@@ -91,27 +143,90 @@ from repository_evidence import (  # noqa: E402
     DEFAULT_MAX_TOTAL_BYTES as DEFAULT_WORKSPACE_INVENTORY_MAX_TOTAL_BYTES,
     DEFAULT_SNAPSHOT_TIMEOUT_SECONDS as DEFAULT_WORKSPACE_INVENTORY_TIMEOUT_SECONDS,
     REPOSITORY_EVIDENCE_SCHEMA_VERSION,
-    baseline_digest as repository_baseline_digest,
-    capture_repository_evidence,
-    normalize_repo_relative_path,
-    open_repository_root_anchor,
-    repository_snapshot_digest,
-    require_same_repository_mount,
-    snapshot_allowed_paths,
-    snapshot_repository_inventory,
 )
-from mount_identity import (  # noqa: E402
+from repository_io import (  # noqa: E402
+    ControllerRootProof,
+    RepositoryIO,
+    RepositoryIOPolicy,
+    _controller_baseline_digest as controller_baseline_digest,
+    _controller_canonical_root as canonical_repository_root,
+    _controller_evidence_digest as controller_evidence_digest,
+    _controller_evidence_from_snapshots as controller_evidence_from_snapshots,
+    _controller_inventory as controller_inventory,
+    _controller_normalize_path as controller_normalize_path,
+    _controller_read_bytes as controller_read_bytes,
+    _controller_root_proof as controller_root_proof,
+    _controller_regular_paths as controller_regular_paths,
+    _controller_snapshot_paths as controller_snapshot_paths,
+    _controller_validation_cwd as controller_validation_cwd,
+    _controller_workspace_proof as controller_workspace_proof,
+    open_repository_io,
+)
+from controller_store import (  # noqa: E402
     APPLY_RUN_MUTATION,
+    APPLY_RUN_COMPONENTS,
+    CONTROLLER_O_CLOEXEC,
+    CONTROLLER_O_CREAT,
+    CONTROLLER_O_DIRECTORY,
+    CONTROLLER_O_EXCL,
+    CONTROLLER_O_NOFOLLOW,
+    CONTROLLER_O_NONBLOCK,
+    CONTROLLER_O_RDONLY,
+    CONTROLLER_O_WRONLY,
     READ_ONLY_EVIDENCE,
     RUN_REPLACE_QUARANTINE_DELETE,
+    ControllerStatResult,
     MountResolution,
-    require_mount_assurance,
-    require_same_mount,
-    resolve_mount_identity,
+    apply_runs_root as controller_apply_runs_root,
+    canonical_repository_root as canonical_controller_repository_root,
+    controller_atomic_write_bytes as secure_atomic_write_bytes_at,
+    controller_atomic_write_json as secure_atomic_write_json_at,
+    controller_atomic_write_text as secure_atomic_write_text_at,
+    controller_directory_entry_matches as secure_directory_entry_matches,
+    controller_chmod,
+    controller_close,
+    controller_dup,
+    controller_effective_uid,
+    controller_entry_exists,
+    controller_fchmod,
+    controller_fsencode,
+    controller_fstat,
+    controller_fsync,
+    controller_lexical_absolute,
+    controller_listdir,
+    controller_lstat,
+    controller_locked_directory as locked_directory,
+    controller_mkdir,
+    controller_open,
+    open_controller_trust_root_fd,
+    controller_path_is_mount,
+    controller_path_normalized,
+    controller_path_real_normalized,
+    controller_process_id,
+    controller_read,
+    controller_read_bytes as secure_read_regular_bytes_at,
+    controller_read_json as secure_read_regular_json_at,
+    controller_read_text as secure_read_regular_text_at,
+    controller_read_unvalidated_bytes as secure_read_regular_unvalidated_bytes_at,
+    controller_regular_metadata as regular_target_metadata_at,
+    controller_regular_entry_exists,
+    controller_rmdir,
+    controller_stat,
+    controller_strerror,
+    controller_require_mount_assurance as require_mount_assurance,
+    controller_require_same_mount as require_same_mount,
+    controller_resolve_mount_identity as resolve_mount_identity,
+    controller_tree_is_private,
+    controller_unlink,
+    controller_unlink_regular as secure_unlink_regular_at,
+    controller_write,
+    legacy_apply_runs_root,
+    open_controller_runs_root,
 )
-from git_evidence import (  # noqa: E402
-    canonical_git_evidence_digest,
-    capture_git_workspace_evidence,
+from execution_controller import (  # noqa: E402
+    ValidationProcessResult,
+    run_bounded_validation_process,
+    run_step4_readiness_validator,
 )
 
 
@@ -120,35 +235,10 @@ HANDOFF_CONTRACT_VERSION = 2
 APPLY_RUN_SCHEMA_VERSION = 3
 SUPPORTED_APPLY_RUN_SCHEMA_VERSIONS = frozenset({APPLY_RUN_SCHEMA_VERSION})
 PLUGIN_VERSION = "0.3.0"
-VALIDATOR_PATH = Path(__file__).resolve().with_name("validate_planner_docs.py")
-MAX_VALIDATION_OUTPUT_BYTES = 8 * 1024 * 1024
-VALIDATION_OUTPUT_CHUNK_BYTES = 64 * 1024
 MAX_WORKSPACE_INVENTORY_FILE_BYTES = DEFAULT_WORKSPACE_INVENTORY_MAX_FILE_BYTES
 MAX_WORKSPACE_INVENTORY_TOTAL_BYTES = DEFAULT_WORKSPACE_INVENTORY_MAX_TOTAL_BYTES
 MAX_WORKSPACE_INVENTORY_PATHS = DEFAULT_WORKSPACE_INVENTORY_MAX_PATHS
 WORKSPACE_INVENTORY_TIMEOUT_SECONDS = DEFAULT_WORKSPACE_INVENTORY_TIMEOUT_SECONDS
-MACOS_VALIDATION_SANDBOX = Path("/usr/bin/sandbox-exec")
-MACOS_VALIDATION_SANDBOX_PROFILE = (
-    "(version 1)(allow default)(deny process-fork)"
-)
-LINUX_CLONE_THREAD = 0x00010000
-
-
-class _SockFilter(ctypes.Structure):
-    _fields_ = [
-        ("code", ctypes.c_ushort),
-        ("jt", ctypes.c_ubyte),
-        ("jf", ctypes.c_ubyte),
-        ("k", ctypes.c_uint32),
-    ]
-
-
-class _SockFprog(ctypes.Structure):
-    _fields_ = [
-        ("length", ctypes.c_ushort),
-        ("filter", ctypes.POINTER(_SockFilter)),
-    ]
-
 APPLY_MODES = {"direct", "subagent_serial", "external_superpowers", "no_action"}
 WORKSPACE_BASELINE_EXCLUDED_PREFIXES = (
     ".codexqb/",
@@ -282,6 +372,8 @@ APPLY_SAFETY = {
     "allows_commit_push_pr_deploy": False,
     "one_writer_per_slice": True,
     "subagents_read_only_by_default": True,
+    "controller_state_owner_only": True,
+    "legacy_repository_apply_runs_archive_only": True,
 }
 VERIFICATION_POLICY = {
     "verification_policy_version": 1,
@@ -330,15 +422,19 @@ APPLY_RUN_MARKER_NAME = ".codexqb-apply-run.json"
 APPLY_RUN_MARKER_KIND = "codexqb_apply_run"
 APPLY_RUN_MARKER_VERSION = 1
 MAX_APPLY_RUN_MARKER_BYTES = 1024 * 1024
+CONTROLLER_STDIN_REQUEST_SCHEMA = "codexqb.controller-argv/v1"
+MAX_CONTROLLER_STDIN_REQUEST_BYTES = MAX_APPLY_RUN_MARKER_BYTES + 64 * 1024
+MAX_CONTROLLER_STDIN_ARGV_ITEMS = 256
+MAX_CONTROLLER_STDIN_ARGUMENT_CHARACTERS = MAX_APPLY_RUN_MARKER_BYTES
 APPLY_DELETE_QUARANTINE_PREFIX = ".codexqb-delete-"
 APPLY_RUN_REGISTRY_DIR_NAME = ".codexqb-run-registry"
 APPLY_RUN_REGISTRATION_KIND = "codexqb_apply_run_registration"
 APPLY_RUN_REGISTRATION_VERSION = 2
-CODEXQB_TRUST_ROOT_ENV = "CODEXQB_TRUST_ROOT"
 CODEXQB_TRUST_DIR_NAME = "codexqb-trust"
 CODEXQB_TRUST_KEY_NAME = "apply-run-hmac-v1.key"
 CODEXQB_TRUST_STATE_NAME = "apply-run-hmac-v1.state.json"
 CODEXQB_TRUST_KEY_BYTES = 32
+APPLY_RUN_REGISTRATION_MAC_DOMAIN = b"codexqb.apply-run-registration.v1\0"
 MAX_REPOSITORY_BASELINE_CONTENT_BYTES = 512 * 1024
 APPLY_RUN_REPLACE_REQUIRED_KEYS = frozenset(
     {
@@ -389,6 +485,93 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def repository_model_text(
+    root: Path,
+    relative_path: str,
+    *,
+    required: bool = False,
+    repository: RepositoryIO | None = None,
+) -> str | None:
+    if repository is not None:
+        return repository.read_text(relative_path, required=required, audience="model").text
+    with open_repository_io(root) as opened:
+        return opened.read_text(relative_path, required=required, audience="model").text
+
+
+def repository_internal_text(
+    root: Path,
+    relative_path: str,
+    *,
+    required: bool = False,
+    repository: RepositoryIO | None = None,
+) -> str | None:
+    if repository is not None:
+        return repository.read_text(relative_path, required=required, audience="internal").text
+    with open_repository_io(root) as opened:
+        return opened.read_text(relative_path, required=required, audience="internal").text
+
+
+def repository_workspace_evidence(
+    root: Path,
+    repository: RepositoryIO | None = None,
+) -> dict[str, object]:
+    if repository is None:
+        with open_repository_io(root) as opened:
+            return repository_workspace_evidence(root, opened)
+    proof = controller_workspace_proof(
+        repository,
+        exclude_untracked=baseline_path_is_excluded,
+        exclude_tracked=baseline_path_is_excluded,
+    )
+    return dict(proof.evidence)
+
+
+def repository_contract_binding(
+    root: Path,
+    source_subplan_path: str,
+    *,
+    repository: RepositoryIO | None = None,
+) -> dict[str, object]:
+    if repository is None:
+        with open_repository_io(root) as opened:
+            return repository_contract_binding(root, source_subplan_path, repository=opened)
+    source = controller_read_bytes(repository, source_subplan_path, required=False)
+    if not source.exists or source.data is None:
+        return {"errors": [f"missing_source_subplan={source_subplan_path}"]}
+    authoritative = implementation_contract_binding_from_bytes(
+        source_subplan_path,
+        source.data,
+    )
+    projected = repository.read_text(
+        source_subplan_path,
+        required=False,
+        audience="model",
+    )
+    if (
+        not projected.exists
+        or projected.text is None
+        or projected.receipt.sha256 != source.receipt.sha256
+    ):
+        raise ValueError("repository_model_projection_identity_mismatch")
+    projected_binding = implementation_contract_binding_from_bytes(
+        source_subplan_path,
+        projected.text.encode("utf-8"),
+    )
+    authoritative_semantics = {
+        key: value
+        for key, value in authoritative.items()
+        if key != "source_subplan_sha256"
+    }
+    projected_semantics = {
+        key: value
+        for key, value in projected_binding.items()
+        if key != "source_subplan_sha256"
+    }
+    if authoritative_semantics != projected_semantics:
+        raise ValueError("repository_model_projection_semantic_mismatch")
+    return authoritative
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -405,16 +588,16 @@ def parse_utc_timestamp(value: object) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def atomic_write_text(path: Path, text: str) -> None:
-    secure_write_apply_artifact(path, text)
+def atomic_write_text(path: Path, text: str, *, root: Path) -> None:
+    secure_write_apply_artifact(path, text, root=root)
 
 
-def atomic_write_json(path: Path, payload: object) -> None:
-    atomic_write_text(path, serialize_safe_persistent_json(payload))
+def atomic_write_json(path: Path, payload: object, *, root: Path) -> None:
+    atomic_write_text(path, serialize_safe_persistent_json(payload), root=root)
 
 
-def append_event(run_dir: Path, event: dict[str, object]) -> dict[str, object]:
-    with open_verified_apply_run_for_mutation(run_dir) as handle:
+def append_event(run_dir: Path, event: dict[str, object], *, root: Path) -> dict[str, object]:
+    with open_verified_apply_run_for_mutation(run_dir, root=root) as handle:
         return append_event_at(handle, event)
 
 
@@ -538,7 +721,7 @@ def read_event_log_at(directory_fd: int) -> str:
 def load_events(run_dir: Path, errors: list[str]) -> list[dict[str, object]]:
     run_fd = -1
     try:
-        run_fd = os.open(run_dir, secure_directory_open_flags())
+        run_fd = controller_open(run_dir, secure_directory_open_flags())
         text = read_event_log_at(run_fd)
     except FileNotFoundError:
         errors.append("missing_events_jsonl")
@@ -548,7 +731,7 @@ def load_events(run_dir: Path, errors: list[str]) -> list[dict[str, object]]:
         return []
     finally:
         if run_fd >= 0:
-            os.close(run_fd)
+            controller_close(run_fd)
     events, event_errors = parse_chained_event_log(text)
     errors.extend(event_errors)
     return events
@@ -572,17 +755,24 @@ def is_inside(parent: Path, child: Path) -> bool:
 
 
 def lexical_absolute(path: Path) -> Path:
-    return Path(os.path.abspath(os.fspath(path)))
+    return controller_lexical_absolute(path)
 
 
 def repository_mount_relative_path(root: Path, path: Path) -> str:
-    root = lexical_absolute(root)
+    root = lexical_absolute(managed_apply_runs_root(root))
     path = lexical_absolute(path)
     try:
         relative = path.relative_to(root)
     except ValueError as exc:
         raise ValueError("invalid_apply_run_output_dir=indirect_target_rejected") from exc
     return relative.as_posix() if relative.parts else "."
+
+
+def apply_run_logical_path(root: Path, run_dir: Path) -> str:
+    relative = repository_mount_relative_path(root, run_dir)
+    if "/" in relative or relative == ".":
+        raise ValueError("invalid_apply_run_output_dir=managed_run_required")
+    return (APPLY_RUNS_RELATIVE_DIR / relative).as_posix()
 
 
 def resolve_apply_mount_identity(directory_fd: int, operation: str) -> MountResolution:
@@ -613,25 +803,47 @@ def decode_mountinfo_path(value: str) -> str:
     return MOUNTINFO_ESCAPE_RE.sub(lambda match: chr(int(match.group(1), 8)), value)
 
 
+def linux_mountinfo_text() -> str | None:
+    """Read only the fixed kernel mount table; never accept a caller path."""
+
+    flags = CONTROLLER_O_RDONLY | CONTROLLER_O_CLOEXEC | CONTROLLER_O_NOFOLLOW
+    try:
+        descriptor = controller_open("/proc/self/mountinfo", flags)
+    except OSError:
+        return None
+    chunks: list[bytes] = []
+    remaining = 1024 * 1024
+    try:
+        while remaining > 0:
+            chunk = controller_read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if remaining == 0 and controller_read(descriptor, 1):
+            return None
+    except OSError:
+        return None
+    finally:
+        controller_close(descriptor)
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
 def path_is_mount_point(path: Path) -> bool:
     try:
-        if os.path.ismount(path):
+        if controller_path_is_mount(path):
             return True
     except OSError:
         return True
-    mountinfo = Path("/proc/self/mountinfo")
-    if not mountinfo.exists():
+    text = linux_mountinfo_text()
+    if text is None:
         return sys.platform.startswith("linux")
-    try:
-        text = mountinfo.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return sys.platform.startswith("linux")
-    candidate = os.path.normpath(os.path.realpath(path))
+    candidate = controller_path_real_normalized(path)
     for line in text.splitlines():
         fields = line.split(" - ", 1)[0].split()
         if len(fields) < 5:
             continue
-        mounted_at = os.path.normpath(decode_mountinfo_path(fields[4]))
+        mounted_at = controller_path_normalized(decode_mountinfo_path(fields[4]))
         if mounted_at == candidate:
             return True
     return False
@@ -647,16 +859,13 @@ def path_has_indirect_component(root: Path, path: Path) -> bool:
     current = root
     for part in relative.parts:
         current /= part
-        if current.is_symlink():
-            return True
         try:
-            exists = current.exists()
+            metadata = controller_lstat(current)
+        except FileNotFoundError:
+            continue
         except OSError:
             return True
-        if not exists:
-            continue
-        is_junction = getattr(current, "is_junction", None)
-        if callable(is_junction) and is_junction():
+        if stat.S_ISLNK(metadata.st_mode):
             return True
         if path_is_mount_point(current):
             return True
@@ -664,7 +873,7 @@ def path_has_indirect_component(root: Path, path: Path) -> bool:
 
 
 def managed_apply_runs_root(root: Path) -> Path:
-    return root / APPLY_RUNS_RELATIVE_DIR
+    return controller_apply_runs_root(root)
 
 
 def resolve_managed_apply_run_dir(
@@ -674,76 +883,79 @@ def resolve_managed_apply_run_dir(
     *,
     lexical_root: Path | None = None,
 ) -> Path:
-    root = root.resolve()
+    root = canonical_controller_repository_root(root)
     lexical_root = lexical_absolute(lexical_root or root)
     runs_root = managed_apply_runs_root(root)
-    lexical_runs_root = lexical_root / APPLY_RUNS_RELATIVE_DIR
-    candidate = requested if requested is not None else lexical_runs_root / str(default_name or "")
+    legacy_root = legacy_apply_runs_root(root)
+    if requested is None:
+        candidate = runs_root / str(default_name or "")
+    elif requested.is_absolute():
+        candidate = requested
+    elif len(requested.parts) == 1:
+        candidate = runs_root / requested.name
+    elif requested.parts[:2] == APPLY_RUNS_RELATIVE_DIR.parts:
+        raise ValueError("legacy_apply_run_archive_only")
+    else:
+        raise ValueError("invalid_apply_run_output_dir=managed_run_required")
     candidate_lexical = lexical_absolute(candidate)
-    inspection_root: Path | None = None
-    for possible_root in (lexical_root, root):
+    legacy_roots = {
+        lexical_absolute(legacy_root),
+        lexical_absolute(lexical_root / APPLY_RUNS_RELATIVE_DIR),
+    }
+    for legacy_candidate_root in legacy_roots:
         try:
-            candidate_lexical.relative_to(possible_root)
+            candidate_lexical.relative_to(legacy_candidate_root)
         except ValueError:
             continue
-        inspection_root = possible_root
-        break
-    if inspection_root is None:
-        raise ValueError("output_dir must be inside the target repository")
-    if path_has_indirect_component(
-        inspection_root,
-        inspection_root / APPLY_RUNS_RELATIVE_DIR,
-    ) or path_has_indirect_component(inspection_root, candidate_lexical):
+        raise ValueError("legacy_apply_run_archive_only")
+    if path_has_indirect_component(runs_root.parent, candidate_lexical):
         raise ValueError("invalid_apply_run_output_dir=indirect_target_rejected")
-    runs_root_resolved = runs_root.resolve(strict=False)
-    candidate_resolved = candidate_lexical.resolve(strict=False)
-    if not is_inside(root, candidate_resolved):
-        raise ValueError("output_dir must be inside the target repository")
-    if candidate_resolved == runs_root_resolved:
+    runs_root_lexical = lexical_absolute(runs_root)
+    if candidate_lexical == runs_root_lexical:
         raise ValueError("invalid_apply_run_output_dir=run_directory_required")
-    if candidate_resolved.parent != runs_root_resolved:
-        raise ValueError("invalid_apply_run_output_dir=must_be_direct_child_of_.codexqb/apply-runs")
-    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", candidate_resolved.name) is None:
+    if candidate_lexical.parent != runs_root_lexical:
+        raise ValueError("invalid_apply_run_output_dir=must_be_direct_child_of_controller_apply_runs")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", candidate_lexical.name) is None:
         raise ValueError("invalid_apply_run_output_dir=invalid_run_directory_name")
-    if has_secret_like(candidate_resolved.name):
+    if has_secret_like(candidate_lexical.name):
         raise ValueError("invalid_apply_run_output_dir=secret_like_run_directory_name")
-    return candidate_resolved
+    return candidate_lexical
 
 
 def secure_directory_open_flags() -> int:
-    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+    if CONTROLLER_O_DIRECTORY == 0 or CONTROLLER_O_NOFOLLOW == 0:
         raise ValueError("secure_apply_run_replace_not_supported")
-    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    return CONTROLLER_O_RDONLY | CONTROLLER_O_DIRECTORY | CONTROLLER_O_NOFOLLOW | CONTROLLER_O_CLOEXEC
 
 
-def same_file_identity(first: os.stat_result, second: os.stat_result) -> bool:
+def same_file_identity(first: ControllerStatResult, second: ControllerStatResult) -> bool:
     return first.st_dev == second.st_dev and first.st_ino == second.st_ino
 
 
-def metadata_is_owner_controlled(metadata: os.stat_result) -> bool:
-    expected_uid = os.geteuid() if hasattr(os, "geteuid") else metadata.st_uid
+def metadata_is_owner_controlled(metadata: ControllerStatResult) -> bool:
+    expected_uid = controller_effective_uid()
     return metadata.st_uid == expected_uid and metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH) == 0
 
 
-def open_child_directory(parent_fd: int, name: str) -> tuple[int, os.stat_result]:
-    before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+def open_child_directory(parent_fd: int, name: str) -> tuple[int, ControllerStatResult]:
+    before = controller_stat(name, dir_fd=parent_fd, follow_symlinks=False)
     if not stat.S_ISDIR(before.st_mode):
         raise ValueError("replace_requires_existing_apply_run")
-    child_fd = os.open(name, secure_directory_open_flags(), dir_fd=parent_fd)
+    child_fd = controller_open(name, secure_directory_open_flags(), dir_fd=parent_fd)
     try:
-        after = os.fstat(child_fd)
+        after = controller_fstat(child_fd)
     except Exception:
-        os.close(child_fd)
+        controller_close(child_fd)
         raise
     if not same_file_identity(before, after):
-        os.close(child_fd)
+        controller_close(child_fd)
         raise ValueError("replace_apply_run_identity_changed")
     return child_fd, after
 
 
-def opened_directory_matches_path(path: Path, metadata: os.stat_result, *, reject_mount: bool) -> bool:
+def opened_directory_matches_path(path: Path, metadata: ControllerStatResult, *, reject_mount: bool) -> bool:
     try:
-        before = os.stat(path, follow_symlinks=False)
+        before = controller_stat(path, follow_symlinks=False)
     except OSError:
         return False
     if not stat.S_ISDIR(before.st_mode) or not same_file_identity(before, metadata):
@@ -751,33 +963,33 @@ def opened_directory_matches_path(path: Path, metadata: os.stat_result, *, rejec
     if reject_mount and path_is_mount_point(path):
         return False
     try:
-        after = os.stat(path, follow_symlinks=False)
+        after = controller_stat(path, follow_symlinks=False)
     except OSError:
         return False
     return stat.S_ISDIR(after.st_mode) and same_file_identity(before, after) and same_file_identity(after, metadata)
 
 
-def metadata_is_private_directory(metadata: os.stat_result) -> bool:
+def metadata_is_private_directory(metadata: ControllerStatResult) -> bool:
     return (
         stat.S_ISDIR(metadata.st_mode)
         and metadata_is_owner_controlled(metadata)
-        and stat.S_IMODE(metadata.st_mode) & 0o077 == 0
+        and stat.S_IMODE(metadata.st_mode) == 0o700
     )
 
 
-def metadata_is_private_regular_file(metadata: os.stat_result) -> bool:
+def metadata_is_private_regular_file(metadata: ControllerStatResult) -> bool:
     return (
         stat.S_ISREG(metadata.st_mode)
         and metadata.st_nlink == 1
         and metadata_is_owner_controlled(metadata)
-        and stat.S_IMODE(metadata.st_mode) & 0o077 == 0
+        and stat.S_IMODE(metadata.st_mode) == 0o600
     )
 
 
 def open_owned_child_directory(parent_fd: int, name: str, *, create: bool, private: bool) -> int:
     if create:
         try:
-            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+            controller_mkdir(name, mode=0o700, dir_fd=parent_fd)
         except FileExistsError:
             pass
     try:
@@ -786,64 +998,21 @@ def open_owned_child_directory(parent_fd: int, name: str, *, create: bool, priva
         raise ValueError("codexqb_trust_store_unavailable") from exc
     valid = metadata_is_private_directory(metadata) if private else metadata_is_owner_controlled(metadata)
     if not valid:
-        os.close(child_fd)
+        controller_close(child_fd)
         raise ValueError("codexqb_trust_store_permissions_invalid")
     return child_fd
 
 
 def open_codexqb_trust_root_fd(*, create: bool) -> int:
-    override = os.environ.get(CODEXQB_TRUST_ROOT_ENV)
-    if override:
-        trust_root = Path(override)
-        if not trust_root.is_absolute():
-            raise ValueError("codexqb_trust_root_must_be_absolute")
-        trust_fd = -1
-        try:
-            trust_fd = os.open(trust_root, secure_directory_open_flags())
-            metadata = os.fstat(trust_fd)
-        except OSError as exc:
-            if trust_fd >= 0:
-                os.close(trust_fd)
-            raise ValueError("codexqb_trust_store_unavailable") from exc
-        if not metadata_is_private_directory(metadata) or not opened_directory_matches_path(
-            trust_root,
-            metadata,
-            reject_mount=True,
-        ):
-            os.close(trust_fd)
-            raise ValueError("codexqb_trust_store_permissions_invalid")
-        return trust_fd
-
-    home = lexical_absolute(Path.home())
-    home_fd = -1
-    codex_fd = -1
-    trust_fd = -1
     try:
-        home_fd = os.open(home, secure_directory_open_flags())
-        home_metadata = os.fstat(home_fd)
-        if not metadata_is_owner_controlled(home_metadata) or not opened_directory_matches_path(
-            home,
-            home_metadata,
-            reject_mount=False,
-        ):
-            raise ValueError("codexqb_trust_store_permissions_invalid")
-        codex_fd = open_owned_child_directory(home_fd, ".codex", create=create, private=False)
-        trust_fd = open_owned_child_directory(codex_fd, CODEXQB_TRUST_DIR_NAME, create=create, private=True)
-        result = trust_fd
-        trust_fd = -1
-        return result
-    finally:
-        if trust_fd >= 0:
-            os.close(trust_fd)
-        if codex_fd >= 0:
-            os.close(codex_fd)
-        if home_fd >= 0:
-            os.close(home_fd)
+        return open_controller_trust_root_fd(create=create)
+    except OSError as exc:
+        raise ValueError("codexqb_trust_store_unavailable") from exc
 
 
 def load_apply_run_trust_state(trust_fd: int) -> dict[str, object] | None:
     try:
-        metadata = os.stat(CODEXQB_TRUST_STATE_NAME, dir_fd=trust_fd, follow_symlinks=False)
+        metadata = controller_stat(CODEXQB_TRUST_STATE_NAME, dir_fd=trust_fd, follow_symlinks=False)
     except FileNotFoundError:
         return None
     except OSError as exc:
@@ -859,9 +1028,9 @@ def load_apply_run_trust_state(trust_fd: int) -> dict[str, object] | None:
 def read_apply_run_trust_key(trust_fd: int) -> bytes:
     key_fd = -1
     try:
-        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-        key_fd = os.open(CODEXQB_TRUST_KEY_NAME, flags, dir_fd=trust_fd)
-        metadata = os.fstat(key_fd)
+        flags = CONTROLLER_O_RDONLY | CONTROLLER_O_NOFOLLOW | CONTROLLER_O_CLOEXEC
+        key_fd = controller_open(CODEXQB_TRUST_KEY_NAME, flags, dir_fd=trust_fd)
+        metadata = controller_fstat(key_fd)
         if not metadata_is_private_regular_file(metadata):
             raise ValueError("codexqb_trust_key_permissions_invalid")
         if metadata.st_size != CODEXQB_TRUST_KEY_BYTES:
@@ -869,7 +1038,7 @@ def read_apply_run_trust_key(trust_fd: int) -> bytes:
         chunks: list[bytes] = []
         remaining = CODEXQB_TRUST_KEY_BYTES + 1
         while remaining > 0:
-            chunk = os.read(key_fd, remaining)
+            chunk = controller_read(key_fd, remaining)
             if not chunk:
                 break
             chunks.append(chunk)
@@ -880,80 +1049,85 @@ def read_apply_run_trust_key(trust_fd: int) -> bytes:
         return key
     finally:
         if key_fd >= 0:
-            os.close(key_fd)
+            controller_close(key_fd)
 
 
 def create_apply_run_trust_key(trust_fd: int) -> bytes:
     key = secrets.token_bytes(CODEXQB_TRUST_KEY_BYTES)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    key_fd = os.open(CODEXQB_TRUST_KEY_NAME, flags, 0o600, dir_fd=trust_fd)
+    flags = CONTROLLER_O_WRONLY | CONTROLLER_O_CREAT | CONTROLLER_O_EXCL | CONTROLLER_O_NOFOLLOW | CONTROLLER_O_CLOEXEC
+    key_fd = controller_open(CODEXQB_TRUST_KEY_NAME, flags, 0o600, dir_fd=trust_fd)
     try:
-        os.fchmod(key_fd, 0o600)
+        controller_fchmod(key_fd, 0o600)
         offset = 0
         while offset < len(key):
-            written = os.write(key_fd, key[offset:])
+            written = controller_write(key_fd, key[offset:])
             if written <= 0:
                 raise OSError("short CodexQB trust-key write")
             offset += written
-        os.fsync(key_fd)
-        os.fsync(trust_fd)
+        controller_fsync(key_fd)
+        controller_fsync(trust_fd)
     except Exception:
-        os.close(key_fd)
+        controller_close(key_fd)
         key_fd = -1
         try:
-            os.unlink(CODEXQB_TRUST_KEY_NAME, dir_fd=trust_fd)
+            controller_unlink(CODEXQB_TRUST_KEY_NAME, dir_fd=trust_fd)
         except OSError:
             pass
         raise
     finally:
         if key_fd >= 0:
-            os.close(key_fd)
+            controller_close(key_fd)
     return key
 
 
 def load_or_create_apply_run_trust_key(*, create: bool) -> bytes:
     trust_fd = open_codexqb_trust_root_fd(create=create)
     try:
-        state = load_apply_run_trust_state(trust_fd)
-        try:
-            key = read_apply_run_trust_key(trust_fd)
-        except FileNotFoundError:
-            if not create:
-                raise ValueError("codexqb_trust_key_unavailable")
-            if state is not None:
-                raise ValueError("codexqb_trust_key_recovery_required")
+        with locked_directory(trust_fd):
+            state = load_apply_run_trust_state(trust_fd)
+            created_key = False
             try:
-                key = create_apply_run_trust_key(trust_fd)
-            except FileExistsError:
                 key = read_apply_run_trust_key(trust_fd)
-        except OSError as exc:
-            raise ValueError("codexqb_trust_key_unavailable") from exc
-        expected_state = {
-            "trust_state_version": 1,
-            "trust_key_id": sha256_bytes(key)[:32],
-        }
-        if state is None and create:
-            try:
-                write_regular_json_exclusive_at(
-                    trust_fd,
-                    CODEXQB_TRUST_STATE_NAME,
-                    expected_state,
-                )
-                os.fsync(trust_fd)
-            except FileExistsError:
+            except FileNotFoundError:
+                if not create:
+                    raise ValueError("codexqb_trust_key_unavailable")
+                if state is not None:
+                    raise ValueError("codexqb_trust_key_recovery_required")
+                try:
+                    key = create_apply_run_trust_key(trust_fd)
+                    created_key = True
+                except FileExistsError:
+                    # A creator outside the shared lease raced or preseeded
+                    # the key.  Never bind an unobserved key to fresh state.
+                    raise ValueError("codexqb_trust_key_recovery_required") from None
+            except OSError as exc:
+                raise ValueError("codexqb_trust_key_unavailable") from exc
+            expected_state = {
+                "trust_state_version": 1,
+                "trust_key_id": sha256_bytes(key)[:32],
+            }
+            if state is None:
+                if not create or not created_key:
+                    raise ValueError("codexqb_trust_key_recovery_required")
+                try:
+                    write_regular_json_exclusive_at(
+                        trust_fd,
+                        CODEXQB_TRUST_STATE_NAME,
+                        expected_state,
+                    )
+                    controller_fsync(trust_fd)
+                except FileExistsError:
+                    raise ValueError("codexqb_trust_key_recovery_required") from None
                 state = load_apply_run_trust_state(trust_fd)
-            else:
-                state = expected_state
-        if state is not None and state != expected_state:
-            raise ValueError("codexqb_trust_key_recovery_required")
-        return key
+            if state != expected_state:
+                raise ValueError("codexqb_trust_key_recovery_required")
+            return key
     finally:
-        os.close(trust_fd)
+        controller_close(trust_fd)
 
 
 def signed_apply_run_registration(
-    root: Path,
-    root_metadata: os.stat_result,
+    root_proof: ControllerRootProof,
     payload: dict[str, object],
     *,
     create_key: bool,
@@ -961,19 +1135,22 @@ def signed_apply_run_registration(
     key = load_or_create_apply_run_trust_key(create=create_key)
     signed = {
         **payload,
-        "root_binding_sha256": sha256_bytes(os.fsencode(root)),
-        "root_device": root_metadata.st_dev,
-        "root_inode": root_metadata.st_ino,
+        "root_binding_sha256": root_proof.repository_identity_sha256,
+        "root_device": root_proof.root_device,
+        "root_inode": root_proof.root_inode,
         "trust_key_id": sha256_bytes(key)[:32],
     }
     encoded = json.dumps(signed, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    signed["registration_mac"] = hmac.new(key, encoded, hashlib.sha256).hexdigest()
+    signed["registration_mac"] = hmac.new(
+        key,
+        APPLY_RUN_REGISTRATION_MAC_DOMAIN + encoded,
+        hashlib.sha256,
+    ).hexdigest()
     return signed
 
 
 def trusted_apply_run_registration(
-    root: Path,
-    root_metadata: os.stat_result,
+    root_proof: ControllerRootProof,
     registration: object,
 ) -> bool:
     if not isinstance(registration, dict):
@@ -987,13 +1164,20 @@ def trusted_apply_run_registration(
         return False
     if registration.get("trust_key_id") != sha256_bytes(key)[:32]:
         return False
-    if registration.get("root_binding_sha256") != sha256_bytes(os.fsencode(root)):
+    if registration.get("root_binding_sha256") != root_proof.repository_identity_sha256:
         return False
-    if registration.get("root_device") != root_metadata.st_dev or registration.get("root_inode") != root_metadata.st_ino:
+    if (
+        registration.get("root_device") != root_proof.root_device
+        or registration.get("root_inode") != root_proof.root_inode
+    ):
         return False
     unsigned = {key_name: value for key_name, value in registration.items() if key_name != "registration_mac"}
     encoded = json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    expected = hmac.new(key, encoded, hashlib.sha256).hexdigest()
+    expected = hmac.new(
+        key,
+        APPLY_RUN_REGISTRATION_MAC_DOMAIN + encoded,
+        hashlib.sha256,
+    ).hexdigest()
     return hmac.compare_digest(registration_mac, expected)
 
 
@@ -1005,87 +1189,30 @@ def open_managed_apply_runs_root_fd(
     root_mount_resolution: MountResolution | None = None,
     operation: str = APPLY_RUN_MUTATION,
 ) -> int:
-    root_fd = os.dup(root_anchor_fd) if root_anchor_fd is not None else os.open(root, secure_directory_open_flags())
-    codexqb_fd = -1
-    runs_fd = -1
+    del root_anchor_fd, root_mount_resolution, operation
     try:
-        mount_resolution = root_mount_resolution or resolve_apply_mount_identity(root_fd, operation)
-        require_mount_assurance(mount_resolution, operation)
-        require_apply_same_mount(
-            mount_resolution,
-            root_fd,
-            ".",
-            mismatch_error="invalid_apply_run_output_dir=root_identity_changed",
-        )
-        root_metadata = os.fstat(root_fd)
-        if not opened_directory_matches_path(root, root_metadata, reject_mount=False):
-            raise ValueError("invalid_apply_run_output_dir=root_identity_changed")
-        if create:
-            try:
-                os.mkdir(".codexqb", mode=0o700, dir_fd=root_fd)
-            except FileExistsError:
-                pass
-        try:
-            codexqb_fd, codexqb_metadata = open_child_directory(root_fd, ".codexqb")
-        except (OSError, ValueError) as exc:
-            raise ValueError("invalid_apply_run_output_dir=indirect_target_rejected") from exc
-        require_apply_same_mount(
-            mount_resolution,
-            codexqb_fd,
-            ".codexqb",
-            mismatch_error="invalid_apply_run_output_dir=indirect_target_rejected",
-        )
-        if (
-            codexqb_metadata.st_dev != root_metadata.st_dev
-            or not opened_directory_matches_path(root / ".codexqb", codexqb_metadata, reject_mount=True)
-        ):
-            raise ValueError("invalid_apply_run_output_dir=indirect_target_rejected")
-        if create:
-            try:
-                os.mkdir("apply-runs", mode=0o700, dir_fd=codexqb_fd)
-            except FileExistsError:
-                pass
-        try:
-            runs_fd, runs_metadata = open_child_directory(codexqb_fd, "apply-runs")
-        except (OSError, ValueError) as exc:
-            raise ValueError("invalid_apply_run_output_dir=indirect_target_rejected") from exc
-        require_apply_same_mount(
-            mount_resolution,
+        with open_controller_runs_root(root, APPLY_RUN_COMPONENTS, create=create) as (
             runs_fd,
-            APPLY_RUNS_RELATIVE_DIR.as_posix(),
-            mismatch_error="invalid_apply_run_output_dir=indirect_target_rejected",
-        )
-        if (
-            runs_metadata.st_dev != root_metadata.st_dev
-            or not opened_directory_matches_path(
-                managed_apply_runs_root(root),
-                runs_metadata,
-                reject_mount=True,
-            )
+            runs_path,
         ):
-            raise ValueError("invalid_apply_run_output_dir=indirect_target_rejected")
-        result = runs_fd
-        runs_fd = -1
-        return result
-    finally:
-        if runs_fd >= 0:
-            os.close(runs_fd)
-        if codexqb_fd >= 0:
-            os.close(codexqb_fd)
-        os.close(root_fd)
+            if runs_path != managed_apply_runs_root(root):
+                raise ValueError("invalid_apply_run_output_dir=controller_state_mismatch")
+            return controller_dup(runs_fd)
+    except FileNotFoundError:
+        raise ValueError("apply_run_controller_state_missing") from None
 
 
 def load_regular_json_at(directory_fd: int, name: str) -> dict[str, object]:
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    file_fd = os.open(name, flags, dir_fd=directory_fd)
+    flags = CONTROLLER_O_RDONLY | CONTROLLER_O_NOFOLLOW | CONTROLLER_O_CLOEXEC
+    file_fd = controller_open(name, flags, dir_fd=directory_fd)
     try:
-        metadata = os.fstat(file_fd)
+        metadata = controller_fstat(file_fd)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_APPLY_RUN_MARKER_BYTES:
             raise ValueError("replace_requires_existing_apply_run")
         chunks: list[bytes] = []
         remaining = MAX_APPLY_RUN_MARKER_BYTES + 1
         while remaining > 0:
-            chunk = os.read(file_fd, min(65536, remaining))
+            chunk = controller_read(file_fd, min(65536, remaining))
             if not chunk:
                 break
             chunks.append(chunk)
@@ -1096,7 +1223,7 @@ def load_regular_json_at(directory_fd: int, name: str) -> dict[str, object]:
         assert_safe_serialized_artifact(name, raw)
         payload = json.loads(raw.decode("utf-8"))
     finally:
-        os.close(file_fd)
+        controller_close(file_fd)
     if not isinstance(payload, dict):
         raise ValueError("replace_requires_existing_apply_run")
     return payload
@@ -1123,16 +1250,25 @@ def open_apply_run_registry_fd(
         mismatch_error="invalid_apply_run_output_dir=indirect_target_rejected",
     )
     if create:
+        created = False
         try:
-            os.mkdir(APPLY_RUN_REGISTRY_DIR_NAME, mode=0o700, dir_fd=parent_fd)
+            controller_mkdir(APPLY_RUN_REGISTRY_DIR_NAME, mode=0o700, dir_fd=parent_fd)
+            created = True
         except FileExistsError:
             pass
+        if created:
+            controller_chmod(
+                APPLY_RUN_REGISTRY_DIR_NAME,
+                0o700,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
     try:
         registry_fd, registry_metadata = open_child_directory(parent_fd, APPLY_RUN_REGISTRY_DIR_NAME)
     except (OSError, ValueError) as exc:
         raise ValueError("replace_requires_registered_apply_run") from exc
     try:
-        parent_metadata = os.fstat(parent_fd)
+        parent_metadata = controller_fstat(parent_fd)
         registry_path = managed_apply_runs_root(root) / APPLY_RUN_REGISTRY_DIR_NAME
         require_apply_same_mount(
             mount_resolution,
@@ -1142,12 +1278,13 @@ def open_apply_run_registry_fd(
         )
         if (
             registry_metadata.st_dev != parent_metadata.st_dev
-            or not metadata_is_owner_controlled(registry_metadata)
+            or not metadata_is_private_directory(registry_metadata)
             or not opened_directory_matches_path(registry_path, registry_metadata, reject_mount=True)
+            or not controller_tree_is_private(registry_fd)
         ):
             raise ValueError("invalid_apply_run_output_dir=indirect_target_rejected")
     except Exception:
-        os.close(registry_fd)
+        controller_close(registry_fd)
         raise
     return registry_fd
 
@@ -1164,27 +1301,28 @@ def write_regular_bytes_exclusive_at(
     if max_bytes is not None and len(encoded) > max_bytes:
         raise ValueError("apply_run_artifact_too_large")
     assert_safe_serialized_artifact(name, encoded)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    file_fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    flags = CONTROLLER_O_WRONLY | CONTROLLER_O_CREAT | CONTROLLER_O_EXCL | CONTROLLER_O_NOFOLLOW | CONTROLLER_O_CLOEXEC
+    file_fd = controller_open(name, flags, 0o600, dir_fd=directory_fd)
     try:
+        controller_fchmod(file_fd, 0o600)
         offset = 0
         while offset < len(encoded):
-            written = os.write(file_fd, encoded[offset:])
+            written = controller_write(file_fd, encoded[offset:])
             if written <= 0:
                 raise OSError("short apply-run registration write")
             offset += written
-        os.fsync(file_fd)
+        controller_fsync(file_fd)
     except Exception:
-        os.close(file_fd)
+        controller_close(file_fd)
         file_fd = -1
         try:
-            os.unlink(name, dir_fd=directory_fd)
+            controller_unlink(name, dir_fd=directory_fd)
         except OSError:
             pass
         raise
     finally:
         if file_fd >= 0:
-            os.close(file_fd)
+            controller_close(file_fd)
 
 
 def write_regular_text_exclusive_at(directory_fd: int, name: str, text: str) -> None:
@@ -1396,7 +1534,7 @@ def apply_run_marker_payload(root: Path, run_dir: Path, run: dict[str, object]) 
     return {
         "marker_kind": APPLY_RUN_MARKER_KIND,
         "marker_version": APPLY_RUN_MARKER_VERSION,
-        "run_dir": run_dir.relative_to(root).as_posix(),
+        "run_dir": apply_run_logical_path(root, run_dir),
         "apply_run_schema_version": run.get("apply_run_schema_version"),
         "artifact_schema_version": run.get("artifact_schema_version"),
         "handoff_contract_version": run.get("handoff_contract_version"),
@@ -1419,8 +1557,8 @@ def recognized_apply_run_manifest(
     marker: object,
     run: object,
     registration: object = None,
-    run_metadata: os.stat_result | None = None,
-    root_metadata: os.stat_result | None = None,
+    run_metadata: ControllerStatResult | None = None,
+    root_proof: ControllerRootProof | None = None,
 ) -> bool:
     if not isinstance(marker, dict) or not isinstance(run, dict) or not isinstance(registration, dict):
         return False
@@ -1432,7 +1570,7 @@ def recognized_apply_run_manifest(
         or manifest_digest is None
         or stable_digest is None
         or run_metadata is None
-        or root_metadata is None
+        or root_proof is None
     ):
         return False
     if run.get("apply_run_schema_version") != APPLY_RUN_SCHEMA_VERSION:
@@ -1450,7 +1588,7 @@ def recognized_apply_run_manifest(
         return False
     if registration.get("run_name") != run_dir.name:
         return False
-    if registration.get("run_dir") != run_dir.relative_to(root).as_posix():
+    if registration.get("run_dir") != apply_run_logical_path(root, run_dir):
         return False
     if registration.get("registration_id") != registration_id:
         return False
@@ -1462,7 +1600,7 @@ def recognized_apply_run_manifest(
         return False
     if registration.get("run_device") != run_metadata.st_dev or registration.get("run_inode") != run_metadata.st_ino:
         return False
-    if not trusted_apply_run_registration(root, root_metadata, registration):
+    if not trusted_apply_run_registration(root_proof, registration):
         return False
     return marker == apply_run_marker_payload(root, run_dir, run)
 
@@ -1472,8 +1610,8 @@ def apply_run_registration_payload(
     run_dir: Path,
     run: dict[str, object],
     *,
-    root_metadata: os.stat_result,
-    run_metadata: os.stat_result,
+    root_proof: ControllerRootProof,
+    run_metadata: ControllerStatResult,
     create_key: bool,
 ) -> dict[str, object]:
     claim_digest = apply_run_manifest_claim_digest(run)
@@ -1492,14 +1630,14 @@ def apply_run_registration_payload(
         "registration_version": APPLY_RUN_REGISTRATION_VERSION,
         "registration_id": registration_id,
         "run_name": run_dir.name,
-        "run_dir": run_dir.relative_to(root).as_posix(),
+        "run_dir": apply_run_logical_path(root, run_dir),
         "run_device": run_metadata.st_dev,
         "run_inode": run_metadata.st_ino,
         "manifest_claim_sha256": claim_digest,
         "manifest_sha256": manifest_digest,
         "refresh_stable_sha256": stable_digest,
     }
-    return signed_apply_run_registration(root, root_metadata, payload, create_key=create_key)
+    return signed_apply_run_registration(root_proof, payload, create_key=create_key)
 
 
 def create_apply_run_registration(
@@ -1507,15 +1645,15 @@ def create_apply_run_registration(
     run_dir: Path,
     run: dict[str, object],
     *,
-    root_metadata: os.stat_result,
+    root_proof: ControllerRootProof,
     parent_fd: int,
     run_fd: int,
-    run_metadata: os.stat_result,
+    run_metadata: ControllerStatResult,
     root_mount_resolution: MountResolution,
 ) -> None:
     registry_fd = -1
     try:
-        parent_metadata = os.fstat(parent_fd)
+        parent_metadata = controller_fstat(parent_fd)
         require_no_managed_recovery_quarantine(parent_fd)
         require_mount_assurance(root_mount_resolution, APPLY_RUN_MUTATION)
         require_apply_same_mount(
@@ -1531,7 +1669,7 @@ def create_apply_run_registration(
             root_mount_resolution=root_mount_resolution,
         )
         require_no_managed_recovery_quarantine(registry_fd)
-        current_run_metadata = os.fstat(run_fd)
+        current_run_metadata = controller_fstat(run_fd)
         if (
             run_metadata.st_dev != parent_metadata.st_dev
             or not same_file_identity(run_metadata, current_run_metadata)
@@ -1542,7 +1680,7 @@ def create_apply_run_registration(
             root,
             run_dir,
             run,
-            root_metadata=root_metadata,
+            root_proof=root_proof,
             run_metadata=run_metadata,
             create_key=True,
         )
@@ -1554,32 +1692,34 @@ def create_apply_run_registration(
             )
         except FileExistsError as exc:
             raise ValueError(f"apply_run_registration_exists={run_dir.name}") from exc
-        os.fsync(registry_fd)
+        controller_fsync(registry_fd)
     finally:
         if registry_fd >= 0:
-            os.close(registry_fd)
+            controller_close(registry_fd)
 
 
-def refresh_apply_run_provenance(run_dir: Path, run: dict[str, object]) -> None:
-    run_dir = run_dir.resolve()
-    root = infer_root(run_dir)
-    if root is None:
-        raise ValueError("source_binding_root_required")
+def refresh_apply_run_provenance(
+    run_dir: Path,
+    run: dict[str, object],
+    *,
+    root: Path,
+) -> None:
+    run_dir = lexical_absolute(run_dir)
+    root = lexical_absolute(root)
     run_dir = resolve_managed_apply_run_dir(root, run_dir, lexical_root=root)
-    root_fd = os.open(root, secure_directory_open_flags())
+    repository_session = open_repository_io(root)
+    repository = repository_session.__enter__()
     parent_fd = -1
     run_fd = -1
     registry_fd = -1
     try:
-        root_mount_resolution = resolve_apply_mount_identity(root_fd, APPLY_RUN_MUTATION)
-        root_metadata = os.fstat(root_fd)
+        root_proof = controller_root_proof(repository)
         parent_fd = open_managed_apply_runs_root_fd(
             root,
             create=False,
-            root_anchor_fd=root_fd,
-            root_mount_resolution=root_mount_resolution,
         )
-        parent_metadata = os.fstat(parent_fd)
+        root_mount_resolution = resolve_apply_mount_identity(parent_fd, APPLY_RUN_MUTATION)
+        parent_metadata = controller_fstat(parent_fd)
         require_no_managed_recovery_quarantine(parent_fd)
         run_fd, run_metadata = open_child_directory(parent_fd, run_dir.name)
         require_apply_same_mount(
@@ -1592,6 +1732,7 @@ def refresh_apply_run_provenance(run_dir: Path, run: dict[str, object]) -> None:
         if (
             run_metadata.st_dev != parent_metadata.st_dev
             or not opened_directory_matches_path(run_dir, run_metadata, reject_mount=True)
+            or not controller_tree_is_private(run_fd)
         ):
             raise ValueError("apply_run_provenance_refresh_identity_changed")
         current_run = load_regular_json_at(run_fd, "Apply-Run.json")
@@ -1606,9 +1747,9 @@ def refresh_apply_run_provenance(run_dir: Path, run: dict[str, object]) -> None:
         )
         require_no_managed_recovery_quarantine(registry_fd)
         registration_name = apply_run_registration_file_name(run_dir.name)
-        registration_metadata = os.stat(registration_name, dir_fd=registry_fd, follow_symlinks=False)
+        registration_metadata = controller_stat(registration_name, dir_fd=registry_fd, follow_symlinks=False)
         registration = load_regular_json_at(registry_fd, registration_name)
-        current_registration_metadata = os.stat(
+        current_registration_metadata = controller_stat(
             registration_name,
             dir_fd=registry_fd,
             follow_symlinks=False,
@@ -1616,7 +1757,7 @@ def refresh_apply_run_provenance(run_dir: Path, run: dict[str, object]) -> None:
         if (
             not metadata_is_private_regular_file(registration_metadata)
             or not same_file_identity(registration_metadata, current_registration_metadata)
-            or not trusted_apply_run_registration(root, root_metadata, registration)
+            or not trusted_apply_run_registration(root_proof, registration)
         ):
             raise ValueError("apply_run_provenance_refresh_requires_trusted_registration")
         registration_id = run.get("apply_run_registration_id")
@@ -1639,7 +1780,7 @@ def refresh_apply_run_provenance(run_dir: Path, run: dict[str, object]) -> None:
             or registration.get("registration_version") != APPLY_RUN_REGISTRATION_VERSION
             or registration.get("registration_id") != registration_id
             or registration.get("run_name") != run_dir.name
-            or registration.get("run_dir") != run_dir.relative_to(root).as_posix()
+            or registration.get("run_dir") != apply_run_logical_path(root, run_dir)
             or registration.get("run_device") != run_metadata.st_dev
             or registration.get("run_inode") != run_metadata.st_ino
             or registration.get("manifest_claim_sha256") != claim_digest
@@ -1653,7 +1794,7 @@ def refresh_apply_run_provenance(run_dir: Path, run: dict[str, object]) -> None:
             root,
             run_dir,
             run,
-            root_metadata=root_metadata,
+            root_proof=root_proof,
             run_metadata=run_metadata,
             create_key=False,
         )
@@ -1668,17 +1809,17 @@ def refresh_apply_run_provenance(run_dir: Path, run: dict[str, object]) -> None:
             run,
             refreshed_registration,
             run_metadata,
-            root_metadata,
+            root_proof,
         ):
             raise ValueError("apply_run_provenance_refresh_failed")
     finally:
         if registry_fd >= 0:
-            os.close(registry_fd)
+            controller_close(registry_fd)
         if run_fd >= 0:
-            os.close(run_fd)
+            controller_close(run_fd)
         if parent_fd >= 0:
-            os.close(parent_fd)
-        os.close(root_fd)
+            controller_close(parent_fd)
+        repository_session.__exit__(None, None, None)
 
 
 def current_apply_run_provenance_is_valid(
@@ -1686,24 +1827,23 @@ def current_apply_run_provenance_is_valid(
     run_dir: Path,
     run: dict[str, object],
 ) -> bool:
-    root_fd = -1
+    repository_session = None
     parent_fd = -1
     run_fd = -1
     registry_fd = -1
     try:
-        root = root.resolve()
+        root = canonical_controller_repository_root(root)
         run_dir = resolve_managed_apply_run_dir(root, run_dir, lexical_root=root)
-        root_fd = os.open(root, secure_directory_open_flags())
-        root_mount_resolution = resolve_apply_mount_identity(root_fd, READ_ONLY_EVIDENCE)
-        root_metadata = os.fstat(root_fd)
+        repository_session = open_repository_io(root)
+        repository = repository_session.__enter__()
+        root_proof = controller_root_proof(repository)
         parent_fd = open_managed_apply_runs_root_fd(
             root,
             create=False,
-            root_anchor_fd=root_fd,
-            root_mount_resolution=root_mount_resolution,
             operation=READ_ONLY_EVIDENCE,
         )
-        parent_metadata = os.fstat(parent_fd)
+        root_mount_resolution = resolve_apply_mount_identity(parent_fd, READ_ONLY_EVIDENCE)
+        parent_metadata = controller_fstat(parent_fd)
         require_no_managed_recovery_quarantine(parent_fd)
         run_fd, run_metadata = open_child_directory(parent_fd, run_dir.name)
         require_apply_same_mount(
@@ -1716,6 +1856,7 @@ def current_apply_run_provenance_is_valid(
         if (
             run_metadata.st_dev != parent_metadata.st_dev
             or not opened_directory_matches_path(run_dir, run_metadata, reject_mount=True)
+            or not controller_tree_is_private(run_fd)
             or load_regular_json_at(run_fd, "Apply-Run.json") != run
         ):
             return False
@@ -1729,9 +1870,9 @@ def current_apply_run_provenance_is_valid(
         )
         require_no_managed_recovery_quarantine(registry_fd)
         registration_name = apply_run_registration_file_name(run_dir.name)
-        registration_metadata = os.stat(registration_name, dir_fd=registry_fd, follow_symlinks=False)
+        registration_metadata = controller_stat(registration_name, dir_fd=registry_fd, follow_symlinks=False)
         registration = load_regular_json_at(registry_fd, registration_name)
-        current_registration_metadata = os.stat(
+        current_registration_metadata = controller_stat(
             registration_name,
             dir_fd=registry_fd,
             follow_symlinks=False,
@@ -1750,39 +1891,39 @@ def current_apply_run_provenance_is_valid(
             run,
             registration,
             run_metadata,
-            root_metadata,
+            root_proof,
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return False
     finally:
         if registry_fd >= 0:
-            os.close(registry_fd)
+            controller_close(registry_fd)
         if run_fd >= 0:
-            os.close(run_fd)
+            controller_close(run_fd)
         if parent_fd >= 0:
-            os.close(parent_fd)
-        if root_fd >= 0:
-            os.close(root_fd)
+            controller_close(parent_fd)
+        if repository_session is not None:
+            repository_session.__exit__(None, None, None)
 
 
-def open_regular_child(parent_fd: int, name: str) -> tuple[int, os.stat_result]:
-    before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+def open_regular_child(parent_fd: int, name: str) -> tuple[int, ControllerStatResult]:
+    before = controller_stat(name, dir_fd=parent_fd, follow_symlinks=False)
     if not stat.S_ISREG(before.st_mode):
         raise ValueError("replace_apply_run_tree_changed")
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
-    child_fd = os.open(name, flags, dir_fd=parent_fd)
+    flags = CONTROLLER_O_RDONLY | CONTROLLER_O_NOFOLLOW | CONTROLLER_O_CLOEXEC | CONTROLLER_O_NONBLOCK
+    child_fd = controller_open(name, flags, dir_fd=parent_fd)
     try:
-        after = os.fstat(child_fd)
+        after = controller_fstat(child_fd)
     except Exception:
-        os.close(child_fd)
+        controller_close(child_fd)
         raise
     if not stat.S_ISREG(after.st_mode) or not same_file_identity(before, after):
-        os.close(child_fd)
+        controller_close(child_fd)
         raise ValueError("replace_apply_run_tree_changed")
     return child_fd, after
 
 
-def inventory_identity(metadata: os.stat_result, kind: str) -> dict[str, object]:
+def inventory_identity(metadata: ControllerStatResult, kind: str) -> dict[str, object]:
     return {
         "kind": kind,
         "device": metadata.st_dev,
@@ -1790,7 +1931,7 @@ def inventory_identity(metadata: os.stat_result, kind: str) -> dict[str, object]
     }
 
 
-def inventory_matches(metadata: os.stat_result, entry: dict[str, object], kind: str) -> bool:
+def inventory_matches(metadata: ControllerStatResult, entry: dict[str, object], kind: str) -> bool:
     expected_mode = stat.S_ISDIR(metadata.st_mode) if kind == "directory" else stat.S_ISREG(metadata.st_mode)
     return (
         entry.get("kind") == kind
@@ -1815,17 +1956,17 @@ def build_deletion_inventory(
         repository_mount_relative_path(root, logical_path),
         mismatch_error="replace_apply_run_tree_contains_indirect_target",
     )
-    directory_metadata = os.fstat(directory_fd)
+    directory_metadata = controller_fstat(directory_fd)
     if directory_metadata.st_dev != expected_device or path_is_mount_point(logical_path):
         raise ValueError("replace_apply_run_tree_contains_indirect_target")
     inventory = inventory_identity(directory_metadata, "directory")
     entries: dict[str, object] = {}
     inventory["entries"] = entries
-    for name in sorted(os.listdir(directory_fd)):
+    for name in sorted(controller_listdir(directory_fd)):
         if name.startswith(APPLY_DELETE_QUARANTINE_PREFIX):
             raise ValueError(f"replace_apply_run_recovery_required={name}")
         entry_path = logical_path / name
-        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        metadata = controller_stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if (
             metadata.st_dev != expected_device
             or stat.S_ISLNK(metadata.st_mode)
@@ -1857,7 +1998,7 @@ def build_deletion_inventory(
                     root_mount_resolution=root_mount_resolution,
                 )
             finally:
-                os.close(child_fd)
+                controller_close(child_fd)
         elif stat.S_ISREG(metadata.st_mode):
             try:
                 child_fd, child_metadata = open_regular_child(directory_fd, name)
@@ -1874,7 +2015,7 @@ def build_deletion_inventory(
                     raise ValueError("replace_apply_run_tree_contains_indirect_target")
                 entries[name] = inventory_identity(child_metadata, "regular")
             finally:
-                os.close(child_fd)
+                controller_close(child_fd)
         else:
             raise ValueError("replace_apply_run_tree_contains_unsupported_file")
     return inventory
@@ -1898,17 +2039,19 @@ def create_deletion_quarantine(
     for _ in range(32):
         name = f"{APPLY_DELETE_QUARANTINE_PREFIX}{secrets.token_hex(16)}"
         try:
-            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+            controller_mkdir(name, mode=0o700, dir_fd=parent_fd)
         except FileExistsError:
             continue
         try:
             quarantine_fd, metadata = open_child_directory(parent_fd, name)
         except (OSError, ValueError) as exc:
             try:
-                os.rmdir(name, dir_fd=parent_fd)
+                controller_rmdir(name, dir_fd=parent_fd)
             except OSError:
                 pass
             raise ValueError("replace_apply_run_tree_changed") from exc
+        controller_fchmod(quarantine_fd, 0o700)
+        metadata = controller_fstat(quarantine_fd)
         try:
             require_apply_same_mount(
                 root_mount_resolution,
@@ -1917,16 +2060,16 @@ def create_deletion_quarantine(
                 mismatch_error="replace_apply_run_tree_changed",
             )
         except Exception:
-            os.close(quarantine_fd)
+            controller_close(quarantine_fd)
             try:
-                os.rmdir(name, dir_fd=parent_fd)
+                controller_rmdir(name, dir_fd=parent_fd)
             except OSError:
                 pass
             raise
         if metadata.st_dev != expected_device:
-            os.close(quarantine_fd)
+            controller_close(quarantine_fd)
             try:
-                os.rmdir(name, dir_fd=parent_fd)
+                controller_rmdir(name, dir_fd=parent_fd)
             except OSError:
                 pass
             raise ValueError("replace_apply_run_tree_changed")
@@ -1969,9 +2112,9 @@ def atomic_rename_no_replace(
     ctypes.set_errno(0)
     result = rename_function(
         source_dir_fd,
-        os.fsencode(source),
+        controller_fsencode(source),
         destination_dir_fd,
-        os.fsencode(destination),
+        controller_fsencode(destination),
         flags,
     )
     if result != 0:
@@ -1984,7 +2127,7 @@ def atomic_rename_no_replace(
         }
         if error_number in unsupported_errors:
             raise ValueError("secure_apply_run_replace_not_supported")
-        raise OSError(error_number, os.strerror(error_number), destination)
+        raise OSError(error_number, controller_strerror(error_number), destination)
 
 
 def probe_atomic_no_replace(
@@ -2009,14 +2152,14 @@ def probe_atomic_no_replace(
     probe_error: Exception | None = None
     try:
         file_flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | os.O_NOFOLLOW
-            | getattr(os, "O_CLOEXEC", 0)
+            CONTROLLER_O_WRONLY
+            | CONTROLLER_O_CREAT
+            | CONTROLLER_O_EXCL
+            | CONTROLLER_O_NOFOLLOW
+            | CONTROLLER_O_CLOEXEC
         )
-        source_fd = os.open("probe-source", file_flags, 0o600, dir_fd=quarantine_fd)
-        destination_fd = os.open("probe-destination", file_flags, 0o600, dir_fd=quarantine_fd)
+        source_fd = controller_open("probe-source", file_flags, 0o600, dir_fd=quarantine_fd)
+        destination_fd = controller_open("probe-destination", file_flags, 0o600, dir_fd=quarantine_fd)
         quarantine_path = logical_parent / quarantine_name
         require_apply_same_mount(
             root_mount_resolution,
@@ -2030,9 +2173,9 @@ def probe_atomic_no_replace(
             repository_mount_relative_path(root, quarantine_path / "probe-destination"),
             mismatch_error="secure_apply_run_replace_not_supported",
         )
-        os.close(source_fd)
+        controller_close(source_fd)
         source_fd = -1
-        os.close(destination_fd)
+        controller_close(destination_fd)
         destination_fd = -1
         try:
             atomic_rename_no_replace(
@@ -2045,28 +2188,28 @@ def probe_atomic_no_replace(
             pass
         else:
             raise ValueError("secure_apply_run_replace_not_supported")
-        source_metadata = os.stat("probe-source", dir_fd=quarantine_fd, follow_symlinks=False)
-        destination_metadata = os.stat("probe-destination", dir_fd=quarantine_fd, follow_symlinks=False)
+        source_metadata = controller_stat("probe-source", dir_fd=quarantine_fd, follow_symlinks=False)
+        destination_metadata = controller_stat("probe-destination", dir_fd=quarantine_fd, follow_symlinks=False)
         if not stat.S_ISREG(source_metadata.st_mode) or not stat.S_ISREG(destination_metadata.st_mode):
             raise ValueError("secure_apply_run_replace_not_supported")
     except Exception as exc:
         probe_error = exc
     finally:
         if source_fd >= 0:
-            os.close(source_fd)
+            controller_close(source_fd)
         if destination_fd >= 0:
-            os.close(destination_fd)
+            controller_close(destination_fd)
         cleanup_failed = False
         for probe_name in ("probe-source", "probe-destination"):
             try:
-                os.unlink(probe_name, dir_fd=quarantine_fd)
+                controller_unlink(probe_name, dir_fd=quarantine_fd)
             except FileNotFoundError:
                 pass
             except OSError:
                 cleanup_failed = True
-        os.close(quarantine_fd)
+        controller_close(quarantine_fd)
         try:
-            os.rmdir(quarantine_name, dir_fd=parent_fd)
+            controller_rmdir(quarantine_name, dir_fd=parent_fd)
         except OSError:
             cleanup_failed = True
         if cleanup_failed:
@@ -2103,9 +2246,9 @@ def restore_quarantined_entry(
         )
     finally:
         if entry_fd >= 0:
-            os.close(entry_fd)
+            controller_close(entry_fd)
     try:
-        before = os.stat("entry", dir_fd=quarantine_fd, follow_symlinks=False)
+        before = controller_stat("entry", dir_fd=quarantine_fd, follow_symlinks=False)
     except OSError as exc:
         raise ValueError(f"replace_apply_run_restore_conflict={quarantine_name}") from exc
     try:
@@ -2122,13 +2265,13 @@ def restore_quarantined_entry(
     except OSError as exc:
         raise ValueError(f"replace_apply_run_restore_failed={quarantine_name}") from exc
     try:
-        after = os.stat(original_name, dir_fd=parent_fd, follow_symlinks=False)
+        after = controller_stat(original_name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError as exc:
         raise ValueError(f"replace_apply_run_restore_failed={quarantine_name}") from exc
     if not same_file_identity(before, after):
         raise ValueError(f"replace_apply_run_restore_conflict={quarantine_name}")
     try:
-        os.rmdir(quarantine_name, dir_fd=parent_fd)
+        controller_rmdir(quarantine_name, dir_fd=parent_fd)
     except OSError as exc:
         raise ValueError(f"replace_apply_run_restore_cleanup_failed={quarantine_name}") from exc
 
@@ -2155,7 +2298,7 @@ def delete_inventory_entry(
         mismatch_error="replace_apply_run_tree_changed",
     )
     try:
-        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        metadata = controller_stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError as exc:
         raise ValueError("replace_apply_run_tree_changed") from exc
     if not inventory_matches(metadata, entry, str(kind)) or path_is_mount_point(entry_path):
@@ -2180,7 +2323,7 @@ def delete_inventory_entry(
         )
         moved = True
         quarantined_path = logical_parent / quarantine_name / "entry"
-        quarantined_metadata = os.stat("entry", dir_fd=quarantine_fd, follow_symlinks=False)
+        quarantined_metadata = controller_stat("entry", dir_fd=quarantine_fd, follow_symlinks=False)
         if (
             not inventory_matches(quarantined_metadata, entry, str(kind))
             or path_is_mount_point(quarantined_path)
@@ -2204,15 +2347,15 @@ def delete_inventory_entry(
                 root=root,
                 root_mount_resolution=root_mount_resolution,
             )
-            current_fd_metadata = os.fstat(entry_fd)
-            current_path_metadata = os.stat("entry", dir_fd=quarantine_fd, follow_symlinks=False)
+            current_fd_metadata = controller_fstat(entry_fd)
+            current_path_metadata = controller_stat("entry", dir_fd=quarantine_fd, follow_symlinks=False)
             if (
                 not inventory_matches(current_fd_metadata, entry, "directory")
                 or not inventory_matches(current_path_metadata, entry, "directory")
                 or path_is_mount_point(quarantined_path)
             ):
                 raise ValueError("replace_apply_run_tree_changed")
-            os.rmdir("entry", dir_fd=quarantine_fd)
+            controller_rmdir("entry", dir_fd=quarantine_fd)
         else:
             entry_fd, opened_metadata = open_regular_child(quarantine_fd, "entry")
             require_apply_same_mount(
@@ -2221,18 +2364,18 @@ def delete_inventory_entry(
                 repository_mount_relative_path(root, quarantined_path),
                 mismatch_error="replace_apply_run_tree_changed",
             )
-            current_path_metadata = os.stat("entry", dir_fd=quarantine_fd, follow_symlinks=False)
+            current_path_metadata = controller_stat("entry", dir_fd=quarantine_fd, follow_symlinks=False)
             if (
                 not inventory_matches(opened_metadata, entry, "regular")
                 or not inventory_matches(current_path_metadata, entry, "regular")
                 or path_is_mount_point(quarantined_path)
             ):
                 raise ValueError("replace_apply_run_tree_changed")
-            os.unlink("entry", dir_fd=quarantine_fd)
+            controller_unlink("entry", dir_fd=quarantine_fd)
         removed = True
     except (OSError, ValueError) as exc:
         if entry_fd >= 0:
-            os.close(entry_fd)
+            controller_close(entry_fd)
             entry_fd = -1
         if moved and not removed:
             restore_quarantined_entry(
@@ -2247,7 +2390,7 @@ def delete_inventory_entry(
             )
         else:
             try:
-                os.rmdir(quarantine_name, dir_fd=parent_fd)
+                controller_rmdir(quarantine_name, dir_fd=parent_fd)
             except OSError:
                 pass
         if isinstance(exc, ValueError) and (
@@ -2258,10 +2401,10 @@ def delete_inventory_entry(
         raise ValueError("replace_apply_run_tree_changed") from exc
     finally:
         if entry_fd >= 0:
-            os.close(entry_fd)
-        os.close(quarantine_fd)
+            controller_close(entry_fd)
+        controller_close(quarantine_fd)
     try:
-        os.rmdir(quarantine_name, dir_fd=parent_fd)
+        controller_rmdir(quarantine_name, dir_fd=parent_fd)
     except OSError as exc:
         raise ValueError("replace_apply_run_tree_changed") from exc
 
@@ -2282,7 +2425,7 @@ def clear_directory_fd(
         repository_mount_relative_path(root, logical_path),
         mismatch_error="replace_apply_run_tree_changed",
     )
-    directory_metadata = os.fstat(directory_fd)
+    directory_metadata = controller_fstat(directory_fd)
     if (
         directory_metadata.st_dev != expected_device
         or not inventory_matches(directory_metadata, inventory, "directory")
@@ -2290,11 +2433,11 @@ def clear_directory_fd(
     ):
         raise ValueError("replace_apply_run_tree_changed")
     entries = inventory.get("entries")
-    if not isinstance(entries, dict) or set(os.listdir(directory_fd)) != set(entries):
+    if not isinstance(entries, dict) or set(controller_listdir(directory_fd)) != set(entries):
         raise ValueError("replace_apply_run_tree_changed")
     ordered_names = sorted(entries)
     for index, name in enumerate(ordered_names):
-        if set(os.listdir(directory_fd)) != set(ordered_names[index:]):
+        if set(controller_listdir(directory_fd)) != set(ordered_names[index:]):
             raise ValueError("replace_apply_run_tree_changed")
         entry = entries[name]
         if not isinstance(entry, dict):
@@ -2308,13 +2451,13 @@ def clear_directory_fd(
             root=root,
             root_mount_resolution=root_mount_resolution,
         )
-    if os.listdir(directory_fd):
+    if controller_listdir(directory_fd):
         raise ValueError("replace_apply_run_tree_changed")
 
 
 def require_no_managed_recovery_quarantine(parent_fd: int) -> None:
     recovery_names = sorted(
-        name for name in os.listdir(parent_fd) if name.startswith(APPLY_DELETE_QUARANTINE_PREFIX)
+        name for name in controller_listdir(parent_fd) if name.startswith(APPLY_DELETE_QUARANTINE_PREFIX)
     )
     if recovery_names:
         raise ValueError(f"replace_apply_run_recovery_required={recovery_names[0]}")
@@ -2322,7 +2465,7 @@ def require_no_managed_recovery_quarantine(parent_fd: int) -> None:
 
 def require_no_stale_apply_run_registration(root: Path, parent_fd: int, run_name: str) -> None:
     try:
-        os.stat(APPLY_RUN_REGISTRY_DIR_NAME, dir_fd=parent_fd, follow_symlinks=False)
+        controller_stat(APPLY_RUN_REGISTRY_DIR_NAME, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
         return
     except OSError as exc:
@@ -2332,42 +2475,36 @@ def require_no_stale_apply_run_registration(root: Path, parent_fd: int, run_name
         require_no_managed_recovery_quarantine(registry_fd)
         registration_name = apply_run_registration_file_name(run_name)
         try:
-            os.stat(registration_name, dir_fd=registry_fd, follow_symlinks=False)
+            controller_stat(registration_name, dir_fd=registry_fd, follow_symlinks=False)
         except FileNotFoundError:
             return
         except OSError as exc:
             raise ValueError(f"apply_run_registration_recovery_required={run_name}") from exc
         raise ValueError(f"apply_run_registration_recovery_required={run_name}")
     finally:
-        os.close(registry_fd)
+        controller_close(registry_fd)
 
 
 def replace_existing_apply_run(
     root: Path,
     run_dir: Path,
     *,
-    root_anchor_fd: int | None = None,
-    root_mount_resolution: MountResolution | None = None,
+    root_proof: ControllerRootProof,
 ) -> None:
-    if root_mount_resolution is None:
-        if root_anchor_fd is None:
-            raise ValueError("secure_repository_mount_identity_unavailable")
-        root_mount_resolution = resolve_apply_mount_identity(
-            root_anchor_fd,
-            RUN_REPLACE_QUARANTINE_DELETE,
-        )
-    require_mount_assurance(root_mount_resolution, RUN_REPLACE_QUARANTINE_DELETE)
     parent_fd = open_managed_apply_runs_root_fd(
         root,
         create=False,
-        root_anchor_fd=root_anchor_fd,
-        root_mount_resolution=root_mount_resolution,
         operation=RUN_REPLACE_QUARANTINE_DELETE,
     )
+    root_mount_resolution = resolve_apply_mount_identity(
+        parent_fd,
+        RUN_REPLACE_QUARANTINE_DELETE,
+    )
+    require_mount_assurance(root_mount_resolution, RUN_REPLACE_QUARANTINE_DELETE)
     run_fd = -1
     registry_fd = -1
     try:
-        parent_metadata = os.fstat(parent_fd)
+        parent_metadata = controller_fstat(parent_fd)
         require_no_managed_recovery_quarantine(parent_fd)
         run_fd, run_metadata = open_child_directory(parent_fd, run_dir.name)
         require_apply_same_mount(
@@ -2397,13 +2534,13 @@ def replace_existing_apply_run(
         require_no_managed_recovery_quarantine(registry_fd)
         registration_name = apply_run_registration_file_name(run_dir.name)
         try:
-            registration_metadata = os.stat(
+            registration_metadata = controller_stat(
                 registration_name,
                 dir_fd=registry_fd,
                 follow_symlinks=False,
             )
             registration = load_regular_json_at(registry_fd, registration_name)
-            current_registration_metadata = os.stat(
+            current_registration_metadata = controller_stat(
                 registration_name,
                 dir_fd=registry_fd,
                 follow_symlinks=False,
@@ -2424,7 +2561,7 @@ def replace_existing_apply_run(
             run,
             registration,
             run_metadata,
-            os.fstat(root_anchor_fd) if root_anchor_fd is not None else os.stat(root, follow_symlinks=False),
+            root_proof,
         ):
             raise ValueError("replace_requires_existing_apply_run")
         probe_atomic_no_replace(
@@ -2441,7 +2578,7 @@ def replace_existing_apply_run(
             root=root,
             root_mount_resolution=root_mount_resolution,
         )
-        os.close(run_fd)
+        controller_close(run_fd)
         run_fd = -1
         delete_inventory_entry(
             registry_fd,
@@ -2463,10 +2600,10 @@ def replace_existing_apply_run(
         )
     finally:
         if run_fd >= 0:
-            os.close(run_fd)
+            controller_close(run_fd)
         if registry_fd >= 0:
-            os.close(registry_fd)
-        os.close(parent_fd)
+            controller_close(registry_fd)
+        controller_close(parent_fd)
 
 
 def create_managed_apply_run_directory(
@@ -2475,22 +2612,23 @@ def create_managed_apply_run_directory(
     *,
     root_anchor_fd: int | None = None,
     root_mount_resolution: MountResolution | None = None,
-) -> tuple[int, int, os.stat_result]:
+) -> tuple[int, int, ControllerStatResult]:
     parent_fd = open_managed_apply_runs_root_fd(
         root,
         create=True,
         root_anchor_fd=root_anchor_fd,
-        root_mount_resolution=root_mount_resolution,
     )
     run_fd = -1
     created = False
     try:
         require_no_managed_recovery_quarantine(parent_fd)
         require_no_stale_apply_run_registration(root, parent_fd, run_dir.name)
-        os.mkdir(run_dir.name, mode=0o700, dir_fd=parent_fd)
+        controller_mkdir(run_dir.name, mode=0o700, dir_fd=parent_fd)
         created = True
         run_fd, run_metadata = open_child_directory(parent_fd, run_dir.name)
-        mount_resolution = root_mount_resolution or resolve_apply_mount_identity(
+        controller_fchmod(run_fd, 0o700)
+        run_metadata = controller_fstat(run_fd)
+        mount_resolution = resolve_apply_mount_identity(
             parent_fd,
             APPLY_RUN_MUTATION,
         )
@@ -2500,7 +2638,7 @@ def create_managed_apply_run_directory(
             repository_mount_relative_path(root, run_dir),
             mismatch_error="invalid_apply_run_output_dir=indirect_target_rejected",
         )
-        parent_metadata = os.fstat(parent_fd)
+        parent_metadata = controller_fstat(parent_fd)
         if (
             run_metadata.st_dev != parent_metadata.st_dev
             or not metadata_is_private_directory(run_metadata)
@@ -2508,17 +2646,17 @@ def create_managed_apply_run_directory(
         ):
             raise ValueError("invalid_apply_run_output_dir=indirect_target_rejected")
     except FileExistsError as exc:
-        os.close(parent_fd)
-        raise ValueError(f"apply_run_already_exists={run_dir.relative_to(root).as_posix()}") from exc
+        controller_close(parent_fd)
+        raise ValueError(f"apply_run_already_exists={apply_run_logical_path(root, run_dir)}") from exc
     except Exception:
         if run_fd >= 0:
-            os.close(run_fd)
+            controller_close(run_fd)
         if created:
             try:
-                os.rmdir(run_dir.name, dir_fd=parent_fd)
+                controller_rmdir(run_dir.name, dir_fd=parent_fd)
             except OSError:
                 pass
-        os.close(parent_fd)
+        controller_close(parent_fd)
         raise
     return parent_fd, run_fd, run_metadata
 
@@ -2553,19 +2691,42 @@ def git_untracked_inventory(entries: object) -> tuple[str, int]:
         if not baseline_path_is_excluded(str(item["path"])):
             selected.append(item)
     selected.sort(key=lambda item: str(item["path"]))
-    return canonical_git_evidence_digest(selected), len(selected)
+    return controller_evidence_digest(selected), len(selected)
 
 
-def workspace_file_inventory_entries(root: Path) -> list[str]:
-    try:
-        snapshot = snapshot_repository_inventory(
-            root,
-            exclude=baseline_path_is_excluded,
-            max_bytes=MAX_WORKSPACE_INVENTORY_FILE_BYTES,
-            max_total_bytes=MAX_WORKSPACE_INVENTORY_TOTAL_BYTES,
+def workspace_file_inventory_entries(
+    root: Path,
+    repository: RepositoryIO | None = None,
+) -> list[str]:
+    if repository is None:
+        policy = RepositoryIOPolicy(
+            name="apply-workspace-evidence/v1",
+            max_file_bytes=MAX_WORKSPACE_INVENTORY_FILE_BYTES,
+            # The legacy Apply contract defines this limit across the two
+            # confirmation passes. RepositoryIO exposes a logical-content
+            # budget, so halve it to preserve the existing physical ceiling.
+            max_total_bytes=max(1, MAX_WORKSPACE_INVENTORY_TOTAL_BYTES // 2),
             max_paths=MAX_WORKSPACE_INVENTORY_PATHS,
             timeout_seconds=WORKSPACE_INVENTORY_TIMEOUT_SECONDS,
+            model_max_file_bytes=max(
+                1,
+                min(256 * 1024, MAX_WORKSPACE_INVENTORY_FILE_BYTES),
+            ),
+            model_max_total_bytes=max(
+                1,
+                min(1024 * 1024, max(1, MAX_WORKSPACE_INVENTORY_TOTAL_BYTES // 2)),
+            ),
+            model_max_matches=max(1, min(512, MAX_WORKSPACE_INVENTORY_PATHS)),
+            model_max_record_characters=4096,
         )
+        with open_repository_io(root, policy) as opened:
+            return workspace_file_inventory_entries(canonical_repository_root(opened), opened)
+    try:
+        snapshot = [
+            item
+            for item in controller_inventory(repository, "intake")
+            if not baseline_path_is_excluded(str(item.get("path", "")))
+        ]
     except ValueError as exc:
         if str(exc) == "repository_inventory_walk_failed":
             raise ValueError("workspace_inventory_walk_failed=descriptor_capture") from exc
@@ -2625,12 +2786,11 @@ def workspace_file_manifest_map(entries: object) -> dict[str, str] | None:
     return result
 
 
-def workspace_baseline_capture(root: Path) -> tuple[dict[str, object], list[str]]:
-    git_evidence = capture_git_workspace_evidence(
-        root,
-        exclude_untracked=baseline_path_is_excluded,
-        exclude_tracked=baseline_path_is_excluded,
-    )
+def workspace_baseline_capture(
+    root: Path,
+    repository: RepositoryIO | None = None,
+) -> tuple[dict[str, object], list[str]]:
+    git_evidence = repository_workspace_evidence(root, repository)
     is_git = git_evidence.get("is_git") is True
     if is_git:
         untracked_paths = [
@@ -2656,9 +2816,9 @@ def workspace_baseline_capture(root: Path) -> tuple[dict[str, object], list[str]
             {"domain": "untracked", "path": path, "state": "untracked"}
             for path in untracked_paths
         )
-        status_hash = canonical_git_evidence_digest(status_entries)
-        staged_hash = canonical_git_evidence_digest(staged_changes)
-        unstaged_hash = canonical_git_evidence_digest(unstaged_changes)
+        status_hash = controller_evidence_digest(status_entries)
+        staged_hash = controller_evidence_digest(staged_changes)
+        unstaged_hash = controller_evidence_digest(unstaged_changes)
         untracked_hash, untracked_count = git_untracked_inventory(
             git_evidence.get("untracked_entries")
         )
@@ -2728,98 +2888,103 @@ def read_repository_file_no_follow(
     relative_path: str,
     *,
     max_bytes: int = MAX_REPOSITORY_BASELINE_CONTENT_BYTES,
+    repository: RepositoryIO | None = None,
 ) -> bytes | None:
-    """Read one explicit repository file without following path components."""
+    """Compatibility wrapper over the mandatory repository I/O boundary."""
 
-    normalized = normalize_repo_relative_path(relative_path)
     if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 0:
         raise ValueError("repository_read_max_bytes_invalid")
-    root = root.resolve(strict=True)
-    root_fd = os.open(root, secure_directory_open_flags())
-    current_fd = root_fd
-    owned_fds: list[int] = []
-    file_fd = -1
-    try:
-        root_metadata = os.fstat(root_fd)
-        if not opened_directory_matches_path(root, root_metadata, reject_mount=False):
-            raise ValueError("repository_root_identity_changed")
-        parts = normalized.split("/")
-        for part in parts[:-1]:
-            try:
-                child_fd, child_metadata = open_child_directory(current_fd, part)
-            except FileNotFoundError:
-                return None
-            if child_metadata.st_dev != root_metadata.st_dev:
-                os.close(child_fd)
-                raise ValueError("repository_path_cross_device_rejected")
-            owned_fds.append(child_fd)
-            current_fd = child_fd
-        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
-        try:
-            file_fd = os.open(parts[-1], flags, dir_fd=current_fd)
-        except FileNotFoundError:
-            return None
-        before = os.fstat(file_fd)
-        expected_uid = os.geteuid() if hasattr(os, "geteuid") else before.st_uid
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_nlink != 1
-            or before.st_uid != expected_uid
-            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-        ):
-            raise ValueError("repository_file_not_owner_controlled_regular")
-        chunks: list[bytes] = []
-        remaining = max_bytes + 1
-        while remaining > 0:
-            chunk = os.read(file_fd, min(65536, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        content = b"".join(chunks)
-        if len(content) > max_bytes:
-            raise ValueError("repository_baseline_content_too_large")
-        after = os.fstat(file_fd)
-        if (
-            before.st_dev,
-            before.st_ino,
-            before.st_mode,
-            before.st_nlink,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        ) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_mode,
-            after.st_nlink,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        ):
-            raise ValueError("repository_file_changed_during_read")
-        return content
-    finally:
-        if file_fd >= 0:
-            os.close(file_fd)
-        for directory_fd in reversed(owned_fds):
-            os.close(directory_fd)
-        os.close(root_fd)
+    if repository is None:
+        with open_repository_io(root) as opened:
+            return read_repository_file_no_follow(
+                canonical_repository_root(opened),
+                relative_path,
+                max_bytes=max_bytes,
+                repository=opened,
+            )
+    evidence = controller_read_bytes(repository, relative_path, required=False)
+    if not evidence.exists or evidence.data is None:
+        return None
+    if len(evidence.data) > max_bytes:
+        raise ValueError("repository_baseline_content_too_large")
+    return evidence.data
 
 
-def capture_repository_baselines(root: Path, tasks: list[dict[str, object]]) -> list[dict[str, object]]:
+def capture_repository_io_evidence(
+    root: Path,
+    allowed_paths: list[str],
+    baseline_snapshot: object,
+    *,
+    apply_run_id: str,
+    task_id: str,
+    apply_run_registration_id: str,
+    contract_digest: str,
+    generation: int,
+    review_package_sha256: str,
+    repository: RepositoryIO | None = None,
+) -> dict[str, object]:
+    if repository is None:
+        with open_repository_io(root) as opened:
+            return capture_repository_io_evidence(
+                canonical_repository_root(opened),
+                allowed_paths,
+                baseline_snapshot,
+                apply_run_id=apply_run_id,
+                task_id=task_id,
+                apply_run_registration_id=apply_run_registration_id,
+                contract_digest=contract_digest,
+                generation=generation,
+                review_package_sha256=review_package_sha256,
+                repository=opened,
+            )
+    if not isinstance(baseline_snapshot, list):
+        raise ValueError("repository_baseline_invalid")
+    current = controller_snapshot_paths(repository, allowed_paths)
+    return controller_evidence_from_snapshots(
+        allowed_paths,
+        baseline_snapshot,
+        current,
+        apply_run_id=apply_run_id,
+        task_id=task_id,
+        apply_run_registration_id=apply_run_registration_id,
+        contract_digest=contract_digest,
+        generation=generation,
+        review_package_sha256=review_package_sha256,
+    )
+
+
+def capture_repository_baselines(
+    root: Path,
+    tasks: list[dict[str, object]],
+    repository: RepositoryIO | None = None,
+) -> list[dict[str, object]]:
+    if repository is None:
+        with open_repository_io(root) as opened:
+            return capture_repository_baselines(canonical_repository_root(opened), tasks, opened)
     baselines: list[dict[str, object]] = []
     for task in tasks:
         task_id = str(task.get("task_id", ""))
         paths = sorted(implementation_contract_paths(task))
-        snapshot = snapshot_allowed_paths(root, paths)
+        captured = [
+            controller_read_bytes(repository, path, required=False)
+            for path in paths
+        ]
+        snapshot = [
+            {
+                "path": evidence.path,
+                "state": "present" if evidence.exists else "missing",
+                "sha256": evidence.receipt.sha256,
+                "size": evidence.receipt.size,
+            }
+            for evidence in captured
+        ]
         contents: list[dict[str, object]] = []
         total_bytes = 0
-        for entry in snapshot:
+        for entry, evidence in zip(snapshot, captured):
             if entry.get("state") != "present":
                 continue
             path = str(entry["path"])
-            content = read_repository_file_no_follow(root, path)
+            content = evidence.data
             if content is None or sha256_bytes(content) != entry.get("sha256") or len(content) != entry.get("size"):
                 raise ValueError(f"repository_baseline_capture_changed={task_id}:{path}")
             assert_safe_embedded_content_bytes(content)
@@ -2840,7 +3005,7 @@ def capture_repository_baselines(root: Path, tasks: list[dict[str, object]]) -> 
                 "implementation_contract_digest": task.get("implementation_contract_digest"),
                 "allowed_paths": paths,
                 "snapshot": snapshot,
-                "baseline_digest": repository_baseline_digest(snapshot),
+                "baseline_digest": controller_baseline_digest(snapshot),
                 "contents": contents,
             }
         )
@@ -2873,11 +3038,11 @@ def implementation_contract_paths_by_state(task: dict[str, object], state: str) 
 
 
 def read_external_report_json(path: Path) -> object:
-    parent_fd = os.open(path.parent, secure_directory_open_flags())
+    parent_fd = controller_open(path.parent, secure_directory_open_flags())
     try:
         return parse_safe_persistent_json(secure_read_regular_text_at(parent_fd, path.name))
     finally:
-        os.close(parent_fd)
+        controller_close(parent_fd)
 
 
 def implementation_report_files(run_dir: Path, task: dict[str, object]) -> set[str]:
@@ -2885,7 +3050,7 @@ def implementation_report_files(run_dir: Path, task: dict[str, object]) -> set[s
     if not safe_task_id(task_id):
         return set()
     report_path = run_dir / task_id / "Implementer-Report.json"
-    if not report_path.is_file():
+    if not controller_regular_entry_exists(report_path):
         return set()
     try:
         report = read_external_report_json(report_path)
@@ -2910,7 +3075,7 @@ def fix_report_files(run_dir: Path, task: dict[str, object]) -> set[str]:
     if not safe_task_id(task_id):
         return set()
     report_path = run_dir / task_id / "Fix-Report.json"
-    if not report_path.is_file():
+    if not controller_regular_entry_exists(report_path):
         return set()
     try:
         report = read_external_report_json(report_path)
@@ -2984,11 +3149,7 @@ def implementation_workspace_drift(
     stored_map = workspace_file_manifest_map(stored_entries)
     if stored_map is None:
         return {"allowed": False, "changed_paths": set(), "allowed_paths": set()}
-    git_evidence = capture_git_workspace_evidence(
-        root,
-        exclude_untracked=baseline_path_is_excluded,
-        exclude_tracked=baseline_path_is_excluded,
-    )
+    git_evidence = repository_workspace_evidence(root)
     is_git = git_evidence.get("is_git") is True
     current_entries = (
         git_workspace_file_inventory_entries(root)
@@ -3027,7 +3188,7 @@ def implementation_workspace_drift(
         if isinstance(item, dict)
         and not baseline_path_is_excluded(str(item.get("path", "")))
     ]
-    current_staged_digest = canonical_git_evidence_digest(current_staged_changes)
+    current_staged_digest = controller_evidence_digest(current_staged_changes)
     staged_unchanged = is_sha256(stored_staged_digest) and stored_staged_digest == current_staged_digest
     tracked_paths = {
         str(path)
@@ -3158,13 +3319,20 @@ def git_worktree_requires_approval(baseline: dict[str, object]) -> bool:
 def collect_snapshot(
     root: Path,
     baseline: dict[str, object] | None = None,
+    repository: RepositoryIO | None = None,
 ) -> list[dict[str, str]]:
-    planner = root / "Planner-docs"
-    files = sorted(planner.glob("**/*.md")) if planner.is_dir() else []
+    if repository is None:
+        with open_repository_io(root) as opened:
+            return collect_snapshot(canonical_repository_root(opened), baseline, opened)
+    files = [
+        path
+        for path in controller_regular_paths(repository, "step3")
+        if path.endswith(".md") and Path(path).name != "Planing-Ledger.md"
+    ]
+    captured = repository.read_many(files, required=True, audience="internal")
     snapshot = [
-        {"path": path.relative_to(root).as_posix(), "sha256": sha256_bytes(path.read_bytes())}
-        for path in files
-        if path.is_file() and path.name != "Planing-Ledger.md"
+        {"path": evidence.path, "sha256": str(evidence.receipt.sha256)}
+        for evidence in captured
     ]
     baseline = baseline or workspace_baseline(root)
     branch = str(baseline["branch"])
@@ -3185,7 +3353,7 @@ def snapshot_digest(snapshot: list[dict[str, str]]) -> str:
 
 
 def invocation_suffix(value: str | None = None) -> str:
-    raw = value or f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-{os.getpid()}"
+    raw = value or f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-{controller_process_id()}"
     if has_secret_like(raw):
         raise ValueError("secret_like_run_id_suffix")
     suffix = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-._")
@@ -3237,34 +3405,28 @@ def apply_run_id(
     return f"apply-{mode}-{digest[:12]}-{invocation_suffix(run_id_suffix)}"
 
 
-def infer_root(run_dir: Path) -> Path | None:
-    parts = run_dir.resolve().parts
-    if len(parts) >= 3 and parts[-3:-1] == (".codexqb", "apply-runs"):
-        return run_dir.resolve().parents[2]
-    return None
-
-
 @dataclass
 class ApplyMutationHandle:
     root: Path
     run_dir: Path
-    root_fd: int
+    repository: RepositoryIO
+    root_proof: ControllerRootProof
     parent_fd: int
     run_fd: int
-    run_metadata: os.stat_result
+    run_metadata: ControllerStatResult
     run: dict[str, object]
     root_mount_resolution: MountResolution
     mount_operation: str
 
     def revalidate(self) -> bool:
         try:
-            parent_metadata = os.fstat(self.parent_fd)
+            current_root_proof = controller_root_proof(self.repository)
+            parent_metadata = controller_fstat(self.parent_fd)
             require_mount_assurance(self.root_mount_resolution, self.mount_operation)
-            require_same_mount(self.root_mount_resolution, self.root_fd, ".")
             require_same_mount(
                 self.root_mount_resolution,
                 self.parent_fd,
-                APPLY_RUNS_RELATIVE_DIR.as_posix(),
+                ".",
             )
             require_same_mount(
                 self.root_mount_resolution,
@@ -3274,23 +3436,29 @@ class ApplyMutationHandle:
         except (OSError, TypeError, ValueError):
             return False
         return (
-            self.run_metadata.st_dev == parent_metadata.st_dev
+            current_root_proof.repository_identity_sha256
+            == self.root_proof.repository_identity_sha256
+            and current_root_proof.root_device == self.root_proof.root_device
+            and current_root_proof.root_inode == self.root_proof.root_inode
+            and self.run_metadata.st_dev == parent_metadata.st_dev
             and secure_directory_entry_matches(self.parent_fd, self.run_dir.name, self.run_metadata)
             and opened_directory_matches_path(self.run_dir, self.run_metadata, reject_mount=True)
+            and controller_tree_is_private(self.run_fd)
         )
 
 
-def lexical_managed_apply_run(root_candidate: Path) -> tuple[Path, Path]:
+def lexical_managed_apply_run(
+    root_candidate: Path,
+    root: Path,
+) -> tuple[Path, Path]:
     lexical_run_dir = lexical_absolute(root_candidate)
-    parts = lexical_run_dir.parts
-    if len(parts) < 3 or parts[-3:-1] != (".codexqb", "apply-runs"):
-        raise ValueError("invalid_apply_run_output_dir=managed_run_required")
-    lexical_root = lexical_run_dir.parents[2]
-    root = lexical_root.resolve(strict=True)
+    selected_root = lexical_absolute(root)
+    with open_repository_io(selected_root) as repository:
+        root = canonical_repository_root(repository)
     run_dir = resolve_managed_apply_run_dir(
         root,
         lexical_run_dir,
-        lexical_root=lexical_root,
+        lexical_root=root,
     )
     return root, run_dir
 
@@ -3299,22 +3467,22 @@ def lexical_managed_apply_run(root_candidate: Path) -> tuple[Path, Path]:
 def open_verified_apply_run_for_mutation(
     run_dir: Path,
     *,
+    root: Path,
     require_provenance: bool = True,
 ) -> Iterator[ApplyMutationHandle]:
-    root, canonical_run_dir = lexical_managed_apply_run(run_dir)
-    root_fd = os.open(root, secure_directory_open_flags())
+    root, canonical_run_dir = lexical_managed_apply_run(run_dir, root)
+    repository_session = open_repository_io(root)
+    repository = repository_session.__enter__()
     parent_fd = -1
     opened_run_fd = -1
     try:
-        root_mount_resolution = resolve_apply_mount_identity(root_fd, APPLY_RUN_MUTATION)
-        root_metadata = os.fstat(root_fd)
+        root_proof = controller_root_proof(repository)
         parent_fd = open_managed_apply_runs_root_fd(
             root,
             create=False,
-            root_anchor_fd=root_fd,
-            root_mount_resolution=root_mount_resolution,
         )
-        parent_metadata = os.fstat(parent_fd)
+        root_mount_resolution = resolve_apply_mount_identity(parent_fd, APPLY_RUN_MUTATION)
+        parent_metadata = controller_fstat(parent_fd)
         require_no_managed_recovery_quarantine(parent_fd)
         opened_run_fd, run_metadata = open_child_directory(parent_fd, canonical_run_dir.name)
         require_apply_same_mount(
@@ -3337,7 +3505,8 @@ def open_verified_apply_run_for_mutation(
             handle = ApplyMutationHandle(
                 root=root,
                 run_dir=canonical_run_dir,
-                root_fd=root_fd,
+                repository=repository,
+                root_proof=root_proof,
                 parent_fd=parent_fd,
                 run_fd=opened_run_fd,
                 run_metadata=run_metadata,
@@ -3347,35 +3516,37 @@ def open_verified_apply_run_for_mutation(
             )
             if not handle.revalidate() or load_regular_json_at(opened_run_fd, "Apply-Run.json") != run:
                 raise ValueError("apply_run_mutation_identity_changed")
-            if not same_file_identity(root_metadata, os.fstat(root_fd)):
-                raise ValueError("invalid_apply_run_output_dir=root_identity_changed")
             yield handle
     finally:
         if opened_run_fd >= 0:
-            os.close(opened_run_fd)
+            controller_close(opened_run_fd)
         if parent_fd >= 0:
-            os.close(parent_fd)
-        os.close(root_fd)
+            controller_close(parent_fd)
+        repository_session.__exit__(None, None, None)
 
 
 @contextmanager
-def open_verified_apply_run_for_read(run_dir: Path) -> Iterator[ApplyMutationHandle]:
+def open_verified_apply_run_for_read(
+    run_dir: Path,
+    *,
+    root: Path,
+) -> Iterator[ApplyMutationHandle]:
     """Open a registered run descriptor-relative without taking its writer lock."""
 
-    root, canonical_run_dir = lexical_managed_apply_run(run_dir)
-    root_fd = os.open(root, secure_directory_open_flags())
+    root, canonical_run_dir = lexical_managed_apply_run(run_dir, root)
+    repository_session = open_repository_io(root)
+    repository = repository_session.__enter__()
     parent_fd = -1
     opened_run_fd = -1
     try:
-        root_mount_resolution = resolve_apply_mount_identity(root_fd, READ_ONLY_EVIDENCE)
         parent_fd = open_managed_apply_runs_root_fd(
             root,
             create=False,
-            root_anchor_fd=root_fd,
-            root_mount_resolution=root_mount_resolution,
             operation=READ_ONLY_EVIDENCE,
         )
-        parent_metadata = os.fstat(parent_fd)
+        root_proof = controller_root_proof(repository)
+        root_mount_resolution = resolve_apply_mount_identity(parent_fd, READ_ONLY_EVIDENCE)
+        parent_metadata = controller_fstat(parent_fd)
         opened_run_fd, run_metadata = open_child_directory(parent_fd, canonical_run_dir.name)
         require_apply_same_mount(
             root_mount_resolution,
@@ -3395,7 +3566,8 @@ def open_verified_apply_run_for_read(run_dir: Path) -> Iterator[ApplyMutationHan
         handle = ApplyMutationHandle(
             root=root,
             run_dir=canonical_run_dir,
-            root_fd=root_fd,
+            repository=repository,
+            root_proof=root_proof,
             parent_fd=parent_fd,
             run_fd=opened_run_fd,
             run_metadata=run_metadata,
@@ -3408,10 +3580,10 @@ def open_verified_apply_run_for_read(run_dir: Path) -> Iterator[ApplyMutationHan
         yield handle
     finally:
         if opened_run_fd >= 0:
-            os.close(opened_run_fd)
+            controller_close(opened_run_fd)
         if parent_fd >= 0:
-            os.close(parent_fd)
-        os.close(root_fd)
+            controller_close(parent_fd)
+        repository_session.__exit__(None, None, None)
 
 
 @contextmanager
@@ -3453,7 +3625,7 @@ def open_apply_task_for_mutation(
             raise ValueError("apply_run_task_identity_changed")
         yield task_fd, revalidate
     finally:
-        os.close(task_fd)
+        controller_close(task_fd)
 
 
 def append_event_at(handle: ApplyMutationHandle, event: dict[str, object]) -> dict[str, object]:
@@ -3499,7 +3671,7 @@ def append_event_at(handle: ApplyMutationHandle, event: dict[str, object]) -> di
         if observed != updated:
             raise
         try:
-            os.fsync(handle.run_fd)
+            controller_fsync(handle.run_fd)
         except OSError:
             raise ValueError("event_log_commit_state_unknown") from None
     return record
@@ -3535,7 +3707,7 @@ APPLY_TASK_MUTABLE_ARTIFACT_RE = re.compile(
 )
 
 
-def secure_write_apply_artifact(path: Path, text: str) -> None:
+def secure_write_apply_artifact(path: Path, text: str, *, root: Path) -> None:
     lexical_path = lexical_absolute(path)
     parent = lexical_path.parent
     task_id: str | None = None
@@ -3550,7 +3722,7 @@ def secure_write_apply_artifact(path: Path, text: str) -> None:
             raise ValueError("invalid_apply_run_artifact_name")
     else:
         raise ValueError("invalid_apply_run_artifact_path")
-    with open_verified_apply_run_for_mutation(run_dir) as handle:
+    with open_verified_apply_run_for_mutation(run_dir, root=root) as handle:
         if task_id is None:
             secure_atomic_write_text_at(
                 handle.run_fd,
@@ -3574,11 +3746,7 @@ def audit_finding_ids(value: str) -> list[str]:
     ]
 
 
-def extract_ready_queue(root: Path) -> list[dict[str, object]]:
-    audit = root / "Planner-docs" / "Sub-Planing-Audit.md"
-    if not audit.is_file():
-        return []
-    text = audit.read_text(encoding="utf-8", errors="replace")
+def _parse_ready_queue(text: str) -> list[dict[str, object]]:
     items: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
     for match in re.finditer(
@@ -3620,34 +3788,57 @@ def extract_ready_queue(root: Path) -> list[dict[str, object]]:
     return items
 
 
-def audit_text(root: Path) -> str:
-    audit = root / "Planner-docs" / "Sub-Planing-Audit.md"
-    if not audit.is_file():
-        return ""
-    return audit.read_text(encoding="utf-8", errors="replace")
+def extract_ready_queue(
+    root: Path,
+    repository: RepositoryIO | None = None,
+) -> list[dict[str, object]]:
+    path = "Planner-docs/Sub-Planing-Audit.md"
+    authoritative_text = repository_internal_text(
+        root,
+        path,
+        repository=repository,
+    )
+    projected_text = repository_model_text(
+        root,
+        path,
+        repository=repository,
+    )
+    if authoritative_text is None and projected_text is None:
+        return []
+    if authoritative_text is None or projected_text is None:
+        raise ValueError("repository_model_projection_identity_mismatch")
+    authoritative = _parse_ready_queue(authoritative_text)
+    projected = _parse_ready_queue(projected_text)
+    authority_keys = [
+        (item["readiness_status"], item["subplan_path"])
+        for item in authoritative
+    ]
+    projected_keys = [
+        (item["readiness_status"], item["subplan_path"])
+        for item in projected
+    ]
+    if authority_keys != projected_keys:
+        raise ValueError("repository_model_projection_semantic_mismatch")
+    return projected
+
+
+def audit_text(root: Path, repository: RepositoryIO | None = None) -> str:
+    return repository_internal_text(
+        root,
+        "Planner-docs/Sub-Planing-Audit.md",
+        repository=repository,
+    ) or ""
 
 
 def run_step4_validator(root: Path) -> tuple[int, str]:
-    command = [
-        sys.executable,
-        VALIDATOR_PATH.as_posix(),
-        "--root",
-        root.as_posix(),
-        "--mode",
-        "step4",
-        "--strict",
-    ]
-    try:
-        completed = subprocess.run(
-            command,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return 1, f"validator_unavailable={type(exc).__name__}"
-    return completed.returncode, f"{completed.stdout}\n{completed.stderr}".strip()
+    # Bind the validator transcript to one canonical root spelling.  macOS can
+    # expose a temporary directory through equivalent filesystem aliases;
+    # hashing an alias without canonicalization makes an otherwise identical
+    # readiness result appear stale on the next validation pass.
+    root = canonical_controller_repository_root(root)
+    return run_step4_readiness_validator(
+        root=root,
+    )
 
 
 def validator_metric(output: str, key: str) -> str:
@@ -3658,9 +3849,13 @@ def validator_metric(output: str, key: str) -> str:
     return ""
 
 
-def validate_step4_queue(root: Path, mode: str) -> dict[str, str]:
-    audit = root / "Planner-docs" / "Sub-Planing-Audit.md"
-    if not audit.is_file():
+def validate_step4_queue(
+    root: Path,
+    mode: str,
+    repository: RepositoryIO | None = None,
+) -> dict[str, str]:
+    text = audit_text(root, repository)
+    if not text:
         raise ValueError("missing_step4_audit=Planner-docs/Sub-Planing-Audit.md")
     code, output = run_step4_validator(root)
     output_hash = sha256_bytes(output.encode("utf-8"))
@@ -3671,8 +3866,8 @@ def validate_step4_queue(root: Path, mode: str) -> dict[str, str]:
         if queue_state != "NO_ACTION_REQUIRED":
             raise ValueError(f"no_action_requires_no_action_required_audit={queue_state}")
         return {"validator_status": "passed", "execution_queue_state": queue_state, "validator_output_sha256": output_hash}
-    if not extract_ready_queue(root):
-        if "NO_ACTION_REQUIRED" in audit_text(root):
+    if not extract_ready_queue(root, repository):
+        if "NO_ACTION_REQUIRED" in text:
             raise ValueError("no_action_required_use_no_action_mode")
         raise ValueError("missing_step4_ready_queue")
     if queue_state == "NO_ACTION_REQUIRED":
@@ -3704,15 +3899,23 @@ def extract_contract_signals(text: str) -> dict[str, list[str]]:
     return signals
 
 
-def extract_subplan_contract(root: Path, subplan_path: str) -> dict[str, list[str]]:
-    path = root / subplan_path
-    if not path.is_file():
+def extract_subplan_contract(
+    root: Path,
+    subplan_path: str,
+    repository: RepositoryIO | None = None,
+) -> dict[str, list[str]]:
+    text = repository_model_text(root, subplan_path, repository=repository)
+    if text is None:
         return {key: [] for key in extract_contract_signals("").keys()}
-    return extract_contract_signals(path.read_text(encoding="utf-8", errors="replace"))
+    return extract_contract_signals(text)
 
 
-def extract_implementation_contract(root: Path, subplan_path: str) -> dict[str, object]:
-    binding = implementation_contract_source_binding(root, subplan_path)
+def extract_implementation_contract(
+    root: Path,
+    subplan_path: str,
+    repository: RepositoryIO | None = None,
+) -> dict[str, object]:
+    binding = repository_contract_binding(root, subplan_path, repository=repository)
     contract = binding.get("implementation_contract")
     return contract if isinstance(contract, dict) else {}
 
@@ -3765,15 +3968,21 @@ def apply_budget_contract(run: dict[str, object]) -> dict[str, object]:
     return contract if isinstance(contract, dict) else default_budget_contract()
 
 
-def default_tasks(root: Path, mode: str, run_id: str, ready_queue: list[dict[str, object]] | None = None) -> list[dict[str, object]]:
+def default_tasks(
+    root: Path,
+    mode: str,
+    run_id: str,
+    ready_queue: list[dict[str, object]] | None = None,
+    repository: RepositoryIO | None = None,
+) -> list[dict[str, object]]:
     if mode == "no_action":
         return []
-    queue = ready_queue if ready_queue is not None else extract_ready_queue(root)
+    queue = ready_queue if ready_queue is not None else extract_ready_queue(root, repository)
     tasks: list[dict[str, object]] = []
     for index, item in enumerate(queue, start=1):
         subplan_path = str(item["subplan_path"])
-        binding = implementation_contract_source_binding(root, subplan_path)
-        contract = extract_subplan_contract(root, subplan_path)
+        binding = repository_contract_binding(root, subplan_path, repository=repository)
+        contract = extract_subplan_contract(root, subplan_path, repository)
         implementation_contract = binding.get("implementation_contract")
         implementation_contract = implementation_contract if isinstance(implementation_contract, dict) else {}
         security_review_required = implementation_contract.get("security_review_required")
@@ -3818,17 +4027,20 @@ def step4_readiness_summary(
     mode: str,
     ready_queue: list[dict[str, object]],
     validation: dict[str, str],
+    repository: RepositoryIO | None = None,
 ) -> dict[str, object]:
-    audit = root / "Planner-docs" / "Sub-Planing-Audit.md"
-    text = audit_text(root)
+    text = audit_text(root, repository)
     queue_state = validation.get("execution_queue_state", "")
     return {
         "audit_path": "Planner-docs/Sub-Planing-Audit.md",
-        "audit_present": audit.is_file(),
+        "audit_present": bool(text),
         "ready_queue_count": len(ready_queue),
         "no_action_required": queue_state == "NO_ACTION_REQUIRED" or "NO_ACTION_REQUIRED" in text,
         "validator_command": [
             "python3",
+            "-I",
+            "-S",
+            "-B",
             "plugins/codexqb/skills/codexqb/scripts/validate_planner_docs.py",
             "--root",
             ".",
@@ -3978,12 +4190,9 @@ def create_apply_run(
     allow_unverified_git_worktree: bool = False,
 ) -> dict[str, object]:
     lexical_root = lexical_absolute(root)
-    root = root.resolve()
-    root_anchor_fd = os.open(root, secure_directory_open_flags())
-    try:
-        root_mount_resolution = resolve_apply_mount_identity(root_anchor_fd, APPLY_RUN_MUTATION)
-        if replace:
-            require_mount_assurance(root_mount_resolution, RUN_REPLACE_QUARANTINE_DELETE)
+    with open_repository_io(root) as repository:
+        root = canonical_repository_root(repository)
+        root_proof = controller_root_proof(repository)
         return create_apply_run_anchored(
             root,
             mode,
@@ -3995,11 +4204,8 @@ def create_apply_run(
             allow_non_git_unsafe=allow_non_git_unsafe,
             allow_unverified_git_worktree=allow_unverified_git_worktree,
             lexical_root=lexical_root,
-            root_anchor_fd=root_anchor_fd,
-            root_mount_resolution=root_mount_resolution,
+            root_proof=root_proof,
         )
-    finally:
-        os.close(root_anchor_fd)
 
 
 def create_apply_run_anchored(
@@ -4014,24 +4220,8 @@ def create_apply_run_anchored(
     allow_non_git_unsafe: bool,
     allow_unverified_git_worktree: bool,
     lexical_root: Path,
-    root_anchor_fd: int,
-    root_mount_resolution: MountResolution,
+    root_proof: ControllerRootProof,
 ) -> dict[str, object]:
-    require_mount_assurance(root_mount_resolution, APPLY_RUN_MUTATION)
-    require_apply_same_mount(
-        root_mount_resolution,
-        root_anchor_fd,
-        ".",
-        mismatch_error="invalid_apply_run_output_dir=root_identity_changed",
-    )
-    if replace:
-        require_mount_assurance(root_mount_resolution, RUN_REPLACE_QUARANTINE_DELETE)
-    if not opened_directory_matches_path(
-        root,
-        os.fstat(root_anchor_fd),
-        reject_mount=False,
-    ):
-        raise ValueError("invalid_apply_run_output_dir=root_identity_changed")
     if mode not in APPLY_MODES:
         raise ValueError(f"unsupported apply mode: {mode}")
     if commit_policy not in COMMIT_POLICIES:
@@ -4047,26 +4237,35 @@ def create_apply_run_anchored(
         if errors:
             raise ValueError(";".join(errors))
         return {"apply_run_id": str(run["apply_run_id"]), "run_dir": run_dir.as_posix(), "state": "resumed"}
-    baseline, workspace_file_manifest = workspace_baseline_capture(root)
-    snapshot = collect_snapshot(root, baseline)
-    ready_queue = [] if mode == "no_action" else extract_ready_queue(root)
-    budget_contract = default_budget_contract()
-    if len(ready_queue) > budget_limit(budget_contract, "max_selected_tasks"):
-        raise ValueError("budget_selected_tasks_exceeded")
-    spec_digest = apply_spec_digest(
-        mode,
-        snapshot,
-        baseline,
-        ready_queue,
-        apply_run_schema_version=APPLY_RUN_SCHEMA_VERSION,
-    )
-    suffix = invocation_suffix(run_id_suffix)
-    run_id = apply_run_id(mode, snapshot, baseline, ready_queue, suffix)
-    run_dir = resolve_managed_apply_run_dir(root, output_dir, run_id, lexical_root=lexical_root)
-    step4_validation = validate_step4_queue(root, mode)
-    step4_readiness = step4_readiness_summary(root, mode, ready_queue, step4_validation)
-    policy = apply_policy_envelope(root, mode, baseline, step4_readiness)
-    policy_digest = canonical_json_digest(policy)
+    with open_repository_io(root) as repository:
+        baseline, workspace_file_manifest = workspace_baseline_capture(root, repository)
+        snapshot = collect_snapshot(root, baseline, repository)
+        ready_queue = [] if mode == "no_action" else extract_ready_queue(root, repository)
+        budget_contract = default_budget_contract()
+        if len(ready_queue) > budget_limit(budget_contract, "max_selected_tasks"):
+            raise ValueError("budget_selected_tasks_exceeded")
+        spec_digest = apply_spec_digest(
+            mode,
+            snapshot,
+            baseline,
+            ready_queue,
+            apply_run_schema_version=APPLY_RUN_SCHEMA_VERSION,
+        )
+        suffix = invocation_suffix(run_id_suffix)
+        run_id = apply_run_id(mode, snapshot, baseline, ready_queue, suffix)
+        run_dir = resolve_managed_apply_run_dir(root, output_dir, run_id, lexical_root=lexical_root)
+        step4_validation = validate_step4_queue(root, mode, repository)
+        step4_readiness = step4_readiness_summary(
+            root,
+            mode,
+            ready_queue,
+            step4_validation,
+            repository,
+        )
+        policy = apply_policy_envelope(root, mode, baseline, step4_readiness)
+        policy_digest = canonical_json_digest(policy)
+        tasks = default_tasks(root, mode, run_id, ready_queue, repository)
+        repository_baselines = capture_repository_baselines(root, tasks, repository)
     action_mode = mode != "no_action"
     non_git_action_mode = baseline["vcs"] == "non_git" and mode != "no_action"
     if non_git_action_mode and not allow_non_git_unsafe:
@@ -4074,11 +4273,9 @@ def create_apply_run_anchored(
     unverified_git_action_mode = action_mode and git_worktree_requires_approval(baseline)
     if unverified_git_action_mode and not allow_unverified_git_worktree:
         raise ValueError("git_workspace_requires_explicit_current_worktree_approval")
-    if run_dir.exists() and not replace:
-        raise ValueError(f"apply_run_already_exists={run_dir.relative_to(root).as_posix()}")
+    if controller_entry_exists(run_dir) and not replace:
+        raise ValueError(f"apply_run_already_exists={apply_run_logical_path(root, run_dir)}")
 
-    tasks = default_tasks(root, mode, run_id, ready_queue)
-    repository_baselines = capture_repository_baselines(root, tasks)
     registration_id = secrets.token_hex(32)
     run = {
         "apply_run_schema_version": APPLY_RUN_SCHEMA_VERSION,
@@ -4172,19 +4369,17 @@ def create_apply_run_anchored(
         serialize_safe_persistent_json(initial_event, indent=None, separators=(",", ":")).encode("utf-8"),
     )
     load_or_create_apply_run_trust_key(create=True)
-    if run_dir.exists() and replace:
+    if controller_entry_exists(run_dir) and replace:
         replace_existing_apply_run(
             root,
             run_dir,
-            root_anchor_fd=root_anchor_fd,
-            root_mount_resolution=root_mount_resolution,
+            root_proof=root_proof,
         )
     parent_fd, run_fd, run_metadata = create_managed_apply_run_directory(
         root,
         run_dir,
-        root_anchor_fd=root_anchor_fd,
-        root_mount_resolution=root_mount_resolution,
     )
+    state_mount_resolution = resolve_apply_mount_identity(parent_fd, APPLY_RUN_MUTATION)
     try:
         write_regular_json_exclusive_at(run_fd, "Apply-Run.json", run)
         write_regular_json_exclusive_at(
@@ -4195,11 +4390,13 @@ def create_apply_run_anchored(
         write_regular_json_exclusive_at(run_fd, "Result.json", result)
         for task in tasks:
             task_name = str(task["task_id"])
-            os.mkdir(task_name, mode=0o700, dir_fd=run_fd)
+            controller_mkdir(task_name, mode=0o700, dir_fd=run_fd)
             task_fd, task_metadata = open_child_directory(run_fd, task_name)
             try:
+                controller_fchmod(task_fd, 0o700)
+                task_metadata = controller_fstat(task_fd)
                 require_apply_same_mount(
-                    root_mount_resolution,
+                    state_mount_resolution,
                     task_fd,
                     repository_mount_relative_path(root, run_dir / task_name),
                     mismatch_error="invalid_apply_run_task_directory",
@@ -4214,9 +4411,9 @@ def create_apply_run_anchored(
                 write_regular_json_exclusive_at(task_fd, "Fix-Report.json", {"status": "PENDING"})
                 for phase in sorted(REVIEW_PHASES):
                     write_regular_json_exclusive_at(task_fd, f"Review-Report-{phase}.json", {"status": "PENDING"})
-                os.fsync(task_fd)
+                controller_fsync(task_fd)
             finally:
-                os.close(task_fd)
+                controller_close(task_fd)
         write_regular_json_exclusive_at(run_fd, "Progress.json", progress)
         write_regular_text_exclusive_at(
             run_fd,
@@ -4232,26 +4429,36 @@ def create_apply_run_anchored(
             APPLY_RUN_MARKER_NAME,
             apply_run_marker_payload(root, run_dir, run),
         )
-        os.fsync(run_fd)
+        controller_fsync(run_fd)
         create_apply_run_registration(
             root,
             run_dir,
             run,
-            root_metadata=os.fstat(root_anchor_fd),
+            root_proof=root_proof,
             parent_fd=parent_fd,
             run_fd=run_fd,
             run_metadata=run_metadata,
-            root_mount_resolution=root_mount_resolution,
+            root_mount_resolution=state_mount_resolution,
         )
-        os.fsync(parent_fd)
+        controller_fsync(parent_fd)
+        if not controller_tree_is_private(run_fd):
+            raise ValueError("apply_run_controller_state_not_private")
     finally:
-        os.close(run_fd)
-        os.close(parent_fd)
+        controller_close(run_fd)
+        controller_close(parent_fd)
     return {"apply_run_id": run_id, "run_dir": run_dir.as_posix(), "state": result["status"]}
 
 
-def reconcile_external_superpowers(run_dir: Path) -> dict[str, object]:
-    with open_verified_apply_run_for_mutation(run_dir, require_provenance=False) as handle:
+def reconcile_external_superpowers(
+    run_dir: Path,
+    *,
+    root: Path,
+) -> dict[str, object]:
+    with open_verified_apply_run_for_mutation(
+        run_dir,
+        require_provenance=False,
+        root=root,
+    ) as handle:
         run_dir = handle.run_dir
         run = handle.run
         progress = secure_read_regular_json_at(handle.run_fd, "Progress.json")
@@ -4261,7 +4468,7 @@ def reconcile_external_superpowers(run_dir: Path) -> dict[str, object]:
                 manifest_errors = apply_run_manifest_replace_errors(run)
                 if manifest_errors:
                     raise ValueError(";".join(manifest_errors))
-                refresh_apply_run_provenance(run_dir, run)
+                refresh_apply_run_provenance(run_dir, run, root=handle.root)
                 return {"state": "reconciled", "mode": "subagent_serial", "recovered": True}
             if not current_apply_run_provenance_is_valid(handle.root, run_dir, run):
                 raise ValueError("apply_run_provenance_unverified")
@@ -4283,7 +4490,7 @@ def reconcile_external_superpowers(run_dir: Path) -> dict[str, object]:
             manifest_errors = apply_run_manifest_replace_errors(run)
             if manifest_errors:
                 raise ValueError(";".join(manifest_errors))
-            refresh_apply_run_provenance(run_dir, run)
+            refresh_apply_run_provenance(run_dir, run, root=handle.root)
             return {"state": "ready", "mode": "external_superpowers"}
         if availability != "unavailable":
             raise ValueError(f"external_superpowers_invalid_availability={availability}")
@@ -4323,7 +4530,7 @@ def reconcile_external_superpowers(run_dir: Path) -> dict[str, object]:
             progress,
             revalidate=handle.revalidate,
         )
-        refresh_apply_run_provenance(run_dir, run)
+        refresh_apply_run_provenance(run_dir, run, root=handle.root)
         return {"state": "reconciled", "mode": "subagent_serial", "event_sequence": event["sequence"]}
 
 
@@ -4351,7 +4558,7 @@ def read_artifact_bytes(
 ) -> bytes | None:
     parent_fd = -1
     try:
-        parent_fd = os.open(path.parent, secure_directory_open_flags())
+        parent_fd = controller_open(path.parent, secure_directory_open_flags())
         encoded = secure_read_regular_bytes_at(parent_fd, path.name)
         assert_safe_serialized_artifact(path.name, encoded)
         return encoded
@@ -4364,7 +4571,7 @@ def read_artifact_bytes(
         return None
     finally:
         if parent_fd >= 0:
-            os.close(parent_fd)
+            controller_close(parent_fd)
 
 
 def read_artifact_text(
@@ -4385,11 +4592,11 @@ def read_artifact_text(
 
 
 def load_json_strict(path: Path) -> dict[str, object]:
-    parent_fd = os.open(path.parent, secure_directory_open_flags())
+    parent_fd = controller_open(path.parent, secure_directory_open_flags())
     try:
         return secure_read_regular_json_at(parent_fd, path.name)
     finally:
-        os.close(parent_fd)
+        controller_close(parent_fd)
 
 
 def find_task(progress: dict[str, object], task_id: str) -> dict[str, object]:
@@ -4443,7 +4650,7 @@ def acquire_writer_lock(
         write_regular_json_exclusive_at(handle.run_fd, WRITER_LOCK_NAME, lock)
     except FileExistsError as exc:
         raise ValueError("active_writer_lock_exists") from exc
-    os.fsync(handle.run_fd)
+    controller_fsync(handle.run_fd)
     progress["active_writer_locks"] = [lock]
     task["writer_lock"] = lock
     return lock
@@ -4523,7 +4730,7 @@ def trusted_task_transition_errors(
                 errors.append(f"repository_baseline_path_mismatch={task_id}")
             if task_baseline.get("implementation_contract_digest") != task.get("implementation_contract_digest"):
                 errors.append(f"repository_baseline_contract_mismatch={task_id}")
-            if task_baseline.get("baseline_digest") != repository_baseline_digest(task_baseline.get("snapshot", [])):
+            if task_baseline.get("baseline_digest") != controller_baseline_digest(task_baseline.get("snapshot", [])):
                 errors.append(f"repository_baseline_digest_mismatch={task_id}")
             baseline_content_map(task_baseline)
         except (TypeError, ValueError) as exc:
@@ -4588,7 +4795,15 @@ def trusted_task_transition_errors(
     return list(dict.fromkeys(errors))
 
 
-def transition_task_state(run_dir: Path, task_id: str, to_state: str, actor: str, evidence: list[str] | None = None) -> dict[str, object]:
+def transition_task_state(
+    run_dir: Path,
+    task_id: str,
+    to_state: str,
+    actor: str,
+    evidence: list[str] | None = None,
+    *,
+    root: Path,
+) -> dict[str, object]:
     assert_safe_persistent_payload(
         {"task_id": task_id, "to_state": to_state, "actor": actor, "evidence": evidence or []}
     )
@@ -4598,7 +4813,7 @@ def transition_task_state(run_dir: Path, task_id: str, to_state: str, actor: str
         raise ValueError(f"invalid_target_state={to_state}")
     if not actor.strip():
         raise ValueError("transition_actor_required")
-    with open_verified_apply_run_for_mutation(run_dir) as handle:
+    with open_verified_apply_run_for_mutation(run_dir, root=root) as handle:
         run = handle.run
         progress = secure_read_regular_json_at(handle.run_fd, "Progress.json")
         task = find_task(progress, task_id)
@@ -4691,10 +4906,7 @@ def transition_task_state(run_dir: Path, task_id: str, to_state: str, actor: str
 def task_dir_for(run_dir: Path, task_id: str) -> Path:
     if not safe_task_id(task_id):
         raise ValueError(f"invalid_task_id={task_id or 'missing'}")
-    task_dir = (run_dir / task_id).resolve()
-    if not is_inside(run_dir, task_dir):
-        raise ValueError(f"invalid_task_id={task_id or 'missing'}")
-    return task_dir
+    return lexical_absolute(run_dir) / task_id
 
 
 def safe_agent_id(value: str) -> bool:
@@ -4827,6 +5039,8 @@ def prepare_dispatch_packet(
     actor: str,
     evidence: list[str] | None = None,
     review_phase: str | None = None,
+    *,
+    root: Path,
 ) -> dict[str, object]:
     assert_safe_persistent_payload(
         {
@@ -4850,7 +5064,7 @@ def prepare_dispatch_packet(
         raise ValueError(f"dispatch_review_phase_not_applicable={role}")
     if expected_phase is not None and review_phase not in expected_phase:
         raise ValueError(f"dispatch_review_phase_required={role}")
-    with open_verified_apply_run_for_mutation(run_dir) as handle:
+    with open_verified_apply_run_for_mutation(run_dir, root=root) as handle:
         run = handle.run
         if run.get("mode") != "subagent_serial":
             raise ValueError(f"dispatch_requires_subagent_serial_mode={run.get('mode')}")
@@ -4988,6 +5202,8 @@ def record_agent_status(
     evidence: list[str] | None = None,
     summary: str | None = None,
     review_phase: str | None = None,
+    *,
+    root: Path,
 ) -> dict[str, object]:
     assert_safe_persistent_payload(
         {
@@ -5018,7 +5234,7 @@ def record_agent_status(
         raise ValueError(f"record_agent_review_phase_not_applicable={role}")
     if expected_phase is not None and review_phase not in expected_phase:
         raise ValueError(f"record_agent_review_phase_required={role}")
-    with open_verified_apply_run_for_mutation(run_dir) as handle:
+    with open_verified_apply_run_for_mutation(run_dir, root=root) as handle:
         run = handle.run
         if run.get("mode") != "subagent_serial":
             raise ValueError(f"record_agent_requires_subagent_serial_mode={run.get('mode')}")
@@ -5212,6 +5428,8 @@ def normalize_writer_report(
     report_payload: object,
     actor: str,
     evidence: list[str] | None = None,
+    *,
+    root: Path,
 ) -> dict[str, object]:
     """Persist a writer's structured return only through controller-owned I/O."""
 
@@ -5321,7 +5539,7 @@ def normalize_writer_report(
         if not isinstance(fixes, list) or any(not isinstance(item, dict) for item in fixes):
             raise ValueError(f"writer_report_invalid={task_id}:{role}")
 
-    with open_verified_apply_run_for_mutation(run_dir) as handle:
+    with open_verified_apply_run_for_mutation(run_dir, root=root) as handle:
         if handle.run.get("mode") != "subagent_serial":
             raise ValueError(f"writer_report_requires_subagent_serial_mode={handle.run.get('mode')}")
         progress = secure_read_regular_json_at(handle.run_fd, "Progress.json")
@@ -5409,6 +5627,8 @@ def normalize_review_report(
     report_payload: object,
     actor: str,
     evidence: list[str] | None = None,
+    *,
+    root: Path,
 ) -> dict[str, object]:
     """Persist a read-only reviewer's structured return under controller control.
 
@@ -5441,7 +5661,7 @@ def normalize_review_report(
         "security": {"pass", "fail", "needs_fixes", "cannot_verify"},
         "final": {"pass", "fail", "needs_fixes", "cannot_verify"},
     }[phase]
-    with open_verified_apply_run_for_mutation(run_dir) as handle:
+    with open_verified_apply_run_for_mutation(run_dir, root=root) as handle:
         if handle.run.get("mode") != "subagent_serial":
             raise ValueError(f"review_report_requires_subagent_serial_mode={handle.run.get('mode')}")
         progress = secure_read_regular_json_at(handle.run_fd, "Progress.json")
@@ -5630,6 +5850,7 @@ def controller_patch_for_manifest(
     root: Path,
     baseline: dict[str, object],
     manifest: object,
+    repository: RepositoryIO | None = None,
 ) -> str:
     if not isinstance(manifest, list):
         raise ValueError("repository_change_manifest_invalid")
@@ -5638,10 +5859,10 @@ def controller_patch_for_manifest(
     for item in manifest:
         if not isinstance(item, dict) or item.get("state") == "unchanged":
             continue
-        path = normalize_repo_relative_path(item.get("path"))
+        path = controller_normalize_path(item.get("path"))
         state = str(item.get("state", ""))
         before = before_contents.get(path, b"")
-        after = read_repository_file_no_follow(root, path)
+        after = read_repository_file_no_follow(root, path, repository=repository)
         if state == "add":
             if before or after is None:
                 raise ValueError(f"repository_change_manifest_mismatch={path}")
@@ -5725,13 +5946,15 @@ def capture_task_change_set(
     task_id: str,
     actor: str,
     evidence: list[str] | None = None,
+    *,
+    root: Path,
 ) -> dict[str, object]:
     assert_safe_persistent_payload(
         {"task_id": task_id, "actor": actor, "evidence": evidence or []}
     )
     if not actor.strip():
         raise ValueError("change_set_actor_required")
-    with open_verified_apply_run_for_mutation(run_dir) as handle:
+    with open_verified_apply_run_for_mutation(run_dir, root=root) as handle:
         run = handle.run
         progress = secure_read_regular_json_at(handle.run_fd, "Progress.json")
         task = find_task(progress, task_id)
@@ -5751,30 +5974,38 @@ def capture_task_change_set(
         generation = generation_value + 1
         if generation > 99:
             raise ValueError(f"implementation_generation_exhausted={task_id}")
-        preliminary = capture_repository_evidence(
-            handle.root,
-            paths,
-            baseline.get("snapshot", []),
-            apply_run_id=str(run["apply_run_id"]),
-            task_id=task_id,
-            apply_run_registration_id=str(run["apply_run_registration_id"]),
-            contract_digest=str(task["implementation_contract_digest"]),
-            generation=generation,
-            review_package_sha256=sha256_bytes(b""),
-        )
-        patch = controller_patch_for_manifest(handle.root, baseline, preliminary.get("manifest"))
-        patch_sha = sha256_bytes(patch.encode("utf-8"))
-        repository_evidence = capture_repository_evidence(
-            handle.root,
-            paths,
-            baseline.get("snapshot", []),
-            apply_run_id=str(run["apply_run_id"]),
-            task_id=task_id,
-            apply_run_registration_id=str(run["apply_run_registration_id"]),
-            contract_digest=str(task["implementation_contract_digest"]),
-            generation=generation,
-            review_package_sha256=patch_sha,
-        )
+        with open_repository_io(handle.root) as repository:
+            preliminary = capture_repository_io_evidence(
+                handle.root,
+                paths,
+                baseline.get("snapshot", []),
+                apply_run_id=str(run["apply_run_id"]),
+                task_id=task_id,
+                apply_run_registration_id=str(run["apply_run_registration_id"]),
+                contract_digest=str(task["implementation_contract_digest"]),
+                generation=generation,
+                review_package_sha256=sha256_bytes(b""),
+                repository=repository,
+            )
+            patch = controller_patch_for_manifest(
+                handle.root,
+                baseline,
+                preliminary.get("manifest"),
+                repository,
+            )
+            patch_sha = sha256_bytes(patch.encode("utf-8"))
+            repository_evidence = capture_repository_io_evidence(
+                handle.root,
+                paths,
+                baseline.get("snapshot", []),
+                apply_run_id=str(run["apply_run_id"]),
+                task_id=task_id,
+                apply_run_registration_id=str(run["apply_run_registration_id"]),
+                contract_digest=str(task["implementation_contract_digest"]),
+                generation=generation,
+                review_package_sha256=patch_sha,
+                repository=repository,
+            )
         if preliminary.get("current_snapshot_digest") != repository_evidence.get("current_snapshot_digest"):
             raise ValueError(f"repository_changed_during_change_set_capture={task_id}")
         captured_at = utc_now()
@@ -5811,7 +6042,7 @@ def capture_task_change_set(
                 revalidate=task_revalidate,
             )
             write_regular_json_exclusive_at(task_fd, file_name, payload)
-            os.fsync(task_fd)
+            controller_fsync(task_fd)
         event = append_event_at(
             handle,
             {
@@ -5900,17 +6131,28 @@ def load_current_change_set(
     baseline = repository_baseline_for_task(handle.run, task_id)
     if baseline is None:
         raise ValueError(f"repository_baseline_missing={task_id}")
-    current = capture_repository_evidence(
-        handle.root,
-        baseline.get("allowed_paths", []),
-        baseline.get("snapshot", []),
-        apply_run_id=str(handle.run["apply_run_id"]),
-        task_id=task_id,
-        apply_run_registration_id=str(handle.run["apply_run_registration_id"]),
-        contract_digest=str(task["implementation_contract_digest"]),
-        generation=int(generation),
-        review_package_sha256=patch_sha,
-    )
+    allowed_paths = baseline.get("allowed_paths", [])
+    if not isinstance(allowed_paths, list) or not all(isinstance(path, str) for path in allowed_paths):
+        raise ValueError(f"repository_baseline_path_mismatch={task_id}")
+    with open_repository_io(handle.root) as repository:
+        current = capture_repository_io_evidence(
+            handle.root,
+            allowed_paths,
+            baseline.get("snapshot", []),
+            apply_run_id=str(handle.run["apply_run_id"]),
+            task_id=task_id,
+            apply_run_registration_id=str(handle.run["apply_run_registration_id"]),
+            contract_digest=str(task["implementation_contract_digest"]),
+            generation=int(generation),
+            review_package_sha256=patch_sha,
+            repository=repository,
+        )
+        regenerated_patch = controller_patch_for_manifest(
+            handle.root,
+            baseline,
+            current.get("manifest"),
+            repository,
+        )
     current_changed_files = changed_files_for_receipt(current.get("manifest"))
     stored_changed_files = payload.get("changed_files")
     current_changed_paths = {
@@ -5928,19 +6170,17 @@ def load_current_change_set(
         or payload.get("manifest") != current.get("manifest")
     ):
         raise ValueError(f"verified_repository_state_digest_mismatch={task_id}")
-    regenerated_patch = controller_patch_for_manifest(handle.root, baseline, current.get("manifest"))
     if regenerated_patch != patch:
         raise ValueError(f"verified_live_diff_mismatch={task_id}")
     return payload, current
 
 
 def receipt_run_binding(handle: ApplyMutationHandle) -> dict[str, object]:
-    root_metadata = os.fstat(handle.root_fd)
     run = handle.run
     return {
-        "root_binding_sha256": sha256_bytes(os.fsencode(handle.root)),
-        "root_device": root_metadata.st_dev,
-        "root_inode": root_metadata.st_ino,
+        "root_binding_sha256": handle.root_proof.repository_identity_sha256,
+        "root_device": handle.root_proof.root_device,
+        "root_inode": handle.root_proof.root_inode,
         "apply_run_registration_id": run["apply_run_registration_id"],
         "apply_run_id": run["apply_run_id"],
         "apply_spec_digest": run["apply_spec_digest"],
@@ -6070,541 +6310,15 @@ def agent_record_sha256_at(
 def normalized_command_cwd(root: Path, value: object) -> tuple[str, Path]:
     if value == ".":
         return ".", root
-    normalized = normalize_repo_relative_path(value)
+    normalized = controller_normalize_path(value)
     path = lexical_absolute(root / normalized)
     try:
-        metadata = os.lstat(path)
+        metadata = controller_lstat(path)
     except FileNotFoundError as exc:
         raise ValueError("validation_cwd_missing") from exc
-    if not stat.S_ISDIR(metadata.st_mode) or path.is_symlink() or not is_inside(root, path):
+    if not stat.S_ISDIR(metadata.st_mode) or not is_inside(root, path):
         raise ValueError("validation_cwd_invalid")
     return normalized, path
-
-
-@dataclass(frozen=True)
-class ValidationProcessResult:
-    exit_code: int
-    stdout: bytes
-    stderr: bytes
-    timed_out: bool
-    output_limit_exceeded: bool
-    termination_reason: str
-
-
-def validation_subprocess_environment(root: Path) -> dict[str, str]:
-    """Build a deterministic child environment without parent credentials.
-
-    Validation commands execute repository-controlled code.  They therefore
-    receive only executable search paths and a minimal locale/Python policy,
-    never arbitrary parent variables such as provider keys, proxies, Git
-    overrides, Python import hooks, or pytest options.
-    """
-
-    path_entries: list[str] = []
-    for raw_entry in os.environ.get("PATH", os.defpath).split(os.pathsep):
-        if not raw_entry:
-            continue
-        entry = Path(raw_entry)
-        if not entry.is_absolute():
-            continue
-        try:
-            common = os.path.commonpath((str(root), str(entry)))
-        except ValueError:
-            common = ""
-        if common == str(root):
-            continue
-        normalized = str(entry)
-        if normalized not in path_entries:
-            path_entries.append(normalized)
-    if not path_entries:
-        path_entries = [entry for entry in os.defpath.split(os.pathsep) if entry]
-
-    environment = {
-        "PATH": os.pathsep.join(path_entries),
-        "LANG": "C",
-        "LC_ALL": "C",
-        "PYTHONDONTWRITEBYTECODE": "1",
-        "PYTHONNOUSERSITE": "1",
-        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
-    }
-    if os.name == "nt":
-        for name in ("SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"):
-            value = os.environ.get(name)
-            if value:
-                environment[name] = value
-    return environment
-
-
-def _linux_validation_seccomp_spec() -> tuple[int, list[_SockFilter]]:
-    """Return an architecture-bound filter that forbids new process trees.
-
-    Same-process threads remain available through ``clone(CLONE_THREAD)``.
-    ``clone3`` reports ENOSYS so libc can fall back to the inspectable clone
-    ABI; process-forming clone, fork, and vfork report EPERM.  An unexpected
-    syscall ABI is killed rather than being allowed to reinterpret numbers.
-    """
-
-    if not sys.platform.startswith("linux") or not hasattr(os, "uname"):
-        raise ValueError("secure_validation_process_isolation_not_supported")
-    machine = os.uname().machine.lower()
-    specs: dict[str, tuple[int, int, int | None, int | None, bool]] = {
-        "x86_64": (0xC000003E, 56, 57, 58, True),
-        "amd64": (0xC000003E, 56, 57, 58, True),
-        "aarch64": (0xC00000B7, 220, None, None, False),
-        "arm64": (0xC00000B7, 220, None, None, False),
-    }
-    spec = specs.get(machine)
-    if spec is None:
-        raise ValueError("secure_validation_process_isolation_not_supported")
-    audit_arch, clone_nr, fork_nr, vfork_nr, reject_x32 = spec
-
-    # Classic BPF opcodes used by seccomp.
-    load_word_absolute = 0x20
-    jump_equal = 0x15
-    jump_bits_set = 0x45
-    return_constant = 0x06
-    seccomp_kill_process = 0x80000000
-    seccomp_errno = 0x00050000
-    seccomp_allow = 0x7FFF0000
-    clone3_nr = 435
-
-    instructions: list[_SockFilter] = [
-        _SockFilter(load_word_absolute, 0, 0, 4),
-        _SockFilter(jump_equal, 1, 0, audit_arch),
-        _SockFilter(return_constant, 0, 0, seccomp_kill_process),
-        _SockFilter(load_word_absolute, 0, 0, 0),
-    ]
-    if reject_x32:
-        # x32 shares AUDIT_ARCH_X86_64 but sets bit 30 on syscall numbers.
-        instructions.extend(
-            [
-                _SockFilter(jump_bits_set, 0, 1, 0x40000000),
-                _SockFilter(return_constant, 0, 0, seccomp_kill_process),
-            ]
-        )
-    instructions.extend(
-        [
-            _SockFilter(jump_equal, 0, 1, clone3_nr),
-            _SockFilter(return_constant, 0, 0, seccomp_errno | errno.ENOSYS),
-        ]
-    )
-
-    direct_process_checks: list[int] = [
-        syscall_nr for syscall_nr in (fork_nr, vfork_nr) if syscall_nr is not None
-    ]
-    # Each direct-process match jumps to the EPERM return immediately before
-    # the final ALLOW instruction.  Offsets are relative to the next opcode.
-    direct_start = len(instructions)
-    clone_check_index = direct_start + len(direct_process_checks)
-    deny_index = clone_check_index + 3
-    allow_index = deny_index + 1
-    for offset, syscall_nr in enumerate(direct_process_checks):
-        index = direct_start + offset
-        instructions.append(
-            _SockFilter(jump_equal, deny_index - index - 1, 0, syscall_nr)
-        )
-    instructions.extend(
-        [
-            _SockFilter(jump_equal, 0, allow_index - clone_check_index - 1, clone_nr),
-            _SockFilter(load_word_absolute, 0, 0, 16),
-            _SockFilter(jump_bits_set, 1, 0, LINUX_CLONE_THREAD),
-            _SockFilter(return_constant, 0, 0, seccomp_errno | errno.EPERM),
-            _SockFilter(return_constant, 0, 0, seccomp_allow),
-        ]
-    )
-    return audit_arch, instructions
-
-
-def _install_linux_validation_process_filter(
-    expected_audit_arch: int,
-    instructions: list[_SockFilter],
-) -> None:
-    """Install the already architecture-checked seccomp filter in the child."""
-
-    current_arch, expected_instructions = _linux_validation_seccomp_spec()
-    if current_arch != expected_audit_arch or [
-        (item.code, item.jt, item.jf, item.k) for item in expected_instructions
-    ] != [(item.code, item.jt, item.jf, item.k) for item in instructions]:
-        raise OSError(errno.ENOTSUP, "validation seccomp binding changed")
-    filter_array = (_SockFilter * len(instructions))(*instructions)
-    program = _SockFprog(len(instructions), filter_array)
-    libc = ctypes.CDLL(None, use_errno=True)
-    prctl = libc.prctl
-    prctl.argtypes = [
-        ctypes.c_int,
-        ctypes.c_ulong,
-        ctypes.c_ulong,
-        ctypes.c_ulong,
-        ctypes.c_ulong,
-    ]
-    prctl.restype = ctypes.c_int
-    pr_set_no_new_privs = 38
-    pr_set_seccomp = 22
-    seccomp_mode_filter = 2
-    if prctl(pr_set_no_new_privs, 1, 0, 0, 0) != 0:
-        error_number = ctypes.get_errno() or errno.EPERM
-        raise OSError(error_number, "could not enable no_new_privs")
-    if prctl(
-        pr_set_seccomp,
-        seccomp_mode_filter,
-        ctypes.addressof(program),
-        0,
-        0,
-    ) != 0:
-        error_number = ctypes.get_errno() or errno.EPERM
-        raise OSError(error_number, "could not install validation seccomp filter")
-
-
-def _validation_containment_command(
-    argv: list[str],
-) -> tuple[list[str], tuple[int, list[_SockFilter]] | None]:
-    """Bind validation to a host mechanism that prevents descendant escape."""
-
-    if sys.platform == "darwin":
-        try:
-            metadata = os.lstat(MACOS_VALIDATION_SANDBOX)
-        except OSError as exc:
-            raise ValueError("secure_validation_process_isolation_not_supported") from exc
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != 0
-            or stat.S_IMODE(metadata.st_mode) & 0o022
-        ):
-            raise ValueError("secure_validation_process_isolation_not_supported")
-        return (
-            [
-                str(MACOS_VALIDATION_SANDBOX),
-                "-p",
-                MACOS_VALIDATION_SANDBOX_PROFILE,
-                *argv,
-            ],
-            None,
-        )
-    if sys.platform.startswith("linux"):
-        return list(argv), _linux_validation_seccomp_spec()
-    raise ValueError("secure_validation_process_isolation_not_supported")
-
-
-def _terminate_validation_process(process: subprocess.Popen[bytes]) -> None:
-    try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGKILL)
-        elif process.poll() is None:
-            process.kill()
-    except ProcessLookupError:
-        pass
-    except OSError:
-        try:
-            process.kill()
-        except OSError:
-            pass
-
-
-def _validation_child_setup(
-    cwd_fd: int,
-    linux_seccomp: tuple[int, list[_SockFilter]] | None,
-) -> None:
-    """Enter the anchored cwd and enable process containment before exec."""
-
-    os.fchdir(cwd_fd)
-    os.close(cwd_fd)
-    if linux_seccomp is not None:
-        _install_linux_validation_process_filter(*linux_seccomp)
-
-
-def _promote_validation_fd(cwd_fd: int) -> int:
-    """Keep the cwd anchor out of Popen's stdin/stdout/stderr remap range."""
-
-    if cwd_fd >= 3:
-        return cwd_fd
-    try:
-        import fcntl
-
-        duplicate = fcntl.fcntl(cwd_fd, fcntl.F_DUPFD_CLOEXEC, 3)
-    except (ImportError, AttributeError, OSError) as exc:
-        raise ValueError("secure_validation_process_isolation_not_supported") from exc
-    os.close(cwd_fd)
-    return int(duplicate)
-
-
-def _open_validation_cwd_fd(
-    *,
-    root: Path,
-    cwd: Path,
-    root_fd: int | None,
-    normalized_cwd: str | None,
-) -> int:
-    """Open a planned cwd component-by-component below an anchored root."""
-
-    if os.name != "posix" or not hasattr(os, "fchdir"):
-        raise ValueError("secure_validation_process_isolation_not_supported")
-
-    lexical_root = lexical_absolute(root)
-    lexical_cwd = lexical_absolute(cwd)
-    if normalized_cwd is None:
-        try:
-            relative = lexical_cwd.relative_to(lexical_root)
-        except ValueError as exc:
-            raise ValueError("validation_cwd_invalid") from exc
-        normalized = (
-            "."
-            if not relative.parts
-            else normalize_repo_relative_path(relative.as_posix())
-        )
-    else:
-        normalized = (
-            "."
-            if normalized_cwd == "."
-            else normalize_repo_relative_path(normalized_cwd)
-        )
-        expected = (
-            lexical_root
-            if normalized == "."
-            else lexical_absolute(lexical_root / normalized)
-        )
-        if lexical_cwd != expected:
-            raise ValueError("validation_cwd_binding_mismatch")
-
-    with open_repository_root_anchor(lexical_root) as repository_anchor:
-        opened_root_fd = -1
-        current_fd = -1
-        try:
-            opened_root_fd = os.dup(
-                root_fd if root_fd is not None else repository_anchor.fd
-            )
-            opened_root_fd = _promote_validation_fd(opened_root_fd)
-            root_metadata = os.fstat(opened_root_fd)
-            if (
-                not same_file_identity(root_metadata, repository_anchor.metadata)
-                or not opened_directory_matches_path(
-                    lexical_root,
-                    root_metadata,
-                    reject_mount=False,
-                )
-            ):
-                raise ValueError("validation_root_identity_changed")
-            try:
-                require_same_repository_mount(repository_anchor, opened_root_fd, ".")
-            except ValueError as exc:
-                raise ValueError("validation_root_mount_identity_changed") from exc
-            current_fd = opened_root_fd
-            opened_root_fd = -1
-            if normalized != ".":
-                relative_parts: list[str] = []
-                for component in normalized.split("/"):
-                    child_fd = -1
-                    relative_parts.append(component)
-                    relative_path = "/".join(relative_parts)
-                    try:
-                        child_fd, child_metadata = open_child_directory(
-                            current_fd,
-                            component,
-                        )
-                        if child_metadata.st_dev != repository_anchor.metadata.st_dev:
-                            raise ValueError("validation_cwd_cross_device")
-                        require_same_repository_mount(
-                            repository_anchor,
-                            child_fd,
-                            relative_path,
-                        )
-                    except (OSError, ValueError) as exc:
-                        if child_fd >= 0:
-                            os.close(child_fd)
-                        if "repository_nested_mount_rejected=" in str(exc):
-                            raise ValueError(
-                                "validation_cwd_nested_mount_rejected"
-                            ) from exc
-                        raise ValueError("validation_cwd_identity_changed") from exc
-                    os.close(current_fd)
-                    current_fd = child_fd
-
-            # Re-open the final lexical path and compare it to the descriptor
-            # chain.  This catches a same-inode bind mount or replacement that
-            # appeared while the component walk was in progress.
-            try:
-                with open_repository_root_anchor(lexical_cwd) as cwd_anchor:
-                    current_metadata = os.fstat(current_fd)
-                    if not same_file_identity(current_metadata, cwd_anchor.metadata):
-                        raise ValueError("validation_cwd_identity_changed")
-                    require_same_repository_mount(
-                        repository_anchor,
-                        cwd_anchor.fd,
-                        normalized,
-                    )
-                    require_same_repository_mount(
-                        repository_anchor,
-                        current_fd,
-                        normalized,
-                    )
-            except ValueError as exc:
-                if "repository_nested_mount_rejected=" in str(exc):
-                    raise ValueError("validation_cwd_nested_mount_rejected") from exc
-                if str(exc) == "validation_cwd_identity_changed":
-                    raise
-                raise ValueError("validation_cwd_identity_changed") from exc
-
-            current_fd = _promote_validation_fd(current_fd)
-            result = current_fd
-            current_fd = -1
-            return result
-        finally:
-            if current_fd >= 0:
-                os.close(current_fd)
-            if opened_root_fd >= 0:
-                os.close(opened_root_fd)
-
-
-def run_bounded_validation_process(
-    argv: list[str],
-    *,
-    cwd: Path,
-    root: Path,
-    timeout_seconds: int,
-    root_fd: int | None = None,
-    normalized_cwd: str | None = None,
-) -> ValidationProcessResult:
-    """Run one validation from an anchored cwd with bounded output/processes."""
-
-    if os.name != "posix" or threading.active_count() != 1:
-        raise ValueError("secure_validation_process_isolation_not_supported")
-    contained_argv, linux_seccomp = _validation_containment_command(argv)
-    cwd_fd = _open_validation_cwd_fd(
-        root=root,
-        cwd=cwd,
-        root_fd=root_fd,
-        normalized_cwd=normalized_cwd,
-    )
-    process: subprocess.Popen[bytes] | None = None
-    selector: selectors.BaseSelector | None = None
-    try:
-        try:
-            try:
-                process = subprocess.Popen(
-                    contained_argv,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    shell=False,
-                    env=validation_subprocess_environment(root),
-                    start_new_session=True,
-                    pass_fds=(cwd_fd,),
-                    preexec_fn=lambda: _validation_child_setup(cwd_fd, linux_seccomp),
-                )
-            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-                raise ValueError("validation_command_launch_failed") from exc
-        finally:
-            parent_cwd_fd = cwd_fd
-            cwd_fd = -1
-            os.close(parent_cwd_fd)
-
-        # Everything after Popen returns remains inside this cleanup scope so
-        # KeyboardInterrupt and setup failures cannot strand a validation.
-        if process.stdout is None or process.stderr is None:
-            raise ValueError("validation_command_pipe_setup_failed")
-
-        stdout = bytearray()
-        stderr = bytearray()
-        total = 0
-        timed_out = False
-        output_limit_exceeded = False
-        deadline = time.monotonic() + timeout_seconds
-        selector = selectors.DefaultSelector()
-        streams = {
-            process.stdout.fileno(): stdout,
-            process.stderr.fileno(): stderr,
-        }
-        for pipe in (process.stdout, process.stderr):
-            os.set_blocking(pipe.fileno(), False)
-            selector.register(pipe, selectors.EVENT_READ)
-
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                timed_out = True
-                _terminate_validation_process(process)
-                break
-            events = selector.select(min(0.1, remaining))
-            for key, _ in events:
-                fd = key.fileobj.fileno()
-                try:
-                    chunk = os.read(
-                        fd,
-                        min(VALIDATION_OUTPUT_CHUNK_BYTES, MAX_VALIDATION_OUTPUT_BYTES - total + 1),
-                    )
-                except BlockingIOError:
-                    continue
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    key.fileobj.close()
-                    continue
-                streams[fd].extend(chunk)
-                total += len(chunk)
-                if total > MAX_VALIDATION_OUTPUT_BYTES:
-                    output_limit_exceeded = True
-                    _terminate_validation_process(process)
-                    break
-            if output_limit_exceeded:
-                break
-
-        if not timed_out and not output_limit_exceeded:
-            remaining = max(0.0, deadline - time.monotonic())
-            try:
-                process.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                _terminate_validation_process(process)
-            else:
-                # The host containment layer forbids new process trees.  The
-                # process-group kill remains defense in depth for the leader.
-                _terminate_validation_process(process)
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            _terminate_validation_process(process)
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired as exc:
-                raise ValueError("validation_process_termination_failed") from exc
-
-        exit_code = int(process.returncode if process.returncode is not None else -1)
-        if output_limit_exceeded:
-            termination_reason = "output_limit"
-        elif timed_out:
-            termination_reason = "timeout"
-            exit_code = -1
-        elif exit_code < 0:
-            termination_reason = "signal"
-        else:
-            termination_reason = "exited"
-        return ValidationProcessResult(
-            exit_code=exit_code,
-            stdout=bytes(stdout[:MAX_VALIDATION_OUTPUT_BYTES]),
-            stderr=bytes(stderr[:MAX_VALIDATION_OUTPUT_BYTES]),
-            timed_out=timed_out,
-            output_limit_exceeded=output_limit_exceeded,
-            termination_reason=termination_reason,
-        )
-    except BaseException:
-        if process is not None:
-            _terminate_validation_process(process)
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                _terminate_validation_process(process)
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-        raise
-    finally:
-        if cwd_fd >= 0:
-            os.close(cwd_fd)
-        if selector is not None:
-            selector.close()
-        if process is not None:
-            for pipe in (process.stdout, process.stderr):
-                if pipe is not None and not pipe.closed:
-                    pipe.close()
 
 
 def execute_planned_validation(
@@ -6613,6 +6327,8 @@ def execute_planned_validation(
     validation_id: str,
     actor: str,
     evidence: list[str] | None = None,
+    *,
+    root: Path,
 ) -> dict[str, object]:
     assert_safe_persistent_payload(
         {
@@ -6624,7 +6340,7 @@ def execute_planned_validation(
     )
     if not actor.strip():
         raise ValueError("validation_actor_required")
-    with open_verified_apply_run_for_mutation(run_dir) as handle:
+    with open_verified_apply_run_for_mutation(run_dir, root=root) as handle:
         run = handle.run
         progress = secure_read_regular_json_at(handle.run_fd, "Progress.json")
         task = find_task(progress, task_id)
@@ -6696,7 +6412,7 @@ def execute_planned_validation(
             cwd=command_cwd,
             root=handle.root,
             timeout_seconds=int(command["timeout_seconds"]),
-            root_fd=handle.root_fd,
+            repository=handle.repository,
             normalized_cwd=normalized_cwd,
         )
         if process_result.output_limit_exceeded:
@@ -6712,7 +6428,22 @@ def execute_planned_validation(
         except ValueError as exc:
             raise ValueError(f"validation_output_secret_rejected={task_id}:{validation_id}") from exc
         finished_at = utc_now()
-        current_change_set, current_repository_evidence = load_current_change_set(handle, task)
+        try:
+            current_change_set, current_repository_evidence = load_current_change_set(handle, task)
+        except ValueError as exc:
+            # The validation process may mutate repository metadata before the
+            # post-execution evidence pass can reopen the task through the
+            # original repository identity.  That is itself mutation evidence,
+            # not a reason to surface the lower-level handle error or publish a
+            # receipt from an unobserved post-state.
+            if str(exc) in {
+                "apply_run_mutation_identity_changed",
+                "apply_run_task_identity_changed",
+            }:
+                raise ValueError(
+                    f"validation_command_mutated_repository={task_id}:{validation_id}"
+                ) from exc
+            raise
         if current_change_set.get("repository_state_digest") != change_set.get("repository_state_digest"):
             raise ValueError(f"validation_command_mutated_repository={task_id}:{validation_id}")
         after_at = utc_now()
@@ -6830,7 +6561,7 @@ def execute_planned_validation(
         file_name = f"Validation-Receipt-{validation_id}-{receipt_id[:12]}.json"
         with open_apply_task_for_mutation(handle, task_id) as (task_fd, _):
             write_regular_json_exclusive_at(task_fd, file_name, receipt)
-            os.fsync(task_fd)
+            controller_fsync(task_fd)
         published_event = append_event_at(
             handle,
             {
@@ -7482,6 +7213,8 @@ def publish_review_completion(
     phase: str,
     actor: str,
     evidence: list[str] | None = None,
+    *,
+    root: Path,
 ) -> dict[str, object]:
     assert_safe_persistent_payload(
         {"task_id": task_id, "phase": phase, "actor": actor, "evidence": evidence or []}
@@ -7491,7 +7224,7 @@ def publish_review_completion(
     if not actor.strip():
         raise ValueError("review_receipt_actor_required")
     role = review_phase_expected_role(phase)
-    with open_verified_apply_run_for_mutation(run_dir) as handle:
+    with open_verified_apply_run_for_mutation(run_dir, root=root) as handle:
         run = handle.run
         if run.get("mode") != "subagent_serial":
             raise ValueError(f"review_receipt_requires_subagent_serial_mode={run.get('mode')}")
@@ -7623,7 +7356,7 @@ def publish_review_completion(
         file_name = f"Review-Receipt-{phase}-{receipt_id[:12]}.json"
         with open_apply_task_for_mutation(handle, task_id) as (task_fd, _):
             write_regular_json_exclusive_at(task_fd, file_name, receipt)
-            os.fsync(task_fd)
+            controller_fsync(task_fd)
         published_event = append_event_at(
             handle,
             {
@@ -7696,6 +7429,8 @@ def recover_stale_writer_lock(
     to_state: str,
     actor: str,
     evidence: list[str] | None = None,
+    *,
+    root: Path,
 ) -> dict[str, object]:
     assert_safe_persistent_payload(
         {
@@ -7711,7 +7446,7 @@ def recover_stale_writer_lock(
         raise ValueError(f"invalid_recovery_state={to_state}")
     if not actor.strip():
         raise ValueError("recovery_actor_required")
-    with open_verified_apply_run_for_mutation(run_dir) as handle:
+    with open_verified_apply_run_for_mutation(run_dir, root=root) as handle:
         progress = secure_read_regular_json_at(handle.run_fd, "Progress.json")
         task = find_task(progress, task_id)
         from_state = str(task.get("state", ""))
@@ -7770,15 +7505,21 @@ def recover_stale_writer_lock(
         return event
 
 
-def finalize_apply_run(run_dir: Path, actor: str, evidence: list[str] | None = None) -> dict[str, object]:
+def finalize_apply_run(
+    run_dir: Path,
+    actor: str,
+    evidence: list[str] | None = None,
+    *,
+    root: Path,
+) -> dict[str, object]:
     assert_safe_persistent_payload({"actor": actor, "evidence": evidence or []})
     if not actor.strip():
         raise ValueError("finalize_actor_required")
-    with open_verified_apply_run_for_mutation(run_dir) as handle:
+    with open_verified_apply_run_for_mutation(run_dir, root=root) as handle:
         for name in ("Progress.json", "Final-Review.json", "Result.json", "Events.jsonl"):
             if regular_target_metadata_at(handle.run_fd, name) is None:
                 raise ValueError(f"missing_apply_artifact={name}")
-        errors = validate_apply_run(handle.run_dir)
+        errors = validate_apply_run(handle.run_dir, handle.root, handle.repository)
         if errors:
             raise ValueError(";".join(errors))
         if not handle.revalidate():
@@ -7868,14 +7609,14 @@ def validate_dispatch_packet(run_dir: Path, run: dict[str, object], task: dict[s
     task_id = str(task.get("task_id", ""))
     if not safe_task_id(task_id):
         return
-    task_dir = (run_dir / task_id).resolve()
+    task_dir = lexical_absolute(run_dir) / task_id
     packet_path = task_dir / "Dispatch-Packet.json"
     state = str(task.get("state", ""))
     if run.get("mode") == "subagent_serial" and state not in {"BRIEFED", "BLOCKED", "NEEDS_CONTEXT"}:
-        if not packet_path.is_file():
+        if not controller_regular_entry_exists(packet_path):
             errors.append(f"subagent_dispatch_packet_missing={task_id}")
             return
-    if not packet_path.is_file():
+    if not controller_regular_entry_exists(packet_path):
         if isinstance(task.get("dispatch"), dict):
             errors.append(f"subagent_dispatch_packet_missing={task_id}")
         return
@@ -8126,13 +7867,18 @@ def validate_writer_report_bindings(
             errors.append(f"writer_report_completed_agent_binding_required={task_id}:{role}")
 
 
-def validate_task_source_binding(root: Path, task: dict[str, object], errors: list[str]) -> None:
+def validate_task_source_binding(
+    root: Path,
+    task: dict[str, object],
+    errors: list[str],
+    repository: RepositoryIO | None = None,
+) -> None:
     task_id = str(task.get("task_id", ""))
     source_path = task.get("source_subplan_path")
     if not isinstance(source_path, str) or not source_path.strip():
         errors.append(f"missing_source_subplan_path={task_id}")
         return
-    binding = implementation_contract_source_binding(root, source_path)
+    binding = repository_contract_binding(root, source_path, repository=repository)
     for error in binding.get("errors", []):
         errors.append(str(error))
     if task.get("source_subplan_sha256") != binding.get("source_subplan_sha256"):
@@ -8206,7 +7952,7 @@ def validate_task_artifacts(
         errors.append(f"invalid_task_id={task_id or 'missing'}")
         return
     try:
-        task_metadata = os.lstat(task_dir)
+        task_metadata = controller_lstat(task_dir)
     except FileNotFoundError:
         errors.append(f"missing_task_dir={task_id}")
         return
@@ -8413,9 +8159,9 @@ def validate_writer_lock(run_dir: Path, progress: dict[str, object], tasks: list
     if len(locks) > 1:
         errors.append("only_one_active_writer_lock_permitted")
     path = run_dir / WRITER_LOCK_NAME
-    if locks and not path.is_file():
+    if locks and not controller_regular_entry_exists(path):
         errors.append("active_writer_lock_missing_file")
-    if path.is_file():
+    if controller_regular_entry_exists(path):
         lock = load_json(path, errors, "writer_lock_json")
         if not isinstance(lock, dict):
             return
@@ -8466,15 +8212,16 @@ def validate_apply_policy(
     baseline: dict[str, object],
     ready_queue: list[dict[str, object]],
     errors: list[str],
+    repository: RepositoryIO | None = None,
 ) -> None:
     if root is None or mode not in APPLY_MODES:
         return
     try:
-        validation = validate_step4_queue(root, mode)
+        validation = validate_step4_queue(root, mode, repository)
     except ValueError as exc:
         errors.append(f"apply_policy_step4_readiness_unavailable={exc}")
         return
-    readiness = step4_readiness_summary(root, mode, ready_queue, validation)
+    readiness = step4_readiness_summary(root, mode, ready_queue, validation, repository)
     expected = apply_policy_envelope(root, mode, baseline, readiness)
     expected_digest = canonical_json_digest(expected)
     if run.get("apply_policy_digest") != expected_digest:
@@ -8488,12 +8235,39 @@ def validate_apply_policy(
             errors.append(f"apply_policy_mismatch={key}")
 
 
-def validate_apply_run(run_dir: Path, root: Path | None = None) -> list[str]:
+def validate_apply_run(
+    run_dir: Path,
+    root: Path,
+    repository: RepositoryIO | None = None,
+) -> list[str]:
     errors: list[str] = []
     run_dir = lexical_absolute(run_dir)
-    root = root.resolve() if root else infer_root(run_dir)
-    if root is None:
-        errors.append("source_binding_root_required")
+    root = lexical_absolute(root)
+    if repository is None:
+        try:
+            with open_repository_io(root) as opened:
+                canonical_root = canonical_repository_root(opened)
+                managed_run_dir = resolve_managed_apply_run_dir(
+                    canonical_root,
+                    run_dir,
+                    lexical_root=root,
+                )
+                return validate_apply_run(
+                    managed_run_dir,
+                    canonical_root,
+                    opened,
+                )
+        except (OSError, TypeError, ValueError) as exc:
+            return [f"repository_io_failed={str(exc).split('=', 1)[0]}"]
+    try:
+        root = canonical_repository_root(repository)
+        run_dir = resolve_managed_apply_run_dir(
+            root,
+            run_dir,
+            lexical_root=root,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        return [f"apply_run_path_rejected={str(exc).split('=', 1)[0]}"]
     run = load_json(run_dir / "Apply-Run.json", errors, "apply_run_json")
     progress = load_json(run_dir / "Progress.json", errors, "progress_json")
     final_review = load_json(run_dir / "Final-Review.json", errors, "final_review_json")
@@ -8504,7 +8278,6 @@ def validate_apply_run(run_dir: Path, root: Path | None = None) -> list[str]:
     schema_version = run.get("apply_run_schema_version")
     if (
         (schema_version == APPLY_RUN_SCHEMA_VERSION or run.get("apply_run_registration_id") is not None)
-        and root is not None
         and not current_apply_run_provenance_is_valid(root, run_dir, run)
     ):
         errors.append("apply_run_provenance_unverified")
@@ -8711,11 +8484,19 @@ def validate_apply_run(run_dir: Path, root: Path | None = None) -> list[str]:
                         if implementation_drift.get("allowed") is True and key in IMPLEMENTATION_DRIFT_BASELINE_KEYS:
                             continue
                         errors.append(f"workspace_baseline_mismatch={key}")
-        validate_apply_policy(root, run, requested_mode, baseline, ready_queue, errors)
+        validate_apply_policy(
+            root,
+            run,
+            requested_mode,
+            baseline,
+            ready_queue,
+            errors,
+            repository,
+        )
 
     if root is not None:
         try:
-            current_snapshot = collect_snapshot(root, snapshot_baseline)
+            current_snapshot = collect_snapshot(root, snapshot_baseline, repository)
         except (OSError, TypeError, ValueError) as exc:
             failure = f"workspace_scope_validation_unavailable={exc}"
             if failure not in errors:
@@ -8798,7 +8579,7 @@ def validate_apply_run(run_dir: Path, root: Path | None = None) -> list[str]:
                     errors.append(f"repository_baseline_path_mismatch={task_id}")
                 if task_baseline.get("implementation_contract_digest") != task.get("implementation_contract_digest"):
                     errors.append(f"repository_baseline_contract_mismatch={task_id}")
-                if task_baseline.get("baseline_digest") != repository_baseline_digest(task_baseline.get("snapshot", [])):
+                if task_baseline.get("baseline_digest") != controller_baseline_digest(task_baseline.get("snapshot", [])):
                     errors.append(f"repository_baseline_digest_mismatch={task_id}")
                 baseline_content_map(task_baseline)
             except (TypeError, ValueError) as exc:
@@ -8807,7 +8588,7 @@ def validate_apply_run(run_dir: Path, root: Path | None = None) -> list[str]:
     for index, task in enumerate([item for item in tasks if isinstance(item, dict)], start=1):
         task_id = str(task.get("task_id", ""))
         if root is not None:
-            validate_task_source_binding(root, task, errors)
+            validate_task_source_binding(root, task, errors, repository)
         source_path = task.get("source_subplan_path")
         digest = task.get("task_contract_digest")
         if isinstance(source_path, str) and isinstance(digest, str):
@@ -8831,7 +8612,7 @@ def validate_apply_run(run_dir: Path, root: Path | None = None) -> list[str]:
     ]
     if evidence_chain_tasks:
         try:
-            with open_verified_apply_run_for_read(run_dir) as evidence_handle:
+            with open_verified_apply_run_for_read(run_dir, root=root) as evidence_handle:
                 evidence_progress = secure_read_regular_json_at(evidence_handle.run_fd, "Progress.json")
                 for evidence_task in evidence_chain_tasks:
                     live_task = find_task(evidence_progress, str(evidence_task.get("task_id", "")))
@@ -8914,15 +8695,60 @@ def print_safe_field(name: str, value: object, *, file=None) -> None:
 
 class SafeArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
-        self.exit(2, f"{safe_log_text(self.prog)}: error: {safe_log_text(message)}\n")
+        del message
+        self.exit(2, f"{safe_log_text(self.prog)}: error: controller_arguments_invalid\n")
+
+
+def _read_controller_stdin_argv() -> list[str]:
+    """Read one bounded argv array from process stdin, never from shell text."""
+
+    raw = sys.stdin.buffer.read(MAX_CONTROLLER_STDIN_REQUEST_BYTES + 1)
+    if len(raw) > MAX_CONTROLLER_STDIN_REQUEST_BYTES:
+        raise ValueError("apply_controller_request_too_large")
+    try:
+        decoded = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("apply_controller_request_non_utf8") from None
+    request = parse_safe_persistent_json(decoded)
+    if (
+        not isinstance(request, dict)
+        or frozenset(request) != {"schema", "argv"}
+        or request.get("schema") != CONTROLLER_STDIN_REQUEST_SCHEMA
+    ):
+        raise ValueError("apply_controller_request_invalid")
+    raw_argv = request.get("argv")
+    if (
+        not isinstance(raw_argv, list)
+        or not 1 <= len(raw_argv) <= MAX_CONTROLLER_STDIN_ARGV_ITEMS
+        or any(
+            not isinstance(item, str)
+            or not item
+            or len(item) > MAX_CONTROLLER_STDIN_ARGUMENT_CHARACTERS
+            for item in raw_argv
+        )
+        or sum(len(item) for item in raw_argv)
+        > MAX_CONTROLLER_STDIN_REQUEST_BYTES
+        or "request-stdin" in raw_argv
+    ):
+        raise ValueError("apply_controller_request_invalid")
+    return list(raw_argv)
 
 
 def main(argv: list[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    stdin_request_mode = arguments == ["request-stdin"]
+    if stdin_request_mode:
+        try:
+            arguments = _read_controller_stdin_argv()
+        except (OSError, TypeError, ValueError):
+            print("apply_run_status=failed", file=sys.stderr)
+            print("error=controller_request_rejected", file=sys.stderr)
+            return 1
     parser = SafeArgumentParser(prog="apply_run.py", description="Manage CodexQB apply-run artifact contracts.")
     sub = parser.add_subparsers(dest="command", required=True)
     for command_name in ("init", "prepare"):
         prepare = sub.add_parser(command_name, help="Create an apply-run artifact directory.")
-        prepare.add_argument("--root", default=".")
+        prepare.add_argument("--root", required=True)
         prepare.add_argument("--mode", default="subagent_serial", choices=sorted(APPLY_MODES))
         prepare.add_argument("--output-dir")
         prepare.add_argument("--replace", action="store_true")
@@ -8932,7 +8758,7 @@ def main(argv: list[str] | None = None) -> int:
         prepare.add_argument("--allow-unverified-git-worktree", action="store_true")
     check = sub.add_parser("validate", help="Validate an apply-run artifact directory.")
     check.add_argument("--run-dir", required=True)
-    check.add_argument("--root")
+    check.add_argument("--root", required=True)
     transition = sub.add_parser("transition", help="Apply one checked task state transition and append Events.jsonl.")
     transition.add_argument("--run-dir", required=True)
     transition.add_argument("--task-id", required=True)
@@ -9007,7 +8833,21 @@ def main(argv: list[str] | None = None) -> int:
     finalize.add_argument("--run-dir", required=True)
     finalize.add_argument("--actor", required=True)
     finalize.add_argument("--evidence", action="append", default=[])
-    args = parser.parse_args(argv)
+    for rooted_parser in (
+        transition,
+        dispatch,
+        record_agent,
+        normalize_writer,
+        normalize_review,
+        capture_evidence,
+        run_validation,
+        publish_review,
+        reconcile,
+        recover,
+        finalize,
+    ):
+        rooted_parser.add_argument("--root", required=True)
+    args = parser.parse_args(arguments)
 
     try:
         if args.command in {"init", "prepare"}:
@@ -9026,7 +8866,14 @@ def main(argv: list[str] | None = None) -> int:
             print_safe_field("run_dir", result["run_dir"])
             return 0
         if args.command == "transition":
-            event = transition_task_state(Path(args.run_dir), args.task_id, args.to, args.actor, args.evidence)
+            event = transition_task_state(
+                Path(args.run_dir),
+                args.task_id,
+                args.to,
+                args.actor,
+                args.evidence,
+                root=Path(args.root),
+            )
             print("apply_run_status=transitioned")
             print_safe_field("event_sequence", event["sequence"])
             print_safe_field("task_id", args.task_id)
@@ -9040,6 +8887,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.actor,
                 args.evidence,
                 args.review_phase,
+                root=Path(args.root),
             )
             event = result["event"]
             print("apply_run_status=dispatch_packet_ready")
@@ -9060,6 +8908,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.evidence,
                 args.summary,
                 args.review_phase,
+                root=Path(args.root),
             )
             print("apply_run_status=agent_recorded")
             print_safe_field("event_sequence", event["sequence"])
@@ -9077,6 +8926,7 @@ def main(argv: list[str] | None = None) -> int:
                 parse_safe_persistent_json(args.report_json),
                 args.actor,
                 args.evidence,
+                root=Path(args.root),
             )
             event = result["event"]
             print("apply_run_status=writer_report_normalized")
@@ -9095,6 +8945,7 @@ def main(argv: list[str] | None = None) -> int:
                 parse_safe_persistent_json(args.report_json),
                 args.actor,
                 args.evidence,
+                root=Path(args.root),
             )
             event = result["event"]
             print("apply_run_status=review_report_normalized")
@@ -9106,7 +8957,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "capture-evidence":
             result = capture_task_change_set(
-                Path(args.run_dir), args.task_id, args.actor, args.evidence
+                Path(args.run_dir),
+                args.task_id,
+                args.actor,
+                args.evidence,
+                root=Path(args.root),
             )
             print("apply_run_status=change_set_captured")
             print_safe_field("task_id", args.task_id)
@@ -9121,6 +8976,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.validation_id,
                 args.actor,
                 args.evidence,
+                root=Path(args.root),
             )
             print("apply_run_status=validation_receipt_published")
             print_safe_field("task_id", args.task_id)
@@ -9136,6 +8992,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.review_phase,
                 args.actor,
                 args.evidence,
+                root=Path(args.root),
             )
             print("apply_run_status=review_receipt_published")
             print_safe_field("task_id", args.task_id)
@@ -9144,28 +9001,46 @@ def main(argv: list[str] | None = None) -> int:
             print_safe_field("receipt_path", result["receipt_path"])
             return 0
         if args.command == "reconcile":
-            result = reconcile_external_superpowers(Path(args.run_dir))
+            result = reconcile_external_superpowers(
+                Path(args.run_dir),
+                root=Path(args.root),
+            )
             print_safe_field("apply_run_status", result["state"])
             print_safe_field("mode", result["mode"])
             if "event_sequence" in result:
                 print_safe_field("event_sequence", result["event_sequence"])
             return 0
         if args.command == "recover-lock":
-            event = recover_stale_writer_lock(Path(args.run_dir), args.task_id, args.to, args.actor, args.evidence)
+            event = recover_stale_writer_lock(
+                Path(args.run_dir),
+                args.task_id,
+                args.to,
+                args.actor,
+                args.evidence,
+                root=Path(args.root),
+            )
             print("apply_run_status=recovered")
             print_safe_field("event_sequence", event["sequence"])
             print_safe_field("task_id", args.task_id)
             print_safe_field("state", args.to)
             return 0
         if args.command == "finalize":
-            event = finalize_apply_run(Path(args.run_dir), args.actor, args.evidence)
+            event = finalize_apply_run(
+                Path(args.run_dir),
+                args.actor,
+                args.evidence,
+                root=Path(args.root),
+            )
             print("apply_run_status=finalized")
             print_safe_field("event_sequence", event["sequence"])
             return 0
-        errors = validate_apply_run(Path(args.run_dir), Path(args.root) if args.root else None)
+        errors = validate_apply_run(Path(args.run_dir), Path(args.root))
     except Exception as exc:
         print("apply_run_status=failed", file=sys.stderr)
-        print_safe_field("error", exc, file=sys.stderr)
+        if stdin_request_mode:
+            print("error=controller_request_failed", file=sys.stderr)
+        else:
+            print_safe_field("error", exc, file=sys.stderr)
         return 1
     if errors:
         print("apply_run_status=failed")

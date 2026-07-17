@@ -283,6 +283,7 @@ class MountIdentityProviderTests(unittest.TestCase):
             payload.f_fsid.value[0] = 10
             payload.f_fsid.value[1] = 20
             payload.f_type = 30
+            payload.f_flags = MOUNT.DARWIN_MNT_LOCAL
             payload.f_fstypename = b"apfs"
             payload.f_mntonname = b"/" + b"Users/example/private"
             payload.f_mntfromname = b"/dev/disk-test"
@@ -291,6 +292,7 @@ class MountIdentityProviderTests(unittest.TestCase):
         result = MOUNT.probe_darwin_fstatfs(16, backend=backend, platform="darwin")
         self.assertTrue(result.supported)
         self.assertEqual(result.identity.namespace, "darwin_fstatfs")
+        self.assertEqual(result.identity.parts[4], MOUNT.DARWIN_MNT_LOCAL)
         report = json.dumps(MOUNT.safe_provider_result_report(result), sort_keys=True)
         self.assertNotIn("Users", report)
         self.assertNotIn("disk-test", report)

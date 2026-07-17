@@ -17,18 +17,34 @@ The goal is to ask the same four required fields, but make the questions active,
 
 ## Pre-Intake Scan
 
-Before asking `PROJECT_NAME`, inspect the repository with a bounded read-only pass.
-
-Prefer commands like:
+Before asking `PROJECT_NAME`, inspect the repository with the bounded `intake`
+profile:
 
 ```bash
-pwd
-git status --short --branch
-git branch --show-current
-find . -maxdepth 2 \( -path './.git' -o -path './node_modules' -o -path './.venv' -o -path './dist' -o -path './build' -o -path './artifacts' \) -prune -o -type f -print | sort | head -120
-find . -maxdepth 2 \( -path './.git' -o -path './node_modules' -o -path './.venv' -o -path './dist' -o -path './build' -o -path './artifacts' \) -prune -o -type d -print | sort | head -80
-ls
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller repository-io -- request-stdin
 ```
+
+Invoke that fixed command once per request and send each bounded JSON object
+directly through the host process API to the child process's stdin:
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["--root",".","inspect","--profile","intake"]}
+```
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["--root",".","search","--profile","intake"]}
+```
+
+Do not materialize these requests with echo, printf, a pipe, redirection, a
+heredoc, command substitution, environment variables, shell interpolation, or
+a temporary/repository file. If direct host-to-child stdin is unavailable,
+stop as `BLOCKED`.
+
+Retain both RepositoryIO receipts. They are the only pre-intake repository
+inventory/search evidence. Branch, dirty-state, and workspace posture may be
+taken only from controller-owned workspace evidence already bound to the
+current Goal/Apply run. If that evidence is unavailable, record the workspace
+posture as unknown; do not fall back to Git or shell commands.
 
 Read likely evidence files when they exist:
 
@@ -44,11 +60,9 @@ Read likely evidence files when they exist:
 - `docs/` index, architecture, roadmap, runbook, deployment, security, or testing files
 - top-level service, package, app, config, script, test, and infra directories
 
-Use `rg` only for targeted discovery when useful:
-
-```bash
-rg -n "architecture|roadmap|runbook|production|security|policy|workflow|worker|scheduler|gateway|adapter|dashboard|test|smoke|deploy|Kubernetes|Docker|Postgres|queue|approval|audit|artifact|observability" . --glob '!.git/**' --glob '!node_modules/**' --glob '!.venv/**' --glob '!dist/**' --glob '!build/**' --glob '!artifacts/**'
-```
+The named search profile returns only signal labels, counts, paths, and line
+locations; it never returns matching source lines. Do not substitute arbitrary
+repository-content search commands.
 
 Keep this pass brief. Its purpose is to make the intake questions smarter, not to replace the full repository analysis in `First-Planner.md`.
 

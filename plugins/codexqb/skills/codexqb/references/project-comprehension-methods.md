@@ -144,9 +144,9 @@ Combine evidence types, but keep their limits clear:
 - Static source evidence shows structure, names, contracts, and dependencies.
 - Behavioral evidence from tests, smoke runs, or runtime probes shows executed behavior.
 - Semantic evidence maps domain language to code concepts.
-- Evolutionary evidence from bounded git history shows churn, co-change, and possible hidden coupling.
+- Evolutionary metadata from named RepositoryIO/controller receipts may show churn, co-change, and possible hidden coupling; if absent, keep those claims unknown instead of querying Git directly.
 
-History is an evolutionary signal, not proof of ownership or architecture.
+Receipt-provided history metadata is an evolutionary signal, not proof of ownership or architecture.
 
 ## Competency Questions
 

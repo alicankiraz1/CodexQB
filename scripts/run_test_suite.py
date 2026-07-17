@@ -15,17 +15,27 @@ TEST_ROOT = REPO_ROOT / "tests"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.controller_test_support import real_trust_store_snapshot
+
 FAST_BASELINE_STEMS = (
     "test_safety_contracts",
     "test_validate_planner_docs",
     "test_artifact_io",
+    "test_controller_store",
     "test_evidence_contracts",
+    "test_execution_controller",
+    "test_repository_io",
+    "test_repository_io_policy",
+    "test_repository_validation",
+    "test_skill_launcher",
+    "test_skill_root_authority",
 )
 
 PRIMARY_SUITE_STEMS = {
     "unit": {
         *FAST_BASELINE_STEMS,
         "test_git_evidence",
+        "test_repository_io_limits",
         "test_suite_partition",
     },
     "platform": {
@@ -113,10 +123,21 @@ def main(argv: list[str] | None = None) -> int:
     if not modules:
         print(f"test_suite_empty={args.suite}")
         return 1
-    loader = unittest.defaultTestLoader
-    selected = loader.loadTestsFromNames(modules)
-    result = unittest.TextTestRunner(verbosity=2).run(selected)
-    return 0 if result.wasSuccessful() else 1
+    # Accidental mutation detector only: this is not same-UID tamper
+    # resistance, host authority, or attestation.
+    trust_before = real_trust_store_snapshot()
+    try:
+        loader = unittest.defaultTestLoader
+        selected = loader.loadTestsFromNames(modules)
+        result = unittest.TextTestRunner(verbosity=2).run(selected)
+        status = 0 if result.wasSuccessful() else 1
+    finally:
+        trust_after = real_trust_store_snapshot()
+    if trust_after != trust_before:
+        print("real_controller_trust_guard=changed", file=sys.stderr)
+        return 1
+    print("real_controller_trust_guard=unchanged")
+    return status
 
 
 if __name__ == "__main__":

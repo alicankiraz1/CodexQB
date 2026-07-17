@@ -21,6 +21,9 @@ import sys
 import tempfile
 import zipfile
 
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 SAFETY_DIR = Path(__file__).resolve().parents[1] / "plugins/codexqb/skills/codexqb/scripts"
 if str(SAFETY_DIR) not in sys.path:
     sys.path.insert(0, str(SAFETY_DIR))

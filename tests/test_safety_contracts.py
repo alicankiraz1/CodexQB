@@ -199,6 +199,129 @@ class SafetyContractsTests(unittest.TestCase):
         self.assertEqual(locations.count(("openai_api_key", len(prefix))), 1)
         self.assertNotIn(fixture, repr(locations))
 
+    def test_package_scanner_preserves_non_ascii_utf_assignment_values(self) -> None:
+        encodings = ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
+        for secret in ("é" * 40, "密碼值" * 16):
+            fixture = "password=" + secret
+            for encoding in encodings:
+                with self.subTest(encoding=encoding, codepoint=ord(secret[0])):
+                    started = time.perf_counter()
+                    locations = SAFETY.package_secret_match_locations(
+                        fixture.encode(encoding),
+                        "",
+                    )
+                    self.assertIn(("generic_credential_assignment", 0), locations)
+                    self.assertNotIn(secret, repr(locations))
+                    self.assertLess(time.perf_counter() - started, 1.0)
+                    self.assertEqual(
+                        SAFETY.package_secret_match_locations(
+                            fixture.encode(encoding),
+                            ".txt",
+                        ),
+                        [("package_text_invalid_utf8", 0)],
+                    )
+
+        byte_fixtures = (
+            ("utf8-cjk", ("password=" + "密碼值" * 16).encode("utf-8")),
+            ("utf8-cyrillic", ("password=" + "тайна" * 10).encode("utf-8")),
+            ("opaque-password", b"password=" + b"\xff" * 40),
+            ("opaque-api-key", b"api_key=" + b"\x80\x81" * 20),
+        )
+        for label, encoded in byte_fixtures:
+            with self.subTest(binary_value=label):
+                locations = SAFETY.package_secret_match_locations(encoded, "")
+                self.assertIn(("generic_credential_assignment", 0), locations)
+                self.assertNotIn(repr(encoded), repr(locations))
+
+        secret = "密碼值" * 16
+        fixture = "password=" + secret
+        prefix = b"\x82" * 61
+        with (
+            mock.patch.object(SAFETY, "PACKAGE_BINARY_SCAN_WINDOW_BYTES", 64),
+            mock.patch.object(SAFETY, "PACKAGE_BINARY_SCAN_OVERLAP_BYTES", 512),
+        ):
+            for encoding in encodings:
+                with self.subTest(boundary_encoding=encoding):
+                    locations = SAFETY.package_secret_match_locations(
+                        prefix + fixture.encode(encoding),
+                        ".bin",
+                    )
+                    self.assertEqual(
+                        locations.count(
+                            ("generic_credential_assignment", len(prefix))
+                        ),
+                        1,
+                    )
+                    self.assertNotIn(secret, repr(locations))
+
+    def test_package_scanner_cue_anchors_wide_structural_records(self) -> None:
+        ascii_secret = "V" * 40
+        forms = (
+            ("block", "name: password\nvalue: " + ascii_secret + "\n"),
+            ("table", "| password | " + ascii_secret + " |\n"),
+        )
+        boms = {
+            "utf-16-le": b"\xff\xfe",
+            "utf-16-be": b"\xfe\xff",
+            "utf-32-le": b"\xff\xfe\x00\x00",
+            "utf-32-be": b"\x00\x00\xfe\xff",
+        }
+        with (
+            mock.patch.object(SAFETY, "PACKAGE_BINARY_SCAN_WINDOW_BYTES", 64),
+            mock.patch.object(SAFETY, "PACKAGE_BINARY_SCAN_OVERLAP_BYTES", 512),
+        ):
+            for encoding, bom in boms.items():
+                for label, fixture in forms:
+                    for include_bom in (False, True):
+                        for prefix_length in (0, 2, 3, 61, 63, 64, 65):
+                            with self.subTest(
+                                encoding=encoding,
+                                form=label,
+                                bom=include_bom,
+                                prefix_length=prefix_length,
+                            ):
+                                prefix = b"\x81" * prefix_length
+                                marker = bom if include_bom else b""
+                                locations = SAFETY.package_secret_match_locations(
+                                    prefix + marker + fixture.encode(encoding),
+                                    "",
+                                )
+                                expected_offset = len(prefix) + len(marker)
+                                if label == "table":
+                                    expected_offset += len("|".encode(encoding))
+                                self.assertIn(
+                                    (
+                                        "generic_credential_assignment",
+                                        expected_offset,
+                                    ),
+                                    locations,
+                                )
+                                self.assertNotIn(ascii_secret, repr(locations))
+
+        non_ascii_secret = "密碼值" * 16
+        for encoding in boms:
+            for label, template in (
+                ("block", "name: password\nvalue: {}\n"),
+                ("table", "| password | {} |\n"),
+            ):
+                with self.subTest(
+                    encoding=encoding,
+                    non_ascii_form=label,
+                ):
+                    prefix = b"\x82" * 3
+                    locations = SAFETY.package_secret_match_locations(
+                        prefix + template.format(non_ascii_secret).encode(encoding),
+                        "",
+                    )
+                    expected_offset = len(prefix)
+                    if label == "table":
+                        expected_offset += len("|".encode(encoding))
+                    self.assertIn(
+                        ("generic_credential_assignment", expected_offset),
+                        locations,
+                    )
+                    self.assertNotIn(non_ascii_secret, repr(locations))
+
     def test_package_scanner_covers_shortest_utf16_assignment_across_windows(self) -> None:
         fixture = assemble_fixture("Api", "Key=x")
         for endian in ("utf-16-le", "utf-16-be"):
@@ -236,6 +359,73 @@ class SafetyContractsTests(unittest.TestCase):
                     SAFETY.package_secret_match_locations(text.encode("utf-8"), suffix),
                     [],
                 )
+
+    def test_package_document_scanner_routes_bounded_structural_credential_contexts(self) -> None:
+        fixture = "V" * 40
+        unsafe = (
+            (
+                "markdown-pair",
+                ".md",
+                "release failure: password, '" + fixture + "'\n",
+                "generic_credential_assignment",
+                len("release failure: "),
+            ),
+            (
+                "markdown-table",
+                ".md",
+                "| Field | Value |\n| --- | --- |\n| password | " + fixture + " |\n",
+                "generic_credential_assignment",
+                len("| Field | Value |\n| --- | --- |\n|"),
+            ),
+            (
+                "text-failure-tuple",
+                ".txt",
+                "failure=('password', {'value': '" + fixture + "'})\n",
+                "generic_credential_assignment",
+                len("failure=('"),
+            ),
+            (
+                "yaml-name-value",
+                ".yaml",
+                "- name: AWS_SECRET_ACCESS_KEY\n  value: " + fixture + "\n",
+                "aws_secret_access_key",
+                0,
+            ),
+        )
+        for label, suffix, text, expected, expected_offset in unsafe:
+            with self.subTest(label=label):
+                self.assertIn(expected, SAFETY.secret_findings(text))
+                locations = SAFETY.package_secret_match_locations(text.encode("utf-8"), suffix)
+                self.assertIn((expected, expected_offset), locations)
+                self.assertNotIn(fixture, repr(locations))
+
+        placeholders = (
+            (".md", "password, '${PASSWORD}'\n"),
+            (".md", "| password | ${PASSWORD} |\n"),
+            (".txt", "failure=('password', {'value': '${PASSWORD}'})\n"),
+            (
+                ".yaml",
+                "- name: AWS_SECRET_ACCESS_KEY\n  value: ${AWS_SECRET_ACCESS_KEY}\n",
+            ),
+        )
+        for suffix, text in placeholders:
+            with self.subTest(placeholder_suffix=suffix, text_hash=hash(text)):
+                self.assertEqual(
+                    SAFETY.package_secret_match_locations(text.encode("utf-8"), suffix),
+                    [],
+                )
+
+        source_fixture = (
+            "PAIR_FIXTURE = " + repr("password, '" + fixture + "'") + "\n"
+            "TABLE_FIXTURE = " + repr("| password | " + fixture + " |") + "\n"
+            "BLOCK_FIXTURE = "
+            + repr("name: AWS_SECRET_ACCESS_KEY\nvalue: " + fixture)
+            + "\n"
+        )
+        self.assertEqual(
+            SAFETY.package_secret_match_locations(source_fixture.encode("utf-8"), ".py"),
+            [],
+        )
 
     def test_python_constant_join_credentials_are_scanned_and_placeholders_remain_safe(self) -> None:
         fixture = "sk-" + "J" * 40
@@ -834,6 +1024,582 @@ class SafetyContractsTests(unittest.TestCase):
         for fixture in safe_pairs:
             with self.subTest(safe=fixture):
                 self.assertEqual(SAFETY.secret_findings(fixture), [])
+
+    def test_pair_context_parser_preserves_suffix_matches_with_many_prefix_segments(self) -> None:
+        secret = "V" * 40
+        fixtures = [
+            "alpha-beta-gamma-delta-epsilon-api-key, '" + secret + "'",
+            "'" + "-".join(["segment"] * 48 + ["api", "key"]) + "', '" + secret + "'",
+        ]
+        for fixture in fixtures:
+            with self.subTest(length=len(fixture)):
+                started = time.perf_counter()
+                self.assertIn("generic_credential_assignment", SAFETY.secret_findings(fixture))
+                self.assertLess(time.perf_counter() - started, 1.0)
+
+    def test_pair_context_parser_preserves_underscore_and_mixed_suffixes(self) -> None:
+        secret = "V" * 40
+        underscore = "_".join(["segment"] * 64 + ["api", "key"])
+        mixed = ""
+        separators = ("-", ".", " ", "_")
+        for count in range(64, 128):
+            candidate = "".join(
+                "segment" + separators[index % len(separators)]
+                for index in range(count)
+            ) + "api_key"
+            if candidate[-SAFETY.MAX_PAIR_CONTEXT_LABEL_CHARACTERS] == "_":
+                mixed = candidate
+                break
+        self.assertTrue(mixed)
+        fixtures = (underscore, mixed)
+        for label in fixtures:
+            fixture = f"'{label}', '{secret}'"
+            with self.subTest(label_length=len(label)):
+                started = time.perf_counter()
+                self.assertIn(
+                    "generic_credential_assignment",
+                    SAFETY.secret_findings(fixture),
+                )
+                self.assertLess(time.perf_counter() - started, 1.0)
+                started = time.perf_counter()
+                self.assertTrue(
+                    any(
+                        name == "generic_credential_assignment"
+                        for name, _offset in SAFETY.package_secret_match_locations(
+                            fixture.encode("utf-8"),
+                            ".txt",
+                        )
+                    )
+                )
+                self.assertLess(time.perf_counter() - started, 1.0)
+
+        adversarial_label = "_".join(["segment"] * 8192 + ["api", "key"])
+        adversarial = f"'{adversarial_label}', '{secret}'"
+        started = time.perf_counter()
+        self.assertIn(
+            "generic_credential_assignment",
+            SAFETY.secret_findings(adversarial),
+        )
+        self.assertLess(time.perf_counter() - started, 2.0)
+
+    def test_pair_context_concatenation_cannot_suppress_a_literal_secret(self) -> None:
+        secret = "V" * 40
+        fixtures = (
+            f"failure=('password', '{secret}' + '')",
+            f'failure=("password", "{secret}" + "safe")',
+            f"failure=('client_secret', b'{secret}' + b'')",
+            f"failure=('password', value: '{secret}' + '')",
+        )
+        for fixture in fixtures:
+            with self.subTest(prefix=fixture[:32]):
+                self.assertIn(
+                    "generic_credential_assignment",
+                    SAFETY.secret_findings(fixture),
+                )
+                locations = SAFETY.package_secret_match_locations(
+                    fixture.encode("utf-8"),
+                    ".txt",
+                )
+                self.assertTrue(
+                    any(
+                        name == "generic_credential_assignment"
+                        for name, _offset in locations
+                    )
+                )
+                self.assertNotIn(secret, repr(locations))
+
+        placeholder = "failure=('password', '$PASSWORD')"
+        self.assertEqual(SAFETY.secret_findings(placeholder), [])
+        self.assertEqual(
+            SAFETY.package_secret_match_locations(
+                placeholder.encode("utf-8"),
+                ".txt",
+            ),
+            [],
+        )
+        placeholder_concatenations = (
+            "failure=('password', '$PASSWORD' + '')",
+            "failure=('password', '${' + 'PASSWORD}')",
+            "failure=('password', '<redacted>' + '')",
+        )
+        for fixture in placeholder_concatenations:
+            with self.subTest(placeholder_concat=fixture):
+                self.assertEqual(SAFETY.secret_findings(fixture), [])
+                self.assertEqual(
+                    SAFETY.package_secret_match_locations(
+                        fixture.encode("utf-8"),
+                        ".txt",
+                    ),
+                    [],
+                )
+
+        unsupported = "failure=('password', '$PASSWORD' + runtime_value)"
+        unsupported_expressions = (
+            unsupported,
+            "failure=('password', '$PASSWORD' + '' runtime_value)",
+            "failure=('password', '$PASSWORD' + '' * 5)",
+            "failure=('password', '$PASSWORD' + '' .format())",
+            "failure=('password', '$PASSWORD' + ''[0])",
+            "failure=('password', '$PASSWORD' + '' 'adjacent')",
+            f"failure=('password', '$PASSWORD' + '' and '{secret}')",
+            f"failure=('password', '$PASSWORD' + ''\n and '{secret}')",
+            f"failure=('password', '$PASSWORD' + '' # note\n + '{secret}')",
+            "failure=('password', '$' + b'PASSWORD')",
+        )
+        for fixture in unsupported_expressions:
+            with self.subTest(unsupported=fixture[:48]):
+                self.assertIn(
+                    "secret_scan_credential_expression_unsupported",
+                    SAFETY.secret_findings(fixture),
+                )
+                with self.assertRaises(ValueError):
+                    SAFETY.assert_safe_persistent_text(fixture)
+                self.assertTrue(
+                    any(
+                        name == "secret_scan_credential_expression_unsupported"
+                        for name, _offset in SAFETY.package_secret_match_locations(
+                            fixture.encode("utf-8"),
+                            ".txt",
+                        )
+                    )
+                )
+                if secret in fixture:
+                    self.assertNotIn(secret, SAFETY.safe_log_text(fixture))
+
+    def test_pair_context_expression_grammar_precedes_placeholder_suppression(self) -> None:
+        secret = "V" * 40
+        unsupported = (
+            f"failure=('password', ('$PASSWORD' + '') and '{secret}')",
+            f"failure=('password', ['$PASSWORD' + ''] and '{secret}')",
+            f"failure=('password', {{'value': '$PASSWORD' + ''}} and '{secret}')",
+            f"failure=('password', '$PASSWORD' and '{secret}')",
+            f"failure=('password', '$PASSWORD' or '{secret}')",
+            f"failure=('password', '$PASSWORD' * 0 + '{secret}')",
+            f"failure=('password', '$PASSWORD'[0] + '{secret}')",
+            f"failure=('password', '$PASSWORD'.format() + '{secret}')",
+            f"failure=('password', '$PASSWORD' runtime_value + '{secret}')",
+            f"failure=('password', '$PASSWORD' '{secret}')",
+            f"failure=('password', '$PASSWORD' # note\n + '{secret}')",
+            f"failure=('password', f'{secret}' + '')",
+            f"failure=('password', F'{secret}')",
+            f"failure=('password', fr'{secret}' + '')",
+            f"failure=('password', rf'{secret}')",
+            f"failure=('password', str('{secret}') + '')",
+            f"failure=('password', memoryview(b'{secret}') + b'')",
+            f"failure=('password', bytes(b'$PASSWORD') and b'{secret}')",
+            f"failure=('password', {{'value': str('{secret}')}})",
+            f"failure=('password', (lambda: '$PASSWORD')() and '{secret}')",
+        )
+        for fixture in unsupported:
+            with self.subTest(unsupported=fixture[:56]):
+                self.assertIn(
+                    "secret_scan_credential_expression_unsupported",
+                    SAFETY.secret_findings(fixture),
+                )
+                with self.assertRaises(ValueError) as caught:
+                    SAFETY.assert_safe_persistent_text(fixture)
+                self.assertNotIn(secret, str(caught.exception))
+                self.assertNotIn(
+                    secret,
+                    SAFETY.safe_log_text(fixture, max_characters=16_384),
+                )
+                for suffix in (".txt", ""):
+                    with self.subTest(suffix=suffix):
+                        locations = SAFETY.package_secret_match_locations(
+                            fixture.encode("utf-8"),
+                            suffix,
+                        )
+                        self.assertTrue(
+                            any(
+                                name == "secret_scan_credential_expression_unsupported"
+                                for name, _offset in locations
+                            ),
+                            locations,
+                        )
+                        self.assertNotIn(secret, repr(locations))
+
+        boundary_truncation = (
+            "failure=('password', '$PASSWORD'"
+            + (" " * 4084)
+            + "+ '"
+            + secret
+            + "')"
+        )
+        self.assertIn(
+            "secret_scan_structured_context_limit",
+            SAFETY.secret_findings(boundary_truncation),
+        )
+        with self.assertRaises(ValueError):
+            SAFETY.assert_safe_persistent_text(boundary_truncation)
+        self.assertNotIn(
+            secret,
+            SAFETY.safe_log_text(boundary_truncation, max_characters=16_384),
+        )
+        for suffix in (".txt", ""):
+            locations = SAFETY.package_secret_match_locations(
+                boundary_truncation.encode("utf-8"),
+                suffix,
+            )
+            self.assertTrue(
+                any(
+                    name == "secret_scan_structured_context_limit"
+                    for name, _offset in locations
+                ),
+                locations,
+            )
+            self.assertNotIn(secret, repr(locations))
+
+        safe_placeholders = (
+            "failure=('password', '$PASSWORD')",
+            "failure=['password', '${PASSWORD}']",
+            "failure=('password', {'value': '<redacted>'})",
+            "password, '$PASSWORD'\n",
+            "failure=('password', '$' + 'PASSWORD')",
+            "failure=('password', '${' + 'PASSWORD}')",
+            "failure=('password', b'$' + b'PASSWORD')",
+            "failure=('password', r'$' + u'PASSWORD')",
+            "password, '$' + 'PASSWORD'\n",
+        )
+        for fixture in safe_placeholders:
+            with self.subTest(safe_placeholder=fixture):
+                self.assertEqual(SAFETY.secret_findings(fixture), [])
+                SAFETY.assert_safe_persistent_text(fixture)
+                for suffix in (".txt", ""):
+                    self.assertEqual(
+                        SAFETY.package_secret_match_locations(
+                            fixture.encode("utf-8"),
+                            suffix,
+                        ),
+                        [],
+                    )
+
+    def test_unknown_package_payloads_preserve_structural_credential_pairs(self) -> None:
+        secret = "V" * 40
+        fixtures = (
+            ("", f"failure=('password','{secret}')"),
+            ("", '{"name":"password","value":"' + secret + '"}'),
+            (".jsonl", '{"name":"password","value":"' + secret + '"}'),
+            ("", "name: password\nvalue: " + secret + "\n"),
+            (".blob", "| password | " + secret + " |\n"),
+        )
+        for suffix, fixture in fixtures:
+            with self.subTest(suffix=suffix, prefix=fixture[:16]):
+                locations = SAFETY.package_secret_match_locations(
+                    fixture.encode("utf-8"),
+                    suffix,
+                )
+                self.assertTrue(
+                    any(
+                        name == "generic_credential_assignment"
+                        for name, _offset in locations
+                    )
+                )
+                self.assertNotIn(secret, repr(locations))
+
+        wide_fixture = f"failure=('password','{secret}')"
+        for encoding in ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):
+            with self.subTest(structural_encoding=encoding):
+                locations = SAFETY.package_secret_match_locations(
+                    wide_fixture.encode(encoding),
+                    "",
+                )
+                self.assertTrue(
+                    any(
+                        name == "generic_credential_assignment"
+                        for name, _offset in locations
+                    )
+                )
+                self.assertNotIn(secret, repr(locations))
+
+        boundary_fixture = (
+            "password\n"
+            + "Z" * (8189 - len("password\n"))
+            + "\npassword"
+            + " " * 64
+            + ", '"
+            + secret
+            + "'"
+        )
+        boundary_locations = SAFETY.package_secret_match_locations(
+            boundary_fixture.encode("utf-8"),
+            "",
+        )
+        self.assertTrue(
+            any(
+                name == "generic_credential_assignment"
+                for name, _offset in boundary_locations
+            )
+        )
+        self.assertNotIn(secret, repr(boundary_locations))
+
+        safe = b"failure=('password','$PASSWORD')"
+        self.assertEqual(SAFETY.package_secret_match_locations(safe, ""), [])
+
+    def test_tracked_high_entropy_binary_remains_clean_and_bounded(self) -> None:
+        payload = (REPO_ROOT / "docs/assets/codexqb-workflow.png").read_bytes()
+        started = time.perf_counter()
+        self.assertEqual(
+            SAFETY.package_secret_match_locations(payload, ".png"),
+            [],
+        )
+        self.assertLess(time.perf_counter() - started, 5.0)
+
+    def test_markdown_package_scanner_applies_visible_label_semantics(self) -> None:
+        secret = "V" * 40
+        labels = (
+            r"api\-key",
+            "api&#45;key",
+            "**password**",
+            "~~password~~",
+            "`password`",
+            "[password](https://example.invalid)",
+            "<span>password</span>",
+            "pass&#119;ord",
+            "**api&#45;key**",
+            "[pass&#119;ord](https://example.invalid)",
+            r"<span>api\-key</span>",
+        )
+        for label in labels:
+            fixture = (
+                "| Field | Value |\n"
+                "| --- | --- |\n"
+                f"| {label} | {secret} |\n"
+            )
+            with self.subTest(label=label):
+                self.assertIn(
+                    "generic_credential_assignment",
+                    SAFETY.secret_findings(fixture),
+                )
+                locations = SAFETY.package_secret_match_locations(
+                    fixture.encode("utf-8"),
+                    ".md",
+                )
+                self.assertTrue(
+                    any(
+                        name == "generic_credential_assignment"
+                        for name, _offset in locations
+                    )
+                )
+                self.assertNotIn(secret, repr(locations))
+
+        direct_fixtures = (
+            (r"sk\-" + "A" * 40, "openai_api_key"),
+            ("sk&#45;" + "A" * 40, "openai_api_key"),
+            ("**password**=" + secret, "generic_credential_assignment"),
+            (
+                "[password](https://example.invalid)=" + secret,
+                "generic_credential_assignment",
+            ),
+        )
+        for fixture, expected in direct_fixtures:
+            with self.subTest(direct=fixture[:20]):
+                self.assertIn(expected, SAFETY.secret_findings(fixture))
+                locations = SAFETY.package_secret_match_locations(
+                    fixture.encode("utf-8"),
+                    ".md",
+                )
+                self.assertIn((expected, 0), locations)
+                self.assertNotIn(secret, repr(locations))
+
+        rendered_suffix_fixtures = (
+            (".rst", "``password``=" + secret),
+            (".html", "<b>password</b>=" + secret),
+            (".xml", "<label>password</label>=" + secret),
+            (".txt", "pass&#119;ord=" + secret),
+            (".html", "name: password\nvalue: " + secret + "\n"),
+            (".xml", "| password | " + secret + " |\n"),
+            (
+                ".html",
+                "<table><tr><td>password</td><td>"
+                + secret
+                + "</td></tr></table>",
+            ),
+            (".html", "<dl><dt>password</dt><dd>" + secret + "</dd></dl>"),
+            (
+                ".xml",
+                "<record><name>password</name><value>"
+                + secret
+                + "</value></record>",
+            ),
+            (
+                ".xml",
+                "<record><cqb:credential-name>password</cqb:credential-name>"
+                "<cqb:credential-value>"
+                + secret
+                + "</cqb:credential-value></record>",
+            ),
+        )
+        for suffix, fixture in rendered_suffix_fixtures:
+            with self.subTest(rendered_suffix=suffix):
+                self.assertIn(
+                    "generic_credential_assignment",
+                    SAFETY.secret_findings(fixture),
+                )
+                self.assertIn(
+                    ("generic_credential_assignment", 0),
+                    SAFETY.package_secret_match_locations(
+                        fixture.encode("utf-8"),
+                        suffix,
+                    ),
+                )
+
+        rendered_placeholders = (
+            (
+                ".html",
+                "<table><tr><td>password</td><td>${PASSWORD}</td></tr></table>",
+            ),
+            (
+                ".xml",
+                "<record><name>password</name><value>${PASSWORD}</value></record>",
+            ),
+        )
+        for suffix, fixture in rendered_placeholders:
+            with self.subTest(rendered_placeholder=suffix):
+                self.assertEqual(
+                    SAFETY.package_secret_match_locations(
+                        fixture.encode("utf-8"),
+                        suffix,
+                    ),
+                    [],
+                )
+
+        for relative in (
+            "README.md",
+            "docs/USAGE.md",
+            "docs/MAINTAINING.md",
+            "requirements-ci.txt",
+        ):
+            with self.subTest(safe_markdown=relative):
+                self.assertEqual(
+                    SAFETY.package_secret_match_locations(
+                        (REPO_ROOT / relative).read_bytes(),
+                        Path(relative).suffix,
+                    ),
+                    [],
+                )
+
+    def test_secret_scanner_large_regression_fixtures_remain_bounded(self) -> None:
+        dispatch_packet = json.dumps(
+            {
+                "dispatch_packet_schema_version": 1,
+                "task_id": "TASK-001",
+                "producer": "controller",
+                "role": "implementer",
+                "acceptance_checks": [
+                    f"planner-check-{index:04d}: repository boundary remains deterministic and safe"
+                    for index in range(240)
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.assertGreater(len(dispatch_packet.encode("utf-8")), 10 * 1024)
+        started = time.perf_counter()
+        self.assertEqual(SAFETY.secret_findings(dispatch_packet), [])
+        self.assertLess(time.perf_counter() - started, 1.0)
+
+        for size in (1024 * 1024, 8 * 1024 * 1024):
+            separators = "," * size
+            started = time.perf_counter()
+            self.assertIn(
+                "secret_scan_structured_context_limit",
+                SAFETY.secret_findings(separators),
+            )
+            self.assertLess(time.perf_counter() - started, 2.0)
+            started = time.perf_counter()
+            self.assertIn(
+                ("secret_scan_structured_context_limit", 0),
+                SAFETY.package_secret_match_locations(
+                    separators.encode("ascii"),
+                    "",
+                ),
+            )
+            self.assertLess(time.perf_counter() - started, 5.0)
+
+        mixed_separators = ("field,value," * 100_000).encode("ascii")
+        started = time.perf_counter()
+        self.assertIn(
+            ("secret_scan_structured_context_limit", 0),
+            SAFETY.package_secret_match_locations(mixed_separators, ""),
+        )
+        self.assertLess(time.perf_counter() - started, 2.0)
+
+        invalid_separators = b"\xff," * (4 * 1024 * 1024)
+        started = time.perf_counter()
+        self.assertIn(
+            ("secret_scan_structured_context_limit", 0),
+            SAFETY.package_secret_match_locations(invalid_separators, ""),
+        )
+        self.assertLess(time.perf_counter() - started, 2.0)
+
+        no_match = "Z" * (900 * 1024)
+        started = time.perf_counter()
+        self.assertEqual(SAFETY.secret_findings(no_match), [])
+        self.assertLess(time.perf_counter() - started, 10.0)
+
+        started = time.perf_counter()
+        self.assertEqual(
+            SAFETY.package_secret_match_locations(no_match.encode("utf-8"), ".txt"),
+            [],
+        )
+        self.assertLess(time.perf_counter() - started, 10.0)
+
+        repeated_label = (
+            "alpha-beta-gamma-delta-epsilon-api-label, safe-value\n"
+            * ((900 * 1024) // 55 + 1)
+        )[: 900 * 1024]
+        started = time.perf_counter()
+        self.assertIn(
+            "secret_scan_structured_context_limit",
+            SAFETY.secret_findings(repeated_label),
+        )
+        self.assertLess(time.perf_counter() - started, 10.0)
+        started = time.perf_counter()
+        self.assertTrue(
+            any(
+                name == "secret_scan_structured_context_limit"
+                for name, _offset in SAFETY.package_secret_match_locations(
+                    repeated_label.encode("utf-8"),
+                    ".txt",
+                )
+            ),
+        )
+        self.assertLess(time.perf_counter() - started, 10.0)
+
+        suffixless_binary = b"\x00\xff\x81\xfe" * ((8 * 1024 * 1024) // 4)
+        started = time.perf_counter()
+        self.assertEqual(
+            SAFETY.package_secret_match_locations(suffixless_binary, ""),
+            [],
+        )
+        self.assertLess(time.perf_counter() - started, 10.0)
+
+    def test_opaque_binary_without_ascii_letters_skips_expensive_projections(self) -> None:
+        opaque = b"\x00\xff\x81\xfe" * ((8 * 1024 * 1024) // 4)
+        with mock.patch.object(
+            SAFETY,
+            "_package_direct_match_locations",
+            side_effect=AssertionError("direct projection scan must be skipped"),
+        ), mock.patch.object(
+            SAFETY,
+            "PACKAGE_STRUCTURAL_CREDENTIAL_CUE_RE",
+        ) as structural_cue:
+            structural_cue.search.side_effect = AssertionError(
+                "structural projection scan must be skipped"
+            )
+            self.assertEqual(SAFETY._package_binary_match_locations(opaque), [])
+            structural_cue.search.assert_not_called()
+
+        # The fast path is keyed on letter absence, not on the credential value.
+        # A numeric value beside an ASCII credential label must remain visible.
+        self.assertIn(
+            ("generic_credential_assignment", 0),
+            SAFETY._package_binary_match_locations(
+                assemble_fixture("pass", "word=12345678901234567890").encode(
+                    "ascii"
+                )
+            ),
+        )
 
     def test_oversized_structured_context_fails_before_large_node_traversal(self) -> None:
         with mock.patch.object(SAFETY, "MAX_STRUCTURED_CONTEXT_INPUT_CHARACTERS", 128):

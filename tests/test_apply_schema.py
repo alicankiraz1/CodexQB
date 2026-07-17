@@ -56,7 +56,7 @@ class ApplySchemaParityTests(unittest.TestCase):
         case.write_apply_fixture(root)
         run_dir = Path(case.create_apply_run(root, "subagent_serial")["run_dir"])
         task_id = case.first_task_id(run_dir)
-        APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller")
+        APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller", root=root)
         APPLY_MODULE.record_agent_status(
             run_dir,
             task_id,
@@ -64,17 +64,20 @@ class ApplySchemaParityTests(unittest.TestCase):
             "schema-impl-1",
             "spawned",
             "controller",
+        root=root,
         )
         APPLY_MODULE.transition_task_state(
             run_dir,
             task_id,
             "IMPLEMENTING",
             "schema-impl-1",
+        root=root,
         )
         return case, run_dir, task_id
 
     def normalize_implementer(
         self,
+        root: Path,
         run_dir: Path,
         task_id: str,
         **extra: object,
@@ -94,6 +97,7 @@ class ApplySchemaParityTests(unittest.TestCase):
             "schema-impl-1",
             payload,
             "controller",
+        root=root,
         )
         return json.loads((run_dir / task_id / "Implementer-Report.json").read_text(encoding="utf-8"))
 
@@ -105,11 +109,12 @@ class ApplySchemaParityTests(unittest.TestCase):
             placeholder = {"status": "PENDING"}
             self.assertEqual(self.schema_errors("ImplementerReport", placeholder), [])
 
-            normalized = self.normalize_implementer(run_dir, task_id)
+            normalized = self.normalize_implementer(root, run_dir, task_id)
             self.assertEqual(self.schema_errors("ImplementerReport", normalized), [])
 
             digest = "a" * 64
             evidence_bound = self.normalize_implementer(
+                root,
                 run_dir,
                 task_id,
                 files_changed=["src/example.py"],
@@ -123,6 +128,7 @@ class ApplySchemaParityTests(unittest.TestCase):
             self.assertEqual(self.schema_errors("ImplementerReport", evidence_bound), [])
 
             blocked = self.normalize_implementer(
+                root,
                 run_dir,
                 task_id,
                 status="BLOCKED",
@@ -134,7 +140,7 @@ class ApplySchemaParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             _, run_dir, task_id = self.create_writer_run(root)
-            self.normalize_implementer(run_dir, task_id)
+            self.normalize_implementer(root, run_dir, task_id)
             progress = json.loads((run_dir / "Progress.json").read_text(encoding="utf-8"))
             self.assertEqual(self.schema_errors("Progress", progress), [])
 
@@ -143,7 +149,7 @@ class ApplySchemaParityTests(unittest.TestCase):
 
             (run_dir / "Progress.json").write_text(json.dumps(progress), encoding="utf-8")
             self.assertTrue(
-                any("writer_report_bindings_invalid" in error for error in APPLY_MODULE.validate_apply_run(run_dir))
+                any("writer_report_bindings_invalid" in error for error in APPLY_MODULE.validate_apply_run(run_dir, root=root))
             )
 
     def test_root_union_cannot_accept_malformed_implementer_as_another_report_type(self) -> None:
@@ -207,6 +213,7 @@ class ApplySchemaParityTests(unittest.TestCase):
             _, run_dir, task_id = self.create_writer_run(root)
             with self.assertRaisesRegex(ValueError, "writer_report_unknown_field"):
                 self.normalize_implementer(
+                    root,
                     run_dir,
                     task_id,
                     unexpected_writer_field="must fail",
@@ -230,6 +237,7 @@ class ApplySchemaParityTests(unittest.TestCase):
                     "schema-impl-1",
                     base,
                     "controller",
+                root=root,
                 )
             invalid_evidence = {**base, "concerns": [], "evidence": 7}
             with self.assertRaisesRegex(ValueError, "writer_report_invalid"):
@@ -240,6 +248,7 @@ class ApplySchemaParityTests(unittest.TestCase):
                     "schema-impl-1",
                     invalid_evidence,
                     "controller",
+                root=root,
                 )
             for invalid_paths in (["../escape"], ["src/example.py", "src/example.py"]):
                 with self.subTest(invalid_paths=invalid_paths):
@@ -253,6 +262,7 @@ class ApplySchemaParityTests(unittest.TestCase):
                             "schema-impl-1",
                             payload,
                             "controller",
+                        root=root,
                         )
 
     def test_implementer_evidence_fields_are_all_or_none_and_nonempty(self) -> None:
@@ -277,6 +287,7 @@ class ApplySchemaParityTests(unittest.TestCase):
                     "schema-impl-1",
                     partial,
                     "controller",
+                root=root,
                 )
 
             empty_bound = {
@@ -296,6 +307,7 @@ class ApplySchemaParityTests(unittest.TestCase):
                     "schema-impl-1",
                     empty_bound,
                     "controller",
+                root=root,
                 )
 
             empty_decision = {
@@ -315,6 +327,7 @@ class ApplySchemaParityTests(unittest.TestCase):
                     "schema-impl-1",
                     empty_decision,
                     "controller",
+                root=root,
                 )
 
     def test_filename_mapped_validator_checks_real_run_directory(self) -> None:
@@ -323,7 +336,7 @@ class ApplySchemaParityTests(unittest.TestCase):
             root = Path(temp_dir)
             _, run_dir, task_id = self.create_writer_run(root)
             self.assertEqual(schema_validation.validate_run_directory(self.schema, run_dir), [])
-            self.normalize_implementer(run_dir, task_id)
+            self.normalize_implementer(root, run_dir, task_id)
             self.assertEqual(schema_validation.validate_run_directory(self.schema, run_dir), [])
 
     def test_run_directory_validator_rejects_symlinks_and_missing_runtime_artifacts(self) -> None:

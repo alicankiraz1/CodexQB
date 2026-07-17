@@ -83,30 +83,58 @@ Repository inspection requirements:
 
 Before writing the audit, inspect the repository safely.
 
-Run only safe read-only commands such as:
-- pwd
-- git status --short --branch
-- git branch --show-current
-- git log --oneline -n 10
-- if [ -d Planner-docs ]; then find Planner-docs -maxdepth 4 -type f | sort; fi
-- cat Planner-docs/Main-Planing.md
-- cat Planner-docs/Sub-Planing-Index.md
-- if [ -d Planner-docs ]; then find Planner-docs -path "*/Faz-*-Plans/*.md" -type f | sort; fi
-- grep/ripgrep commands for headings and phase markers
+Use the mandatory Step 3 repository boundary:
 
-Useful discovery commands:
-- rg "^#|^##|Faz|Phase|Stage|Maturity|Acceptance|Risk|Dependency|Validation|Test|Desired|Scope|Out of Scope|Current Repository Evidence|Planned Work Breakdown" Planner-docs --glob '!.git/**' --glob '!node_modules/**' --glob '!.venv/**' --glob '!dist/**' --glob '!build/**' --glob '!artifacts/**'
-- rg "TODO|FIXME|TBD|unclear|missing|later|future|assumption|blocked|blocker|risk|production|live|local|readiness|ontology|ledger|comprehension|vibecoding|Goal|subagent" Planner-docs --glob '!.git/**' --glob '!node_modules/**' --glob '!dist/**' --glob '!build/**' --glob '!artifacts/**'
-- rg -l "secret|token|credential|api[_-]?key|password|private[_-]?key" Planner-docs --glob '!.git/**' --glob '!node_modules/**' --glob '!dist/**' --glob '!build/**' --glob '!artifacts/**'
-- rg "docs/|Planner-docs/|Main-Planing|Sub-Planing|Faz-" Planner-docs --glob '!.git/**' --glob '!node_modules/**' --glob '!.venv/**' --glob '!dist/**' --glob '!build/**' --glob '!artifacts/**'
+```bash
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller repository-io -- request-stdin
+```
 
-Before writing the audit, run the bundled read-only Step 3 preflight validator if available:
+Send each request below as one bounded JSON object directly to the child
+process's stdin through the host process API, invoking the fixed command once
+per object:
 
-python3 plugins/codexqb/skills/codexqb/scripts/validate_planner_docs.py --root . --mode step3-preflight --strict
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["--root",".","inspect","--profile","step3"]}
+```
 
-If an installed plugin exposes a different active skill script path, use that bundled validator path instead.
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["--root",".","search","--profile","step3"]}
+```
 
-If no script path is accessible, perform equivalent all-file validation and state that validator execution was unavailable.
+Use the inspection receipt as the only repository/worktree/VCS evidence; do
+not supplement it with raw Git or filesystem commands.
+
+Read Main-Planing, Sub-Planing-Index, every phase plan, and continuity artifact
+only with the fixed request-stdin command and this stdin data request:
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["--root",".","read-model","--path","<repository-relative-path>"]}
+```
+
+The named search profile exposes signal metadata, not matching lines. Do not
+substitute raw enumeration or content-search commands.
+
+Publish `Planner-docs/Sub-Planing-Audit.md` only through
+the fixed request-stdin command and this stdin data request:
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["--root",".","write-planner","--stage","step3","--path","Planner-docs/Sub-Planing-Audit.md","--expected-sha256","<CURRENT_SHA256>"],"body":"<planner-markdown-body>"}
+```
+
+Use a separate validated JSON request containing `--expected-missing` only when
+absence is confirmed. Never materialize requests with echo, printf, a pipe,
+redirection, a heredoc, command substitution, environment variables, shell
+interpolation, or a temporary/repository file. Missing host stdin support or a
+CAS mismatch is `BLOCKED`; no generic write fallback is permitted.
+
+Before writing the audit, run the bundled read-only Step 3 preflight validator through the loader-supplied, controller-bound active skill root:
+
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller planner-validator -- --root . --mode step3-preflight --strict
+
+Resolve `<CODEXQB_SKILL_ROOT>` only from the active Codex skill-loader path
+contract in `SKILL.md`. If that loader-supplied, controller-bound absolute root or the validator is
+unavailable, stop as `BLOCKED`; do not search the target repository or perform
+manual/raw all-file validation.
 
 If the validator exits nonzero, do not stop only because of that. Incorporate the validator findings into Planner-docs/Sub-Planing-Audit.md and continue the audit unless required source files are missing.
 
@@ -573,26 +601,29 @@ After creating/updating Planner-docs/Sub-Planing-Audit.md:
 
 1. Read the file back.
 
-2. Run:
-   find Planner-docs -maxdepth 4 -type f | sort
+2. Invoke the fixed repository-io request-stdin command with this JSON object on
+   host-provided stdin and retain its inventory receipt:
+
+   ```json
+   {"schema":"codexqb.controller-argv/v1","argv":["--root",".","inspect","--profile","step3"]}
+   ```
 
 3. Run:
-   python3 plugins/codexqb/skills/codexqb/scripts/validate_planner_docs.py --root . --mode step3 --strict
+   python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller planner-validator -- --root . --mode step3 --strict
 
-4. Do not run grep/ripgrep scans that print matched secret-bearing lines. The validator in step 3 already performs redacted secret detection. If a fallback scan is unavoidable, use file-name-only output such as `rg -l` and never copy matched values into the audit.
+4. The Step 3 validator performs redacted secret detection. If the validator
+   or repository I/O helper is unavailable, stop as `BLOCKED`; do not use a raw
+   content-search fallback.
 
 5. Run:
-   python3 plugins/codexqb/skills/codexqb/scripts/validate_planner_docs.py --root . --mode step4 --strict
+   python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller planner-validator -- --root . --mode step4 --strict
 
-6. Run:
-   git diff -- Planner-docs/Sub-Planing-Audit.md
+6. Compare the before/after Step 3 inspection receipts and confirm whether
+   only `Planner-docs/Sub-Planing-Audit.md` changed.
 
-7. Run:
-   git status --short
-
-8. Confirm whether only Planner-docs/Sub-Planing-Audit.md changed.
-
-9. If any file outside Planner-docs/Sub-Planing-Audit.md changed, report it as unexpected and do not attempt to fix unless explicitly asked.
+7. If the receipt reports any change outside
+   `Planner-docs/Sub-Planing-Audit.md`, report it as unexpected and do not
+   attempt to fix unless explicitly asked.
 
 Goal-following behavior:
 
@@ -614,7 +645,7 @@ A. Success:
 - naming/order issues were checked;
 - Step 4 readiness was assessed;
 - prioritized fixes were listed;
-- git status was checked.
+- RepositoryIO and controller-owned workspace evidence were revalidated.
 
 B. Blocked:
 - Planner-docs/Main-Planing.md is missing;

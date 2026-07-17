@@ -46,29 +46,61 @@ Repository inspection requirements:
 
 Before writing the report, inspect the repository safely.
 
-Run only read-only or safe local commands such as:
-- pwd
-- git status --short --branch
-- git branch --show-current
-- git log --oneline -n 10
-- find . -maxdepth 3 \( -path './.git' -o -path './node_modules' -o -path './.venv' -o -path './dist' -o -path './build' -o -path './artifacts' \) -prune -o -type f -print | sort | head -300
-- for d in Planner-docs docs configs scripts services packages tests infra .github; do [ -d "$d" ] && find "$d" -maxdepth 2 -type f | sort | head -80; done
-- if [ -d Planner-docs ]; then find Planner-docs -maxdepth 3 -type f | sort; fi
-- cat Planner-docs/Main-Planing.md
-- if [ -f Planner-docs/Planing-Ledger.md ]; then cat Planner-docs/Planing-Ledger.md; fi
-- if [ -f Planner-docs/Project-Ontology.md ]; then cat Planner-docs/Project-Ontology.md; fi
-- if [ -f Planner-docs/Project-Comprehension.md ]; then cat Planner-docs/Project-Comprehension.md; fi
-- cat README.md if present
-- cat AGENTS.md if present
-- inspect pyproject.toml, package.json, Cargo.toml, go.mod, Makefile, docker-compose files, CI workflow files, docs indexes, architecture docs, runbooks, tests, config examples, service skeletons, package skeletons, and policy files if present
+Use the mandatory autopsy repository boundary:
 
-You may use ripgrep/grep for normal discovery where matching lines are safe to show:
-- rg "TODO|FIXME|TBD|placeholder|stub|mock|fake|skeleton|not implemented|NotImplemented|pass$|Phase|roadmap|architecture|runbook|readiness|activation|production|security|policy|worker|scheduler|gateway|adapter|test|smoke|CI|API|database|Postgres|queue|artifact|approval|review" . --glob '!.git/**' --glob '!node_modules/**' --glob '!.venv/**' --glob '!dist/**' --glob '!build/**' --glob '!artifacts/**'
+```bash
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller repository-io -- request-stdin
+```
 
-Use file-name-only sensitive discovery so secret-bearing lines are never printed:
-- rg -l "secret|token|credential|api[_-]?key|password|private[_-]?key" . --glob '!.git/**' --glob '!node_modules/**' --glob '!.venv/**' --glob '!dist/**' --glob '!build/**' --glob '!artifacts/**'
+Invoke it separately with each request, sent as JSON bytes through the host
+process stdin channel:
 
-Do not print or copy secret values. If a secret-like value is detected, report only the file path and line number with the value redacted. Do not run grep/ripgrep commands that print matching secret-bearing lines; prefer the bundled validator or file-name-only scans such as `rg -l` when fallback discovery is needed.
+```json
+{
+  "schema": "codexqb.controller-argv/v1",
+  "argv": ["--root", ".", "inspect", "--profile", "autopsy"]
+}
+```
+
+```json
+{
+  "schema": "codexqb.controller-argv/v1",
+  "argv": ["--root", ".", "search", "--profile", "autopsy"]
+}
+```
+
+The inspection receipt is the only repository/worktree/VCS evidence source;
+do not supplement it with raw Git or filesystem commands.
+
+Read required evidence, including existing Planner-docs continuity files, by
+sending this non-executable request object through that same fixed command:
+
+```json
+{
+  "schema": "codexqb.controller-argv/v1",
+  "argv": ["--root", ".", "read-model", "--path", "<repository-relative-path>"]
+}
+```
+
+Do not substitute arbitrary enumeration or content-search commands. Named
+search results contain only safe metadata, never matching lines.
+
+Publish Autopsy, Project-Ontology, and Project-Comprehension only by sending a
+request of this form through the fixed command's host stdin channel:
+
+```json
+{
+  "schema": "codexqb.controller-argv/v1",
+  "argv": ["--root", ".", "write-planner", "--stage", "autopsy", "--path", "<allowed-path>", "--expected-sha256", "<CURRENT_SHA256>"],
+  "body": "<planner-markdown-body>"
+}
+```
+
+Use a separately validated `--expected-missing` request when the receipt proves
+the target absent. A missing launcher, unavailable host stdin channel, or CAS
+mismatch is `BLOCKED` with no direct-write fallback. Never materialize request
+JSON with echo, printf, a pipe, redirection, a heredoc, command substitution,
+environment variables, shell interpolation, or a temporary/repository file.
 
 Analysis expectations:
 
@@ -128,7 +160,7 @@ Pass 4 — Architecture reflexion:
 
 Pass 5 — Behavioral and evolutionary evidence:
 - Record safe runtime/test evidence when already available; for live probes, record approval-gated next probes instead of mutating systems.
-- Use bounded git history only as an evolutionary signal, not as proven ownership truth.
+- Use only evolutionary metadata present in named RepositoryIO/controller receipts, and never treat it as proven ownership truth. When those receipts provide no evolutionary evidence, mark the signal unknown rather than running Git history commands.
 
 Pass 6 — Quality scenarios and synthesis:
 - Capture 3-5 QAW/ATAM-lite scenarios and GQM-style Goal/Question/Evidence checks for the most important risks.
@@ -341,23 +373,26 @@ Validation after writing:
 
 After creating/updating Planner-docs/Autopsy.md and optional Planner-docs/Project-Ontology.md or Planner-docs/Project-Comprehension.md:
 
-1. Run:
-   test -f Planner-docs/Autopsy.md && echo "Autopsy.md exists"
+1. Read back `Planner-docs/Autopsy.md` through the fixed RepositoryIO command by
+   sending this host-stdin request, then retain its returned content hash receipt:
 
-2. Read back:
-   Planner-docs/Autopsy.md
+   ```json
+   {
+     "schema": "codexqb.controller-argv/v1",
+     "argv": ["--root", ".", "read-model", "--path", "Planner-docs/Autopsy.md"]
+   }
+   ```
 
 3. Verify all required headings exist in the required order.
 
 4. Run the bundled validator when available. When manually validating from a CodexQB repository checkout, use:
-   python3 plugins/codexqb/skills/codexqb/scripts/validate_planner_docs.py --root . --mode autopsy --strict
-   If no validator path is accessible, use only file-name-only fallback scans such as `rg -l` and never print matched secret values.
+   python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller planner-validator -- --root . --mode autopsy --strict
+   If no validator path is accessible, stop as `BLOCKED`; do not substitute a
+   raw repository-content scan.
 
-5. Run:
-   git diff -- Planner-docs/Autopsy.md Planner-docs/Project-Ontology.md Planner-docs/Project-Comprehension.md
-
-6. Run:
-   git status --short -- Planner-docs
+5. Confirm scope only from the post-write RepositoryIO read-back receipt and
+   controller-owned workspace evidence after the strict validator pass; do not
+   use raw VCS or shell metadata fallbacks.
 
 7. Confirm that only Planner-docs/Autopsy.md and optional Planner-docs/Project-Ontology.md or Planner-docs/Project-Comprehension.md were modified by this step.
 

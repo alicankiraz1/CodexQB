@@ -11,14 +11,14 @@ It is not an executor. It does not run validation commands, edit global Codex co
 - Canonical handoff source when the stage has one.
 - Stage goal spec under `references/goal-specs/`.
 - Relevant existing `Planner-docs/` artifacts.
-- Optional output directory that is one direct child of `Planner-docs/Goal-Runs/`.
+- Optional output directory that is one direct child of the repository-bound external controller-state `goal-runs/` directory.
 
 ## Outputs
 
 The compiler writes a per-invocation run directory:
 
 ```text
-Planner-docs/Goal-Runs/<goal-run-id>/
+<passwd-home>/.codex/codexqb-trust/controller-state-v1/<repository-identity>/goal-runs/<goal-run-id>/
   Goal-Run.json
   Goal-Prompt.md
   Goal-Result.json
@@ -38,13 +38,14 @@ Before any Goal JSON or Markdown is published, shared safe serialization rejects
 
 Validation also rejects semantic drift in run controls: unsupported stage modes, blank objectives, empty work steps, unsafe validation checkpoints, recursive subagent depth, invalid context-token risk declarations, invalid budget limits, selected-task budget overflow, and dishonest token-usage state. These fields are execution safety controls, not display-only metadata.
 
-Stage snapshots are stage-aware. Step 3 treats `Sub-Planing-Audit.md` as expected mutable output while keeping Step 2 source artifacts immutable. Step 4 treats `Planing-Ledger.md`, `.codexqb/apply-runs/**`, and implementation paths declared by READY queue contracts as mutable outputs while keeping the Main Plan, index, audit, and selected source sub-plans immutable.
+Stage snapshots are stage-aware. Step 3 treats `Sub-Planing-Audit.md` as expected mutable output while keeping Step 2 source artifacts immutable. Step 4 treats `Planing-Ledger.md` and implementation paths declared by READY queue contracts as mutable repository outputs while keeping the Main Plan, index, audit, and selected source sub-plans immutable. Apply controller artifacts live outside the repository and are excluded by boundary rather than by a repository glob.
 
 ## Security Rules
 
-- The output directory must be a direct, non-symlink child of `Planner-docs/Goal-Runs/`; another repo-local directory is not approved.
-- Default output is `Planner-docs/Goal-Runs/<goal-run-id>/`; explicit output and resume use the same direct-child boundary.
-- `Planner-docs`, `Goal-Runs`, the run directory, and final artifact targets are opened or inspected without following symlinks; symlink and special-file targets fail closed.
+- The output directory must be a direct, non-symlink child of the fixed, repository-bound external controller-state `goal-runs/` directory; no repo-local directory is approved.
+- Default output is the external controller-state `goal-runs/<goal-run-id>/`; explicit output and resume use the same direct-child boundary. Production derives the store from the effective account's passwd home and accepts no environment path override.
+- The external controller-store chain, `goal-runs`, the run directory, and final artifact targets are opened or inspected descriptor-relative without following symlinks; symlink and special-file targets fail closed.
+- Legacy in-repository `Planner-docs/Goal-Runs/` trees are archive-only and cannot be resumed, replaced, or mutated.
 - Source snapshots include hashes and relative paths only.
 - Active scope must use portable repo-relative roots such as `"."`, not local absolute paths.
 - Allowed and forbidden write patterns must be repo-relative. Absolute paths, traversal, unsafe wildcards, and overlapping allowed/forbidden patterns are blockers.

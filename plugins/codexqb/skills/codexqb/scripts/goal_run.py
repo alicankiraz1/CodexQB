@@ -8,16 +8,84 @@ the target repo.
 
 from __future__ import annotations
 
+import sys
+
+if __name__ == "__main__" and not (
+    sys.flags.isolated
+    and sys.flags.no_site
+    and sys.flags.dont_write_bytecode
+    and sys.flags.optimize == 0
+):
+    sys.stderr.write(
+        "codexqb_controller=unsupported "
+        "reason=requires_python_-I_-S_-B_first_process\n"
+    )
+    raise SystemExit(2)
+
+from types import ModuleType
+
+
+def _launcher_admission_is_valid(expected_basename: str) -> bool:
+    context = sys.modules.get("_codexqb_held_runtime_context_v1")
+    if not isinstance(context, ModuleType):
+        return False
+    try:
+        state = ModuleType.__getattribute__(context, "__dict__")
+    except (AttributeError, TypeError):
+        return False
+    runtime_sources = state.get("runtime_sources")
+    if (
+        type(expected_basename) is not str
+        or not expected_basename
+        or type(state.get("__name__")) is not str
+        or state.get("__name__") != "_codexqb_held_runtime_context_v1"
+        or type(state.get("schema_version")) is not int
+        or state.get("schema_version") != 1
+        or type(state.get("assurance")) is not str
+        or state.get("assurance")
+        != "controller_observed_loader_path_unattested"
+        or state.get("host_attested") is not False
+        or state.get("verified") is not False
+        or state.get("finalization_authority") is not False
+        or "runtime_sha256" in state
+        or "goal_sha256" in state
+        or type(runtime_sources) is not tuple
+        or not runtime_sources
+    ):
+        return False
+    source_names: list[str] = []
+    for item in runtime_sources:
+        if type(item) is not tuple or len(item) != 2:
+            return False
+        source_name, source = item
+        if (
+            type(source_name) is not str
+            or not source_name
+            or type(source) is not bytes
+            or not source
+        ):
+            return False
+        source_names.append(source_name)
+    return bool(
+        tuple(source_names) == tuple(sorted(source_names))
+        and len(source_names) == len(set(source_names))
+        and expected_basename in source_names
+    )
+
+if __name__ == "__main__" and not _launcher_admission_is_valid("goal_run.py"):
+    sys.stderr.write(
+        "codexqb_controller=unsupported reason=launcher_admission_required\n"
+    )
+    raise SystemExit(2)
+
+
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fnmatch
 import hashlib
 import json
-import os
 import re
-import subprocess
-import sys
 from pathlib import Path
 from collections.abc import Iterator
 
@@ -32,7 +100,7 @@ from safety_contracts import (  # noqa: E402
     default_budget_contract,
     glob_patterns_overlap,
     has_secret_like,
-    implementation_contract_source_binding,
+    implementation_contract_binding_from_bytes,
     implementation_contract_validation_command_ids,
     is_safe_repo_path,
     parse_safe_persistent_json,
@@ -44,29 +112,31 @@ from safety_contracts import (  # noqa: E402
     validate_budget_contract,
     validate_token_usage,
 )
-from artifact_io import (  # noqa: E402
-    atomic_write_text_at,
-    directory_entry_matches,
-    locked_directory,
-    open_child_directory,
-    open_or_create_child_directory,
-    read_regular_json_at,
-    regular_target_metadata_at,
-    secure_directory_open_flags,
-    unlink_regular_at,
+from controller_store import (  # noqa: E402
+    ControllerRunArtifacts,
+    GOAL_RUN_COMPONENTS,
+    canonical_repository_root as canonical_controller_repository_root,
+    controller_lexical_absolute,
+    controller_process_id,
+    goal_runs_root,
+    legacy_goal_runs_root,
+    open_goal_run_artifacts,
 )
-from git_evidence import (  # noqa: E402
-    canonical_git_evidence_digest,
-    capture_git_workspace_evidence,
+from execution_controller import (  # noqa: E402
+    read_goal_held_bytes,
+    run_goal_planner_validator,
 )
-from mount_identity import (  # noqa: E402
-    NON_DESTRUCTIVE_ARTIFACT_PACKAGE_CREATION,
-    MountResolution,
-    require_mount_assurance,
-    require_same_mount,
-    resolve_mount_identity,
+from repository_io import (  # noqa: E402
+    RepositoryIO,
+    _controller_canonical_root as canonical_repository_root,
+    _controller_evidence_digest as controller_evidence_digest,
+    _controller_inventory as controller_inventory,
+    _controller_path_kind as controller_path_kind,
+    _controller_read_bytes as controller_read_bytes,
+    _controller_regular_paths as controller_regular_paths,
+    _controller_workspace_proof as controller_workspace_proof,
+    open_repository_io,
 )
-from repository_evidence import snapshot_repository_inventory  # noqa: E402
 
 
 ARTIFACT_SCHEMA_VERSION = 3
@@ -76,10 +146,6 @@ PLUGIN_VERSION = "0.3.0"
 GOAL_COMPILER_VERSION = 2
 GOAL_RUNS_RELATIVE_DIR = Path("Planner-docs") / "Goal-Runs"
 GOAL_RUN_DIRECTORY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,159}")
-
-SCRIPT_PATH = Path(__file__).resolve()
-SKILL_ROOT = SCRIPT_PATH.parents[1]
-VALIDATOR_PATH = SCRIPT_PATH.with_name("validate_planner_docs.py")
 
 STAGE_REFERENCES = {
     "step15": ["references/Autopsy-Planner.md", "references/goal-specs/step15.md"],
@@ -186,7 +252,9 @@ GOAL_SAFETY = {
     "executes_commands": False,
     "allows_global_config_edits": False,
     "allows_commit_push_pr_deploy": False,
-    "output_dir_must_be_inside_repo": True,
+    "output_dir_must_be_inside_repo": False,
+    "controller_state_owner_only": True,
+    "legacy_repository_goal_runs_archive_only": True,
 }
 GOAL_AGENT_PROFILES = {
     "explorer": {"agent_type": "explorer", "model_profile": "fast", "sandbox": "read-only"},
@@ -201,12 +269,108 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+def read_skill_bytes(relative_path: str) -> bytes:
+    """Read one immutable resource only from launcher-held descriptor bytes."""
+
+    return read_goal_held_bytes(relative_path)
 
 
-def repo_relative(root: Path, path: Path) -> str:
-    return path.resolve().relative_to(root.resolve()).as_posix()
+def read_skill_text(relative_path: str) -> str:
+    try:
+        return read_skill_bytes(relative_path).decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("non_utf8_trusted_skill_resource") from None
+
+
+def repository_model_text(
+    root: Path,
+    relative_path: str,
+    *,
+    required: bool = False,
+    repository: RepositoryIO | None = None,
+) -> str | None:
+    if repository is not None:
+        return repository.read_text(relative_path, required=required, audience="model").text
+    with open_repository_io(root) as opened:
+        return opened.read_text(relative_path, required=required, audience="model").text
+
+
+def repository_internal_text(
+    root: Path,
+    relative_path: str,
+    *,
+    required: bool = False,
+    repository: RepositoryIO | None = None,
+) -> str | None:
+    if repository is not None:
+        return repository.read_text(relative_path, required=required, audience="internal").text
+    with open_repository_io(root) as opened:
+        return opened.read_text(relative_path, required=required, audience="internal").text
+
+
+def repository_workspace_evidence(
+    root: Path,
+    repository: RepositoryIO | None = None,
+) -> dict[str, object]:
+    if repository is None:
+        with open_repository_io(root) as opened:
+            return repository_workspace_evidence(root, opened)
+    return dict(controller_workspace_proof(repository).evidence)
+
+
+def _repository_path_kind(root: Path, relative_path: str) -> str:
+    with open_repository_io(root) as repository:
+        return controller_path_kind(repository, relative_path)
+
+
+def repository_contract_binding(
+    root: Path,
+    source_subplan_path: str,
+    *,
+    repository: RepositoryIO | None = None,
+) -> dict[str, object]:
+    if repository is None:
+        with open_repository_io(root) as opened:
+            return repository_contract_binding(
+                root,
+                source_subplan_path,
+                repository=opened,
+            )
+    source = controller_read_bytes(repository, source_subplan_path, required=False)
+    if not source.exists or source.data is None:
+        return {"errors": [f"missing_source_subplan={source_subplan_path}"]}
+    authoritative = implementation_contract_binding_from_bytes(
+        source_subplan_path,
+        source.data,
+    )
+    projected = repository.read_text(
+        source_subplan_path,
+        required=False,
+        audience="model",
+    )
+    if (
+        not projected.exists
+        or projected.text is None
+        or projected.receipt.sha256 != source.receipt.sha256
+    ):
+        raise ValueError("repository_model_projection_identity_mismatch")
+    projected_binding = implementation_contract_binding_from_bytes(
+        source_subplan_path,
+        projected.text.encode("utf-8"),
+    )
+    authoritative_semantics = {
+        key: value
+        for key, value in authoritative.items()
+        if key != "source_subplan_sha256"
+    }
+    projected_semantics = {
+        key: value
+        for key, value in projected_binding.items()
+        if key != "source_subplan_sha256"
+    }
+    if authoritative_semantics != projected_semantics:
+        raise ValueError("repository_model_projection_semantic_mismatch")
+    return authoritative
 
 
 def is_inside(parent: Path, child: Path) -> bool:
@@ -214,7 +378,7 @@ def is_inside(parent: Path, child: Path) -> bool:
 
 
 def lexical_absolute(path: Path) -> Path:
-    return Path(os.path.abspath(os.fspath(path)))
+    return controller_lexical_absolute(path)
 
 
 def resolve_managed_goal_run_dir(
@@ -224,9 +388,10 @@ def resolve_managed_goal_run_dir(
     *,
     lexical_root: Path | None = None,
 ) -> Path:
-    canonical_root = root.resolve(strict=True)
+    canonical_root = canonical_controller_repository_root(root)
     lexical_root = lexical_absolute(lexical_root or canonical_root)
-    managed_root = canonical_root / GOAL_RUNS_RELATIVE_DIR
+    managed_root = goal_runs_root(canonical_root)
+    legacy_root = legacy_goal_runs_root(canonical_root)
     if requested is None:
         candidate = managed_root / str(default_name or "")
     else:
@@ -234,33 +399,28 @@ def resolve_managed_goal_run_dir(
             raise ValueError("invalid_goal_output_dir=path_traversal_rejected")
         if requested.is_absolute():
             lexical_requested = lexical_absolute(requested)
-            try:
-                candidate = canonical_root / lexical_requested.relative_to(lexical_root)
-            except ValueError:
-                candidate = lexical_requested
+            candidate = lexical_requested
         else:
-            candidate = canonical_root / requested
+            if len(requested.parts) == 1:
+                candidate = managed_root / requested.name
+            elif requested.parts[:2] == GOAL_RUNS_RELATIVE_DIR.parts:
+                raise ValueError("legacy_goal_run_archive_only")
+            else:
+                raise ValueError("invalid_goal_output_dir=managed_run_required")
     lexical_candidate = lexical_absolute(candidate)
+    try:
+        lexical_candidate.relative_to(legacy_root)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("legacy_goal_run_archive_only")
     if lexical_candidate.parent != managed_root:
-        raise ValueError("invalid_goal_output_dir=must_be_direct_child_of_Planner-docs/Goal-Runs")
+        raise ValueError("invalid_goal_output_dir=must_be_direct_child_of_controller_goal_runs")
     if GOAL_RUN_DIRECTORY_RE.fullmatch(lexical_candidate.name) is None:
         raise ValueError("invalid_goal_output_dir=invalid_run_directory_name")
     if has_secret_like(lexical_candidate.name):
         raise ValueError("invalid_goal_output_dir=secret_like_run_directory_name")
     return lexical_candidate
-
-
-def require_goal_same_mount(
-    root_resolution: MountResolution,
-    child_fd: int,
-    relative_path: str,
-) -> None:
-    try:
-        require_same_mount(root_resolution, child_fd, relative_path)
-    except ValueError as exc:
-        if str(exc).startswith("repository_nested_mount_rejected="):
-            raise ValueError("invalid_goal_output_dir=directory_identity_changed") from exc
-        raise
 
 
 @contextmanager
@@ -270,96 +430,22 @@ def open_managed_goal_run_directory(
     *,
     create: bool,
     allow_existing: bool,
-) -> Iterator[tuple[int, object]]:
-    root = root.resolve(strict=True)
+) -> Iterator[ControllerRunArtifacts]:
+    root = canonical_controller_repository_root(root)
     run_dir = resolve_managed_goal_run_dir(root, run_dir)
-    root_fd = os.open(root, secure_directory_open_flags())
-    planner_fd = -1
-    runs_fd = -1
-    run_fd = -1
-    created_run = False
     try:
-        root_mount_resolution = resolve_mount_identity(root_fd, reconcile=True)
-        require_mount_assurance(
-            root_mount_resolution,
-            NON_DESTRUCTIVE_ARTIFACT_PACKAGE_CREATION,
-        )
-        require_goal_same_mount(root_mount_resolution, root_fd, ".")
-        root_metadata = os.fstat(root_fd)
-        planner_fd, planner_metadata, _ = open_or_create_child_directory(
-            root_fd,
-            "Planner-docs",
+        with open_goal_run_artifacts(
+            root,
+            run_dir,
             create=create,
-        )
-        require_goal_same_mount(root_mount_resolution, planner_fd, "Planner-docs")
-        runs_fd, runs_metadata, _ = open_or_create_child_directory(
-            planner_fd,
-            "Goal-Runs",
-            create=create,
-        )
-        require_goal_same_mount(
-            root_mount_resolution,
-            runs_fd,
-            GOAL_RUNS_RELATIVE_DIR.as_posix(),
-        )
-        try:
-            existing_metadata = os.stat(run_dir.name, dir_fd=runs_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            existing_metadata = None
-        if existing_metadata is not None and not allow_existing:
-            raise ValueError(f"goal_run_already_exists={run_dir.relative_to(root).as_posix()}")
-        if existing_metadata is None:
-            if not create:
-                raise ValueError(f"goal_run_missing={run_dir.relative_to(root).as_posix()}")
-            os.mkdir(run_dir.name, mode=0o700, dir_fd=runs_fd)
-            created_run = True
-        run_fd, run_metadata = open_child_directory(runs_fd, run_dir.name)
-        run_relative_path = run_dir.relative_to(root).as_posix()
-        require_goal_same_mount(root_mount_resolution, run_fd, run_relative_path)
-
-        def revalidate() -> bool:
-            try:
-                current_root_metadata = os.stat(root, follow_symlinks=False)
-                require_mount_assurance(
-                    root_mount_resolution,
-                    NON_DESTRUCTIVE_ARTIFACT_PACKAGE_CREATION,
-                )
-                require_same_mount(root_mount_resolution, root_fd, ".")
-                require_same_mount(root_mount_resolution, planner_fd, "Planner-docs")
-                require_same_mount(
-                    root_mount_resolution,
-                    runs_fd,
-                    GOAL_RUNS_RELATIVE_DIR.as_posix(),
-                )
-                require_same_mount(root_mount_resolution, run_fd, run_relative_path)
-            except (OSError, TypeError, ValueError):
-                return False
-            return (
-                current_root_metadata.st_dev == root_metadata.st_dev
-                and current_root_metadata.st_ino == root_metadata.st_ino
-                and directory_entry_matches(root_fd, "Planner-docs", planner_metadata)
-                and directory_entry_matches(planner_fd, "Goal-Runs", runs_metadata)
-                and directory_entry_matches(runs_fd, run_dir.name, run_metadata)
-            )
-
-        if not revalidate():
-            raise ValueError("invalid_goal_output_dir=directory_identity_changed")
-        yield run_fd, revalidate
-    except Exception:
-        if created_run and run_fd < 0:
-            try:
-                os.rmdir(run_dir.name, dir_fd=runs_fd)
-            except OSError:
-                pass
-        raise
-    finally:
-        if run_fd >= 0:
-            os.close(run_fd)
-        if runs_fd >= 0:
-            os.close(runs_fd)
-        if planner_fd >= 0:
-            os.close(planner_fd)
-        os.close(root_fd)
+            allow_existing=allow_existing,
+            name_pattern=GOAL_RUN_DIRECTORY_RE.pattern,
+        ) as artifacts:
+            yield artifacts
+    except FileExistsError:
+        raise ValueError(f"goal_run_already_exists={run_dir.name}") from None
+    except FileNotFoundError:
+        raise ValueError(f"goal_run_missing={run_dir.name}") from None
 
 
 def safe_rel_path(value: str) -> bool:
@@ -383,14 +469,22 @@ def selected_step4_subplan_paths(active_scope: dict[str, object] | None) -> set[
     return selected
 
 
-def step4_unselected_subplan_paths(root: Path, active_scope: dict[str, object] | None) -> set[str]:
+def step4_unselected_subplan_paths(
+    root: Path,
+    active_scope: dict[str, object] | None,
+    repository: RepositoryIO | None = None,
+) -> set[str]:
     selected = selected_step4_subplan_paths(active_scope)
     if not selected:
         return set()
-    planner = root / "Planner-docs"
-    if not planner.is_dir():
-        return set()
-    all_subplans = {repo_relative(root, path) for path in planner.glob("Faz-*-Plans/*.md") if path.is_file()}
+    if repository is None:
+        with open_repository_io(root) as opened:
+            return step4_unselected_subplan_paths(root, active_scope, opened)
+    all_subplans = {
+        path
+        for path in controller_regular_paths(repository, "step3")
+        if re.fullmatch(r"Planner-docs/Faz-\d+-Plans/Faz\d+\.\d+-[a-z0-9-]+\.md", path)
+    }
     return all_subplans - selected
 
 
@@ -399,30 +493,32 @@ def collect_sources(
     stage: str,
     active_scope: dict[str, object] | None = None,
     git_evidence: dict[str, object] | None = None,
+    repository: RepositoryIO | None = None,
 ) -> list[dict[str, str]]:
+    if repository is None:
+        with open_repository_io(root) as opened:
+            return collect_sources(root, stage, active_scope, git_evidence, opened)
     sources: list[dict[str, str]] = []
     for rel in STAGE_REFERENCES[stage]:
-        path = SKILL_ROOT / rel
-        data = path.read_bytes()
+        data = read_skill_bytes(rel)
         sources.append({"scope": "skill", "path": rel, "sha256": sha256_bytes(data)})
 
     for rel in IMMUTABLE_PLANNER_DOCS_BY_STAGE[stage]:
-        path = root / rel
-        if path.is_file():
-            data = path.read_bytes()
-            sources.append({"scope": "repo", "path": rel, "sha256": sha256_bytes(data)})
+        evidence = controller_read_bytes(repository, rel, required=False)
+        if evidence.exists:
+            sources.append({"scope": "repo", "path": rel, "sha256": str(evidence.receipt.sha256)})
 
     if stage in {"step3", "step4"}:
         selected_step4_paths = selected_step4_subplan_paths(active_scope) if stage == "step4" else set()
-        planner = root / "Planner-docs"
-        for path in sorted(planner.glob("Faz-*-Plans/*.md")) if planner.is_dir() else []:
-            rel_path = repo_relative(root, path)
+        for rel_path in controller_regular_paths(repository, "step3"):
+            if re.fullmatch(r"Planner-docs/Faz-\d+-Plans/Faz\d+\.\d+-[a-z0-9-]+\.md", rel_path) is None:
+                continue
             if stage == "step4" and selected_step4_paths and rel_path not in selected_step4_paths:
                 continue
-            data = path.read_bytes()
-            sources.append({"scope": "repo", "path": rel_path, "sha256": sha256_bytes(data)})
+            evidence = controller_read_bytes(repository, rel_path, required=True)
+            sources.append({"scope": "repo", "path": rel_path, "sha256": str(evidence.receipt.sha256)})
 
-    evidence = git_evidence or capture_git_workspace_evidence(root)
+    evidence = git_evidence or repository_workspace_evidence(root, repository)
     branch = str(evidence.get("branch") or "unknown")
     commit = str(evidence.get("head") or "unknown")
     sources.append({"scope": "git", "path": "branch", "sha256": sha256_bytes(branch.encode("utf-8")), "value": branch})
@@ -455,7 +551,14 @@ def mutable_output_matches(rel_path: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatch(rel_path, pattern) for pattern in patterns)
 
 
-def mutable_output_baseline(root: Path, patterns: list[str]) -> dict[str, object]:
+def mutable_output_baseline(
+    root: Path,
+    patterns: list[str],
+    repository: RepositoryIO | None = None,
+) -> dict[str, object]:
+    if repository is None:
+        with open_repository_io(root) as opened:
+            return mutable_output_baseline(root, patterns, opened)
     seen: set[str] = set()
     duplicates: list[str] = []
     for pattern in patterns:
@@ -463,18 +566,20 @@ def mutable_output_baseline(root: Path, patterns: list[str]) -> dict[str, object
             duplicates.append(pattern)
         seen.add(pattern)
     files: list[dict[str, object]] = []
+    intake_paths = controller_regular_paths(repository, "intake")
     for pattern in patterns:
         if any(char in pattern for char in "*?[]"):
-            matches = sorted(root.glob(pattern))
+            matches = [path for path in intake_paths if fnmatch.fnmatch(path, pattern)]
         else:
-            matches = [root / pattern]
+            matches = [pattern]
         for path in matches:
-            if path.is_file():
+            evidence = controller_read_bytes(repository, path, required=False)
+            if evidence.exists:
                 files.append(
                     {
-                        "path": repo_relative(root, path),
+                        "path": path,
                         "exists": True,
-                        "sha256": sha256_bytes(path.read_bytes()),
+                        "sha256": evidence.receipt.sha256,
                     }
                 )
             elif not any(char in pattern for char in "*?[]"):
@@ -486,6 +591,8 @@ def workspace_path_excluded(rel_path: str, mutable_patterns: list[str], excluded
     if excluded_paths and rel_path in excluded_paths:
         return True
     if rel_path in WORKSPACE_BASELINE_EXCLUDED_NAMES:
+        return True
+    if any(part in WORKSPACE_BASELINE_PRUNED_DIRS for part in Path(rel_path).parts):
         return True
     if any(rel_path == prefix.rstrip("/") or rel_path.startswith(prefix) for prefix in WORKSPACE_BASELINE_EXCLUDED_PREFIXES):
         return True
@@ -503,21 +610,10 @@ def workspace_inventory_with_exclusions(
     mutable_patterns: list[str],
     excluded_paths: set[str],
     git_evidence: dict[str, object] | None = None,
+    repository: RepositoryIO | None = None,
 ) -> list[str]:
     entries: list[str] = []
-    evidence = git_evidence or capture_git_workspace_evidence(
-        root,
-        exclude_untracked=lambda path: workspace_path_excluded(
-            path,
-            mutable_patterns,
-            excluded_paths,
-        ),
-        exclude_tracked=lambda path: workspace_path_excluded(
-            path,
-            mutable_patterns,
-            excluded_paths,
-        ),
-    )
+    evidence = git_evidence or repository_workspace_evidence(root, repository)
     if evidence.get("is_git") is True:
         raw_worktree = evidence.get("worktree_entries")
         raw_untracked = evidence.get("untracked_entries")
@@ -544,7 +640,20 @@ def workspace_inventory_with_exclusions(
             or workspace_path_excluded(rel_path, mutable_patterns, excluded_paths)
         )
 
-    inventory = snapshot_repository_inventory(root, exclude=excluded_from_inventory)
+    if repository is None:
+        with open_repository_io(root) as opened:
+            return workspace_inventory_with_exclusions(
+                root,
+                mutable_patterns,
+                excluded_paths,
+                git_evidence,
+                opened,
+            )
+    inventory = [
+        item
+        for item in controller_inventory(repository, "intake")
+        if not excluded_from_inventory(str(item.get("path", "")))
+    ]
     return [
         f"{item['path']}\0{item['fingerprint_sha256']}"
         for item in inventory
@@ -557,24 +666,19 @@ def workspace_baseline(
     mutable_patterns: list[str],
     excluded_paths: set[str] | None = None,
     git_evidence: dict[str, object] | None = None,
+    repository: RepositoryIO | None = None,
 ) -> dict[str, object]:
     excluded = excluded_paths or set()
-    evidence = git_evidence or capture_git_workspace_evidence(
-        root,
-        exclude_untracked=lambda path: workspace_path_excluded(
-            path,
-            mutable_patterns,
-            excluded,
-        ),
-        exclude_tracked=lambda path: workspace_path_excluded(
-            path,
-            mutable_patterns,
-            excluded,
-        ),
-    )
+    evidence = git_evidence or repository_workspace_evidence(root, repository)
     branch = str(evidence.get("branch") or "unknown")
     commit = str(evidence.get("head") or "unknown")
-    inventory = workspace_inventory_with_exclusions(root, mutable_patterns, excluded, evidence)
+    inventory = workspace_inventory_with_exclusions(
+        root,
+        mutable_patterns,
+        excluded,
+        evidence,
+        repository,
+    )
     staged_changes = [
         item
         for item in evidence.get("staged_changes", [])
@@ -603,9 +707,9 @@ def workspace_baseline(
     return {
         "branch": branch,
         "base_commit": commit,
-        "staged_diff_hash": canonical_git_evidence_digest(staged_changes),
-        "unstaged_diff_hash": canonical_git_evidence_digest(unstaged_changes),
-        "untracked_inventory_hash": canonical_git_evidence_digest(untracked_entries),
+        "staged_diff_hash": controller_evidence_digest(staged_changes),
+        "unstaged_diff_hash": controller_evidence_digest(unstaged_changes),
+        "untracked_inventory_hash": controller_evidence_digest(untracked_entries),
         "workspace_inventory_sha256": sha256_bytes("\n".join(inventory).encode("utf-8")),
         "workspace_inventory_count": len(inventory),
         "excluded_paths": sorted(excluded),
@@ -622,20 +726,22 @@ def stage_snapshot(
     goal_spec_digest_value: str,
     baseline_excluded_paths: set[str] | None = None,
     git_evidence: dict[str, object] | None = None,
+    repository: RepositoryIO | None = None,
 ) -> dict[str, object]:
-    evidence = git_evidence or capture_git_workspace_evidence(root)
+    evidence = git_evidence or repository_workspace_evidence(root, repository)
     return {
         "stage": stage,
         "branch": str(evidence.get("branch") or "unknown"),
         "base_commit": str(evidence.get("head") or "unknown"),
         "immutable_inputs": sources,
         "immutable_input_digest": snapshot_digest(stage, sources),
-        "mutable_outputs": mutable_output_baseline(root, mutable_patterns),
+        "mutable_outputs": mutable_output_baseline(root, mutable_patterns, repository),
         "workspace_baseline": workspace_baseline(
             root,
             mutable_patterns,
             baseline_excluded_paths,
             evidence,
+            repository,
         ),
         "template_bundle_digest": template_bundle_digest,
         "compiler_version": GOAL_COMPILER_VERSION,
@@ -655,12 +761,11 @@ def run_id_for(stage: str, sources: list[dict[str, str]]) -> str:
 def template_bundle(stage: str) -> dict[str, object]:
     templates = []
     for rel in STAGE_REFERENCES[stage]:
-        path = SKILL_ROOT / rel
-        templates.append({"path": rel, "sha256": sha256_bytes(path.read_bytes())})
+        templates.append({"path": rel, "sha256": sha256_bytes(read_skill_bytes(rel))})
     compiler = {
         "path": "scripts/goal_run.py",
         "version": GOAL_COMPILER_VERSION,
-        "sha256": sha256_bytes(SCRIPT_PATH.read_bytes()),
+        "sha256": sha256_bytes(read_skill_bytes("scripts/goal_run.py")),
     }
     payload = {"templates": templates, "compiler": compiler}
     digest = sha256_bytes(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
@@ -711,7 +816,7 @@ def goal_policy_digest(stage: str, sources: list[dict[str, str]], mode: str, act
 
 
 def invocation_suffix(value: str | None = None) -> str:
-    raw = value or f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-{os.getpid()}"
+    raw = value or f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-{controller_process_id()}"
     if has_secret_like(raw):
         raise ValueError("secret_like_run_id_suffix")
     suffix = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-._")
@@ -725,20 +830,11 @@ def goal_run_id_for(stage: str, spec_digest: str, run_id_suffix: str | None = No
 
 
 def run_bundled_validator(root: Path, mode: str, *, strict: bool = True) -> tuple[int, str]:
-    command = [sys.executable, VALIDATOR_PATH.as_posix(), "--root", root.as_posix(), "--mode", mode]
-    if strict:
-        command.append("--strict")
-    try:
-        completed = subprocess.run(
-            command,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return 1, f"validator_unavailable={type(exc).__name__}"
-    return completed.returncode, f"{completed.stdout}\n{completed.stderr}".strip()
+    return run_goal_planner_validator(
+        root=root,
+        mode=mode,
+        strict=strict,
+    )
 
 
 def stage_validator_mode(stage: str) -> str:
@@ -750,22 +846,32 @@ def stage_validator_mode(stage: str) -> str:
     }[stage]
 
 
-def stage_prerequisite_blockers(root: Path, stage: str) -> list[str]:
-    docs = root / "Planner-docs"
+def stage_prerequisite_blockers(
+    root: Path,
+    stage: str,
+    repository: RepositoryIO | None = None,
+) -> list[str]:
+    if repository is None:
+        with open_repository_io(root) as opened:
+            return stage_prerequisite_blockers(root, stage, opened)
     blockers: list[str] = []
-    if stage in {"step15", "step2"} and not (docs / "Main-Planing.md").is_file():
+    if stage in {"step15", "step2"} and controller_path_kind(repository, "Planner-docs/Main-Planing.md") != "regular":
         blockers.append("missing_prerequisite=Planner-docs/Main-Planing.md")
     if stage == "step3":
-        if not (docs / "Sub-Planing-Index.md").is_file():
+        if controller_path_kind(repository, "Planner-docs/Sub-Planing-Index.md") != "regular":
             blockers.append("missing_prerequisite=Planner-docs/Sub-Planing-Index.md")
-        if not any(docs.glob("Faz-*-Plans/Faz*.md")):
+        if not any(
+            re.fullmatch(r"Planner-docs/Faz-\d+-Plans/Faz\d+\.\d+-[a-z0-9-]+\.md", path)
+            for path in controller_regular_paths(repository, "step3")
+        ):
             blockers.append("missing_prerequisite=active_subplans")
     if stage == "step4":
-        audit = docs / "Sub-Planing-Audit.md"
-        if not audit.is_file():
+        audit_path = "Planner-docs/Sub-Planing-Audit.md"
+        audit = repository.read_text(audit_path, required=False, audience="internal")
+        if not audit.exists:
             blockers.append("missing_prerequisite=Planner-docs/Sub-Planing-Audit.md")
         else:
-            text = audit.read_text(encoding="utf-8", errors="replace")
+            text = audit.text or ""
             if "READY" not in text and "NO_ACTION_REQUIRED" not in text:
                 blockers.append("missing_prerequisite=step4_ready_queue_or_no_action")
     if blockers:
@@ -778,21 +884,25 @@ def stage_prerequisite_blockers(root: Path, stage: str) -> list[str]:
     return blockers
 
 
-def project_name(root: Path) -> str:
-    main = root / "Planner-docs" / "Main-Planing.md"
-    if main.is_file():
-        text = main.read_text(encoding="utf-8", errors="replace")
+def project_name(root: Path, repository: RepositoryIO | None = None) -> str:
+    text = repository_model_text(
+        root,
+        "Planner-docs/Main-Planing.md",
+        repository=repository,
+    )
+    if text is not None:
         match = re.search(r"Project\s+Name\s*[:|-]\s*(.+)", text, flags=re.IGNORECASE)
         if match:
             return match.group(1).strip()[:120]
-    return root.name
+    fallback = root.name[:120]
+    try:
+        assert_safe_persistent_text(fallback)
+    except ValueError:
+        return "Unnamed Project"
+    return fallback if fallback and not has_secret_like(fallback) else "Unnamed Project"
 
 
-def extract_ready_queue(root: Path) -> list[dict[str, str]]:
-    audit = root / "Planner-docs" / "Sub-Planing-Audit.md"
-    if not audit.is_file():
-        return []
-    text = audit.read_text(encoding="utf-8", errors="replace")
+def _parse_ready_queue(text: str) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for match in re.finditer(
@@ -827,6 +937,40 @@ def extract_ready_queue(root: Path) -> list[dict[str, str]]:
     return items
 
 
+def extract_ready_queue(
+    root: Path,
+    repository: RepositoryIO | None = None,
+) -> list[dict[str, str]]:
+    path = "Planner-docs/Sub-Planing-Audit.md"
+    authoritative_text = repository_internal_text(
+        root,
+        path,
+        repository=repository,
+    )
+    projected_text = repository_model_text(
+        root,
+        path,
+        repository=repository,
+    )
+    if authoritative_text is None and projected_text is None:
+        return []
+    if authoritative_text is None or projected_text is None:
+        raise ValueError("repository_model_projection_identity_mismatch")
+    authoritative = _parse_ready_queue(authoritative_text)
+    projected = _parse_ready_queue(projected_text)
+    authority_keys = [
+        (item["readiness_status"], item["subplan_path"])
+        for item in authoritative
+    ]
+    projected_keys = [
+        (item["readiness_status"], item["subplan_path"])
+        for item in projected
+    ]
+    if authority_keys != projected_keys:
+        raise ValueError("repository_model_projection_semantic_mismatch")
+    return projected
+
+
 def extract_contract_signals(text: str) -> dict[str, list[str]]:
     patterns = {
         "acceptance_criteria": r"(?:acceptance|behavior|mp-ph\d+-as-\d+)",
@@ -851,8 +995,12 @@ def extract_contract_signals(text: str) -> dict[str, list[str]]:
     return signals
 
 
-def extract_implementation_contract(root: Path, subplan_path: str) -> dict[str, object]:
-    binding = implementation_contract_source_binding(root, subplan_path)
+def extract_implementation_contract(
+    root: Path,
+    subplan_path: str,
+    repository: RepositoryIO | None = None,
+) -> dict[str, object]:
+    binding = repository_contract_binding(root, subplan_path, repository=repository)
     contract = binding.get("implementation_contract")
     return contract if isinstance(contract, dict) else {}
 
@@ -867,18 +1015,22 @@ def implementation_contract_digest(implementation_contract: dict[str, object]) -
     return canonical_json_digest(implementation_contract)
 
 
-def subplan_scope_item(root: Path, subplan_path: str) -> dict[str, object]:
-    path = root / subplan_path
-    text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+def subplan_scope_item(
+    root: Path,
+    subplan_path: str,
+    repository: RepositoryIO | None = None,
+) -> dict[str, object]:
+    text_value = repository_model_text(root, subplan_path, repository=repository)
+    text = text_value or ""
     contract = extract_contract_signals(text)
-    binding = implementation_contract_source_binding(root, subplan_path)
+    binding = repository_contract_binding(root, subplan_path, repository=repository)
     implementation_contract = binding.get("implementation_contract")
     implementation_contract = implementation_contract if isinstance(implementation_contract, dict) else {}
     item: dict[str, object] = {
         "subplan_path": subplan_path,
         "source_subplan_path": subplan_path,
-        "subplan_sha256": binding.get("source_subplan_sha256") if path.is_file() else None,
-        "source_subplan_sha256": binding.get("source_subplan_sha256") if path.is_file() else None,
+        "subplan_sha256": binding.get("source_subplan_sha256") if text_value is not None else None,
+        "source_subplan_sha256": binding.get("source_subplan_sha256") if text_value is not None else None,
         "contract_signals": contract,
         "implementation_contract": implementation_contract,
         "implementation_contract_digest": binding.get("implementation_contract_digest"),
@@ -902,8 +1054,12 @@ def subplan_scope_item(root: Path, subplan_path: str) -> dict[str, object]:
     return item
 
 
-def collect_subplan_scope(root: Path, subplans: list[str]) -> list[dict[str, object]]:
-    return [subplan_scope_item(root, path) for path in subplans]
+def collect_subplan_scope(
+    root: Path,
+    subplans: list[str],
+    repository: RepositoryIO | None = None,
+) -> list[dict[str, object]]:
+    return [subplan_scope_item(root, path, repository) for path in subplans]
 
 
 def markdown_section(text: str, section_number: int, title: str) -> str:
@@ -940,9 +1096,18 @@ def active_phases_from_notes(notes: str, detected_phases: list[int]) -> list[int
     return [phase for phase in detected_phases if phase in set(detected_phases[:3]) and phase in detected]
 
 
-def collect_step2_planning_horizon(root: Path, mode: str, existing_subplan_count: int) -> dict[str, object]:
-    main = root / "Planner-docs" / "Main-Planing.md"
-    if not main.is_file():
+def collect_step2_planning_horizon(
+    root: Path,
+    mode: str,
+    existing_subplan_count: int,
+    repository: RepositoryIO | None = None,
+) -> dict[str, object]:
+    text = repository_model_text(
+        root,
+        "Planner-docs/Main-Planing.md",
+        repository=repository,
+    )
+    if text is None:
         return {
             "planning_mode": mode,
             "detected_phases": [],
@@ -958,7 +1123,6 @@ def collect_step2_planning_horizon(root: Path, mode: str, existing_subplan_count
             "framework_ownership_required": False,
             "algorithmic_invariants_required": False,
         }
-    text = main.read_text(encoding="utf-8", errors="replace")
     roadmap = markdown_section(text, 6, "Phase-Based Master Roadmap")
     next_steps = markdown_section(text, 8, "Prioritized Next Steps")
     prep_notes = markdown_section(text, 9, "Step 2 Preparation Notes")
@@ -1027,31 +1191,47 @@ def collect_step2_planning_horizon(root: Path, mode: str, existing_subplan_count
     }
 
 
-def collect_stage_scope(root: Path, stage: str, mode: str) -> dict[str, object]:
-    docs = root / "Planner-docs"
+def collect_stage_scope(
+    root: Path,
+    stage: str,
+    mode: str,
+    repository: RepositoryIO | None = None,
+) -> dict[str, object]:
+    if repository is None:
+        with open_repository_io(root) as opened:
+            return collect_stage_scope(root, stage, mode, opened)
     subplans = [
-        repo_relative(root, path)
-        for path in sorted(docs.glob("Faz-*-Plans/Faz*.md"))
-        if path.is_file()
-    ] if docs.is_dir() else []
+        path
+        for path in controller_regular_paths(repository, "step3")
+        if re.fullmatch(r"Planner-docs/Faz-\d+-Plans/Faz\d+\.\d+-[a-z0-9-]+\.md", path)
+    ]
     scope: dict[str, object] = {"stage": stage, "project_root": "."}
     if stage in {"step2", "step3"}:
         scope["detailed_subplans"] = subplans
-        scope["subplan_contracts"] = collect_subplan_scope(root, subplans)
+        scope["subplan_contracts"] = collect_subplan_scope(root, subplans, repository)
         scope["subplan_count"] = len(subplans)
-        scope["index_path"] = "Planner-docs/Sub-Planing-Index.md" if (docs / "Sub-Planing-Index.md").is_file() else None
+        scope["index_path"] = (
+            "Planner-docs/Sub-Planing-Index.md"
+            if controller_path_kind(repository, "Planner-docs/Sub-Planing-Index.md") == "regular"
+            else None
+        )
     if stage == "step2":
-        scope["planning_horizon"] = collect_step2_planning_horizon(root, mode, len(subplans))
+        scope["planning_horizon"] = collect_step2_planning_horizon(root, mode, len(subplans), repository)
     if stage == "step4":
-        ready_queue = extract_ready_queue(root)
+        ready_queue = extract_ready_queue(root, repository)
         enriched_queue: list[dict[str, object]] = []
         for item in ready_queue:
             enriched = dict(item)
-            enriched.update(subplan_scope_item(root, item["subplan_path"]))
+            enriched.update(subplan_scope_item(root, item["subplan_path"], repository))
             enriched_queue.append(enriched)
         scope["ready_queue"] = enriched_queue
         scope["ready_count"] = len(ready_queue)
-        scope["no_action_required"] = bool((docs / "Sub-Planing-Audit.md").is_file() and "NO_ACTION_REQUIRED" in (docs / "Sub-Planing-Audit.md").read_text(encoding="utf-8", errors="replace"))
+        audit_text = repository_model_text(
+            root,
+            "Planner-docs/Sub-Planing-Audit.md",
+            repository=repository,
+        )
+        scope["no_action_required"] = bool(audit_text and "NO_ACTION_REQUIRED" in audit_text)
     return scope
 
 
@@ -1135,6 +1315,9 @@ def validation_checkpoints_for(stage: str) -> list[dict[str, object]]:
             "id": f"VAL-{index:02d}",
             "argv": [
                 "python3",
+                "-I",
+                "-S",
+                "-B",
                 "plugins/codexqb/skills/codexqb/scripts/validate_planner_docs.py",
                 "--root",
                 ".",
@@ -1157,6 +1340,9 @@ def checkpoint_is_safe(checkpoint: object) -> bool:
         return False
     expected_prefix = [
         "python3",
+        "-I",
+        "-S",
+        "-B",
         "plugins/codexqb/skills/codexqb/scripts/validate_planner_docs.py",
         "--root",
         ".",
@@ -1295,6 +1481,7 @@ def _validate_goal_scope_source_items(
     errors: list[str],
     *,
     mutable_source_baseline: dict[str, str] | None = None,
+    repository: RepositoryIO | None = None,
 ) -> None:
     if items is None:
         return
@@ -1314,7 +1501,7 @@ def _validate_goal_scope_source_items(
         subplan_path = item.get("subplan_path")
         if isinstance(subplan_path, str) and subplan_path != source_path:
             errors.append(f"subplan_source_path_mismatch={source_path}")
-        binding = implementation_contract_source_binding(root, source_path)
+        binding = repository_contract_binding(root, source_path, repository=repository)
         baseline_sha256 = mutable_source_baseline.get(source_path)
         live_sha256 = binding.get("source_subplan_sha256")
         mutable_source_changed = (
@@ -1357,7 +1544,12 @@ def _validate_goal_scope_source_items(
             errors.append(f"risk_domains_source_mismatch={source_path}")
 
 
-def validate_goal_scope_source_bindings(root: Path, run: dict[str, object], errors: list[str]) -> None:
+def validate_goal_scope_source_bindings(
+    root: Path,
+    run: dict[str, object],
+    errors: list[str],
+    repository: RepositoryIO | None = None,
+) -> None:
     active_scope = run.get("active_scope")
     if not isinstance(active_scope, dict):
         errors.append("invalid_active_scope")
@@ -1384,11 +1576,23 @@ def validate_goal_scope_source_bindings(root: Path, run: dict[str, object], erro
         active_scope.get("subplan_contracts"),
         errors,
         mutable_source_baseline=mutable_source_baseline,
+        repository=repository,
     )
-    _validate_goal_scope_source_items(root, "ready_queue", active_scope.get("ready_queue"), errors)
+    _validate_goal_scope_source_items(
+        root,
+        "ready_queue",
+        active_scope.get("ready_queue"),
+        errors,
+        repository=repository,
+    )
 
 
-def validate_stage_snapshot(root: Path, run: dict[str, object], errors: list[str]) -> None:
+def validate_stage_snapshot(
+    root: Path,
+    run: dict[str, object],
+    errors: list[str],
+    repository: RepositoryIO | None = None,
+) -> None:
     stage = str(run.get("stage", ""))
     snapshot = run.get("stage_snapshot")
     active_scope = run.get("active_scope") if isinstance(run.get("active_scope"), dict) else {}
@@ -1427,7 +1631,13 @@ def validate_stage_snapshot(root: Path, run: dict[str, object], errors: list[str
             if not isinstance(item, dict):
                 continue
             path = item.get("path")
-            if item.get("exists") is True and isinstance(path, str) and not (root / path).is_file():
+            if (
+                item.get("exists") is True
+                and isinstance(path, str)
+                and (
+                    controller_path_kind(repository, path) if repository is not None else _repository_path_kind(root, path)
+                ) != "regular"
+            ):
                 errors.append(f"mutable_output_removed={path}")
 
     baseline = snapshot.get("workspace_baseline")
@@ -1437,7 +1647,8 @@ def validate_stage_snapshot(root: Path, run: dict[str, object], errors: list[str
     current = workspace_baseline(
         root,
         mutable_patterns,
-        step4_unselected_subplan_paths(root, active_scope) if stage == "step4" else set(),
+        step4_unselected_subplan_paths(root, active_scope, repository) if stage == "step4" else set(),
+        repository=repository,
     )
     for key in (
         "branch",
@@ -1493,30 +1704,29 @@ def default_goal_run(
     mode: str | None = None,
     objective: str | None = None,
     run_id_suffix: str | None = None,
+    repository: RepositoryIO | None = None,
 ) -> dict[str, object]:
+    if repository is None:
+        with open_repository_io(root) as opened:
+            return default_goal_run(
+                canonical_repository_root(opened),
+                stage,
+                mode,
+                objective,
+                run_id_suffix,
+                opened,
+            )
     selected_mode = mode or ("subagent_serial" if stage == "step4" else "wave")
     selected_objective = objective or f"Run CodexQB {stage} using current repository planning evidence."
-    active_scope = collect_stage_scope(root, stage, selected_mode)
+    active_scope = collect_stage_scope(root, stage, selected_mode, repository)
     mutable_patterns = goal_mutable_output_patterns(stage, active_scope)
     baseline_excluded_paths = (
-        step4_unselected_subplan_paths(root, active_scope)
+        step4_unselected_subplan_paths(root, active_scope, repository)
         if stage == "step4"
         else set()
     )
-    git_evidence = capture_git_workspace_evidence(
-        root,
-        exclude_untracked=lambda path: workspace_path_excluded(
-            path,
-            mutable_patterns,
-            baseline_excluded_paths,
-        ),
-        exclude_tracked=lambda path: workspace_path_excluded(
-            path,
-            mutable_patterns,
-            baseline_excluded_paths,
-        ),
-    )
-    sources = collect_sources(root, stage, active_scope, git_evidence)
+    git_evidence = repository_workspace_evidence(root, repository)
+    sources = collect_sources(root, stage, active_scope, git_evidence, repository)
     digest = snapshot_digest(stage, sources)
     subagent_plan = build_subagent_plan(stage, selected_mode, active_scope)
     spec_digest = goal_spec_digest(stage, sources, selected_mode, selected_objective, active_scope)
@@ -1533,6 +1743,7 @@ def default_goal_run(
         goal_spec_digest_value=spec_digest,
         baseline_excluded_paths=baseline_excluded_paths,
         git_evidence=git_evidence,
+        repository=repository,
     )
     suffix = invocation_suffix(run_id_suffix)
     run_id = goal_run_id_for(stage, spec_digest, suffix)
@@ -1552,7 +1763,7 @@ def default_goal_run(
         "template_bundle": bundle["templates"],
         "template_bundle_digest": bundle["digest"],
         "compiler": bundle["compiler"],
-        "project_name": project_name(root),
+        "project_name": project_name(root, repository),
         "mode": selected_mode,
         "objective": selected_objective,
         "source_snapshot": sources,
@@ -1576,7 +1787,17 @@ def default_goal_run(
     }
 
 
-def validate_goal_run(root: Path, run: dict[str, object]) -> list[str]:
+def validate_goal_run(
+    root: Path,
+    run: dict[str, object],
+    repository: RepositoryIO | None = None,
+) -> list[str]:
+    if repository is None:
+        try:
+            with open_repository_io(root) as opened:
+                return validate_goal_run(canonical_repository_root(opened), run, opened)
+        except (OSError, TypeError, ValueError) as exc:
+            return [f"repository_io_failed={str(exc).split('=', 1)[0]}"]
     errors: list[str] = []
     stage = str(run.get("stage", ""))
     if stage not in STAGE_REFERENCES:
@@ -1640,8 +1861,8 @@ def validate_goal_run(root: Path, run: dict[str, object]) -> list[str]:
     expected_run_id = f"goal-{stage}-{spec_digest[:12]}-{invocation}" if invocation else ""
     if run.get("goal_run_id") != expected_run_id:
         errors.append("stored_goal_run_id_mismatch")
-    validate_goal_scope_source_bindings(root, run, errors)
-    validate_stage_snapshot(root, run, errors)
+    validate_goal_scope_source_bindings(root, run, errors, repository)
+    validate_stage_snapshot(root, run, errors, repository)
     text = json.dumps(run, sort_keys=True)
     if has_secret_like(text):
         errors.append("secret_like_content")
@@ -1668,6 +1889,7 @@ def validate_goal_run(root: Path, run: dict[str, object]) -> list[str]:
         root,
         stage,
         run.get("active_scope", {}) if isinstance(run.get("active_scope"), dict) else {},
+        repository=repository,
     )
     current_digest = snapshot_digest(stage, current_sources)
     if run.get("source_snapshot_digest") != current_digest:
@@ -1677,11 +1899,11 @@ def validate_goal_run(root: Path, run: dict[str, object]) -> list[str]:
 
 def render_prompt_from_run(run: dict[str, object]) -> str:
     stage = str(run["stage"])
-    spec = read_text(SKILL_ROOT / f"references/goal-specs/{stage}.md")
+    spec = read_skill_text(f"references/goal-specs/{stage}.md")
     handoff = ""
     for rel in STAGE_REFERENCES[stage]:
         if "/handoffs/" in rel:
-            handoff = read_text(SKILL_ROOT / rel)
+            handoff = read_skill_text(rel)
             break
 
     preview = [
@@ -1741,15 +1963,24 @@ def compile_goal(
     run_id_suffix: str | None = None,
 ) -> dict[str, object]:
     lexical_root = lexical_absolute(root)
-    root = root.resolve(strict=True)
     if stage not in STAGE_REFERENCES:
         raise ValueError(f"unsupported stage: {stage}")
     if resume and output_dir is None:
         raise ValueError("resume_requires_output_dir")
-    run = default_goal_run(root, stage, mode, objective, run_id_suffix)
-    errors = validate_goal_run(root, run)
-    if errors:
-        raise ValueError(";".join(errors))
+    with open_repository_io(root) as repository:
+        root = canonical_repository_root(repository)
+        run = default_goal_run(
+            root,
+            stage,
+            mode,
+            objective,
+            run_id_suffix,
+            repository,
+        )
+        errors = validate_goal_run(root, run, repository)
+        if errors:
+            raise ValueError(";".join(errors))
+        blockers = stage_prerequisite_blockers(root, stage, repository) if not resume else []
     out_dir = resolve_managed_goal_run_dir(
         root,
         output_dir,
@@ -1761,18 +1992,18 @@ def compile_goal(
         out_dir,
         create=not resume,
         allow_existing=replace or resume,
-    ) as (run_fd, revalidate):
-        with locked_directory(run_fd):
+    ) as artifacts:
+        with artifacts.locked():
             if resume:
                 try:
-                    existing = read_regular_json_at(run_fd, "Goal-Run.json")
+                    existing = artifacts.read_json("Goal-Run.json")
                 except FileNotFoundError as exc:
-                    raise ValueError(f"goal_run_resume_missing={out_dir.relative_to(root).as_posix()}") from exc
+                    raise ValueError(f"goal_run_resume_missing={out_dir.name}") from exc
                 existing_errors = validate_goal_run(root, existing)
                 if existing_errors:
                     raise ValueError(";".join(existing_errors))
                 try:
-                    result = read_regular_json_at(run_fd, "Goal-Result.json")
+                    result = artifacts.read_json("Goal-Result.json")
                 except FileNotFoundError:
                     result = {
                         "goal_run_id": existing.get("goal_run_id"),
@@ -1781,10 +2012,9 @@ def compile_goal(
                     }
                 return {"run": existing, "result": result, "output_dir": out_dir.as_posix()}
 
-            blockers = stage_prerequisite_blockers(root, stage)
             run_json = serialize_safe_persistent_json(run)
             for name in ("Goal-Run.json", "Goal-Prompt.md", "Goal-Result.json"):
-                regular_target_metadata_at(run_fd, name)
+                artifacts.has_regular(name)
             if blockers:
                 result = {
                     "goal_run_id": run["goal_run_id"],
@@ -1798,14 +2028,9 @@ def compile_goal(
                     "next_action": "Repair missing prerequisites, then prepare this Goal run again.",
                 }
                 result_json = serialize_safe_persistent_json(result)
-                atomic_write_text_at(run_fd, "Goal-Run.json", run_json, revalidate=revalidate)
-                unlink_regular_at(run_fd, "Goal-Prompt.md", missing_ok=True, revalidate=revalidate)
-                atomic_write_text_at(
-                    run_fd,
-                    "Goal-Result.json",
-                    result_json,
-                    revalidate=revalidate,
-                )
+                artifacts.write_text("Goal-Run.json", run_json)
+                artifacts.remove("Goal-Prompt.md", missing_ok=True)
+                artifacts.write_text("Goal-Result.json", result_json)
                 return {"run": run, "result": result, "output_dir": out_dir.as_posix()}
 
             prompt = assert_safe_persistent_text(render_prompt_from_run(run))
@@ -1821,57 +2046,70 @@ def compile_goal(
                 "next_action": "Review Goal-Prompt.md, then paste it into Goal mode only if the stage and safety policy match the intended run.",
             }
             result_json = serialize_safe_persistent_json(result)
-            atomic_write_text_at(run_fd, "Goal-Run.json", run_json, revalidate=revalidate)
-            atomic_write_text_at(run_fd, "Goal-Prompt.md", prompt, revalidate=revalidate)
-            atomic_write_text_at(
-                run_fd,
-                "Goal-Result.json",
-                result_json,
-                revalidate=revalidate,
-            )
+            artifacts.write_text("Goal-Run.json", run_json)
+            artifacts.write_text("Goal-Prompt.md", prompt)
+            artifacts.write_text("Goal-Result.json", result_json)
             return {"run": run, "result": result, "output_dir": out_dir.as_posix()}
 
 
 def render_goal_file(root: Path, goal_run_path: Path, output: Path | None = None) -> str:
     lexical_root = lexical_absolute(root)
-    root = root.resolve(strict=True)
-    if ".." in goal_run_path.parts:
-        raise ValueError("invalid_goal_run_path=path_traversal_rejected")
-    requested_run_path = goal_run_path if goal_run_path.is_absolute() else root / goal_run_path
-    lexical_run_path = lexical_absolute(requested_run_path)
-    if lexical_run_path.name != "Goal-Run.json":
+    with open_repository_io(root) as repository:
+        root = canonical_repository_root(repository)
+        if ".." in goal_run_path.parts:
+            raise ValueError("invalid_goal_run_path=path_traversal_rejected")
+        requested_run_path = (
+            goal_run_path
+            if goal_run_path.is_absolute()
+            else goal_runs_root(root) / goal_run_path
+        )
+        lexical_run_path = lexical_absolute(requested_run_path)
+        if lexical_run_path.name != "Goal-Run.json":
+            raise ValueError("invalid_goal_run_path=Goal-Run.json_required")
+        run_dir = resolve_managed_goal_run_dir(root, lexical_run_path.parent, lexical_root=lexical_root)
+        with open_managed_goal_run_directory(root, run_dir, create=False, allow_existing=True) as artifacts:
+            with artifacts.locked():
+                run = artifacts.read_json("Goal-Run.json")
+                errors = validate_goal_run(root, run, repository)
+                if errors:
+                    raise ValueError(";".join(errors))
+                prompt = assert_safe_persistent_text(render_prompt_from_run(run))
+                if output:
+                    if ".." in output.parts:
+                        raise ValueError("invalid_goal_render_output=path_traversal_rejected")
+                    requested_output = output if output.is_absolute() else run_dir / output
+                    lexical_output = lexical_absolute(requested_output)
+                    output_run_dir = resolve_managed_goal_run_dir(
+                        root,
+                        lexical_output.parent,
+                        lexical_root=lexical_root,
+                    )
+                    if output_run_dir != run_dir or lexical_output.name != "Goal-Prompt.md":
+                        raise ValueError("invalid_goal_render_output=managed_Goal-Prompt.md_required")
+                    artifacts.has_regular("Goal-Prompt.md")
+                    artifacts.write_text("Goal-Prompt.md", prompt)
+                return prompt
+
+
+def load_goal_run(path: Path, root: Path) -> dict[str, object]:
+    repository_root = canonical_controller_repository_root(root)
+    lexical_path = lexical_absolute(
+        path
+        if path.is_absolute()
+        else goal_runs_root(repository_root) / path
+    )
+    if lexical_path.name != "Goal-Run.json":
         raise ValueError("invalid_goal_run_path=Goal-Run.json_required")
-    run_dir = resolve_managed_goal_run_dir(root, lexical_run_path.parent, lexical_root=lexical_root)
-    with open_managed_goal_run_directory(root, run_dir, create=False, allow_existing=True) as (run_fd, revalidate):
-        with locked_directory(run_fd):
-            run = read_regular_json_at(run_fd, "Goal-Run.json")
-            errors = validate_goal_run(root, run)
-            if errors:
-                raise ValueError(";".join(errors))
-            prompt = assert_safe_persistent_text(render_prompt_from_run(run))
-            if output:
-                if ".." in output.parts:
-                    raise ValueError("invalid_goal_render_output=path_traversal_rejected")
-                requested_output = output if output.is_absolute() else run_dir / output
-                lexical_output = lexical_absolute(requested_output)
-                output_run_dir = resolve_managed_goal_run_dir(
-                    root,
-                    lexical_output.parent,
-                    lexical_root=lexical_root,
-                )
-                if output_run_dir != run_dir or lexical_output.name != "Goal-Prompt.md":
-                    raise ValueError("invalid_goal_render_output=managed_Goal-Prompt.md_required")
-                regular_target_metadata_at(run_fd, "Goal-Prompt.md")
-                atomic_write_text_at(run_fd, "Goal-Prompt.md", prompt, revalidate=revalidate)
-            return prompt
-
-
-def load_goal_run(path: Path) -> dict[str, object]:
-    parent_fd = os.open(path.parent, secure_directory_open_flags())
-    try:
-        return read_regular_json_at(parent_fd, path.name)
-    finally:
-        os.close(parent_fd)
+    run_dir = resolve_managed_goal_run_dir(repository_root, lexical_path.parent)
+    with open_managed_goal_run_directory(
+        repository_root,
+        run_dir,
+        create=False,
+        allow_existing=True,
+    ) as artifacts:
+        if not artifacts.revalidate():
+            raise ValueError("invalid_goal_output_dir=directory_identity_changed")
+        return artifacts.read_json("Goal-Run.json")
 
 
 def print_safe_field(name: str, value: object, *, file=None) -> None:
@@ -1888,7 +2126,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command")
 
     def add_common(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--root", default=".", help="Target repository root.")
+        p.add_argument("--root", required=True, help="Target repository root.")
         p.add_argument("--stage", required=True, choices=sorted(STAGE_REFERENCES), help="Goal stage.")
 
     collect = sub.add_parser("collect", help="Print source snapshot JSON.")
@@ -1902,14 +2140,14 @@ def main(argv: list[str] | None = None) -> int:
     prepare.add_argument("--resume", action="store_true")
     prepare.add_argument("--run-id-suffix")
     validate = sub.add_parser("validate", help="Validate Goal-Run.json against current snapshot.")
-    validate.add_argument("--root", default=".")
+    validate.add_argument("--root", required=True)
     validate.add_argument("--goal-run", required=True)
     render = sub.add_parser("render", help="Render Goal-Prompt.md from Goal-Run.json.")
-    render.add_argument("--root", default=".")
+    render.add_argument("--root", required=True)
     render.add_argument("--goal-run", required=True)
     render.add_argument("--output")
 
-    parser.add_argument("--root", default=".", help=argparse.SUPPRESS)
+    parser.add_argument("--root", help=argparse.SUPPRESS)
     parser.add_argument("--stage", choices=sorted(STAGE_REFERENCES), help=argparse.SUPPRESS)
     parser.add_argument("--output-dir", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -1918,13 +2156,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command is None:
             if not args.stage:
                 parser.error("--stage is required")
+            if not args.root:
+                parser.error("--root is required")
             compiled = compile_goal(Path(args.root), args.stage, Path(args.output_dir) if args.output_dir else None)
             print_safe_field("goal_run_status", compiled["result"]["status"])
             print_safe_field("goal_run_id", compiled["result"]["goal_run_id"])
             print_safe_field("output_dir", compiled["output_dir"])
             return 0 if compiled["result"]["status"] == "ready" else 1
         if args.command == "collect":
-            root = Path(args.root).resolve()
+            root = canonical_controller_repository_root(Path(args.root))
             sources = collect_sources(root, args.stage)
             collected = json.dumps({"stage": args.stage, "source_snapshot": sources}, indent=2, sort_keys=True)
             try:
@@ -1949,7 +2189,10 @@ def main(argv: list[str] | None = None) -> int:
             print_safe_field("output_dir", compiled["output_dir"])
             return 0 if compiled["result"]["status"] == "ready" else 1
         if args.command == "validate":
-            errors = validate_goal_run(Path(args.root).resolve(), load_goal_run(Path(args.goal_run)))
+            errors = validate_goal_run(
+                canonical_controller_repository_root(Path(args.root)),
+                load_goal_run(Path(args.goal_run), Path(args.root)),
+            )
             if errors:
                 print("goal_run_status=failed")
                 for error in errors:

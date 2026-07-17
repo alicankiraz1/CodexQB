@@ -41,11 +41,22 @@ DEFAULT_MAX_TOTAL_BYTES = 512 * 1024 * 1024
 DEFAULT_MAX_PATHS = 100_000
 DEFAULT_SNAPSHOT_TIMEOUT_SECONDS = 60.0
 
+DescriptorAuthorityValidator = Callable[[int, str], bool]
+
 _SHA256_RE = re.compile(r"[a-f0-9]{64}")
 _WINDOWS_DRIVE_RE = re.compile(r"[A-Za-z]:")
 _SNAPSHOT_STATES = frozenset({"missing", "present"})
 _CHANGE_STATES = frozenset({"add", "modify", "delete", "unchanged"})
 _GIT_OBJECT_FORMATS = frozenset({"sha1", "sha256"})
+_DARWIN_PLATFORM_PATH_ALIASES = {
+    "etc": ("private", "etc"),
+    "tmp": ("private", "tmp"),
+    "var": ("private", "var"),
+}
+
+
+class _RepositoryRootWalkError(Exception):
+    """One absolute root component was unsafe or changed during opening."""
 
 
 @dataclass(frozen=True)
@@ -57,6 +68,8 @@ class RepositoryRootAnchor:
     metadata: os.stat_result
     mount_identity: tuple[object, ...]
     mount_resolution: _mount_identity.MountResolution
+    component_fds: tuple[int, ...]
+    component_metadata: tuple[os.stat_result, ...]
 
 
 @dataclass(frozen=True)
@@ -298,7 +311,110 @@ def _root_path(value: object) -> Path:
     raw = os.fspath(value)
     if not isinstance(raw, str) or not raw or "\x00" in raw:
         raise TypeError("repository_root_must_be_path")
-    return Path(os.path.abspath(raw))
+    path = Path(os.path.abspath(raw))
+    if sys.platform == "darwin" and len(path.parts) >= 2:
+        alias = _DARWIN_PLATFORM_PATH_ALIASES.get(path.parts[1])
+        if alias is not None:
+            path = Path("/").joinpath(*alias, *path.parts[2:])
+    return path
+
+
+def _directory_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+    )
+
+
+def _close_directory_walk(descriptors: Sequence[int]) -> None:
+    for descriptor in reversed(descriptors):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _open_absolute_directory_component_walk(
+    path: Path,
+) -> tuple[list[int], tuple[os.stat_result, ...]]:
+    """Open every absolute component relative to a held parent descriptor."""
+
+    if not path.is_absolute():
+        raise _RepositoryRootWalkError("repository_root_path_not_absolute")
+    flags = _secure_directory_flags()
+    descriptors: list[int] = []
+    identities: list[os.stat_result] = []
+    try:
+        current_fd = _promote_root_fd(os.open("/", flags))
+        descriptors.append(current_fd)
+        root_metadata = os.fstat(current_fd)
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            raise _RepositoryRootWalkError("repository_root_component_not_directory")
+        identities.append(root_metadata)
+
+        for component in path.parts[1:]:
+            parent_before = os.fstat(current_fd)
+            entry_before = os.stat(
+                component,
+                dir_fd=current_fd,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(entry_before.st_mode):
+                raise _RepositoryRootWalkError("repository_root_component_not_directory")
+            child_fd = _promote_root_fd(
+                os.open(component, flags, dir_fd=current_fd)
+            )
+            descriptors.append(child_fd)
+            opened = os.fstat(child_fd)
+            entry_after = os.stat(
+                component,
+                dir_fd=current_fd,
+                follow_symlinks=False,
+            )
+            parent_after = os.fstat(current_fd)
+            if (
+                any(
+                    not stat.S_ISDIR(metadata.st_mode)
+                    for metadata in (parent_before, parent_after, entry_after, opened)
+                )
+                or _directory_identity(parent_before) != _directory_identity(parent_after)
+                or _directory_identity(entry_before) != _directory_identity(opened)
+                or _directory_identity(entry_before) != _directory_identity(entry_after)
+            ):
+                raise _RepositoryRootWalkError("repository_root_component_identity_changed")
+            identities.append(opened)
+            current_fd = child_fd
+        return descriptors, tuple(identities)
+    except Exception:
+        _close_directory_walk(descriptors)
+        raise
+
+
+def _open_stable_absolute_directory(
+    path: Path,
+) -> tuple[tuple[int, ...], tuple[os.stat_result, ...]]:
+    """Return a held no-follow component chain only if two walks agree."""
+
+    first_descriptors: list[int] = []
+    second_descriptors: list[int] = []
+    keep_first = False
+    try:
+        first_descriptors, first_identities = _open_absolute_directory_component_walk(path)
+        second_descriptors, second_identities = _open_absolute_directory_component_walk(path)
+        if (
+            len(first_identities) != len(second_identities)
+            or any(
+                _directory_identity(first) != _directory_identity(second)
+                for first, second in zip(first_identities, second_identities)
+            )
+        ):
+            raise _RepositoryRootWalkError("repository_root_component_identity_changed")
+        keep_first = True
+        return tuple(first_descriptors), first_identities
+    finally:
+        if not keep_first:
+            _close_directory_walk(first_descriptors)
+        _close_directory_walk(second_descriptors)
 
 
 def _open_root(
@@ -309,21 +425,27 @@ def _open_root(
     os.stat_result,
     tuple[object, ...],
     _mount_identity.MountResolution,
+    tuple[int, ...],
+    tuple[os.stat_result, ...],
 ]:
     path = _root_path(root)
     try:
-        before = os.stat(path, follow_symlinks=False)
-        root_fd = os.open(path, _secure_directory_flags())
-        root_fd = _promote_root_fd(root_fd)
-    except OSError as exc:
+        component_fds, component_metadata = _open_stable_absolute_directory(path)
+        root_fd = component_fds[-1]
+        opened = component_metadata[-1]
+    except (OSError, _RepositoryRootWalkError) as exc:
         raise ValueError("repository_root_must_be_real_directory") from exc
     try:
-        opened = os.fstat(root_fd)
-        if not stat.S_ISDIR(before.st_mode) or not stat.S_ISDIR(opened.st_mode) or not _same_identity(before, opened):
-            raise ValueError("repository_root_must_be_real_directory")
         mount_resolution = _require_descriptor_mount_resolution(
             root_fd,
             reconcile=True,
+        )
+        _revalidate_root(
+            path,
+            root_fd,
+            opened,
+            component_fds,
+            component_metadata,
         )
         return (
             path,
@@ -331,9 +453,11 @@ def _open_root(
             opened,
             _opaque_mount_identity(mount_resolution),
             mount_resolution,
+            component_fds,
+            component_metadata,
         )
     except Exception:
-        os.close(root_fd)
+        _close_directory_walk(component_fds)
         raise
 
 
@@ -341,30 +465,163 @@ def _open_root(
 def open_repository_root_anchor(root: object) -> Iterator[RepositoryRootAnchor]:
     """Open one no-follow root descriptor for a complete evidence operation."""
 
-    path, root_fd, metadata, mount_identity, mount_resolution = _open_root(root)
+    (
+        path,
+        root_fd,
+        metadata,
+        mount_identity,
+        mount_resolution,
+        component_fds,
+        component_metadata,
+    ) = _open_root(root)
     anchor = RepositoryRootAnchor(
         path=path,
         fd=root_fd,
         metadata=metadata,
         mount_identity=mount_identity,
         mount_resolution=mount_resolution,
+        component_fds=component_fds,
+        component_metadata=component_metadata,
     )
     try:
         yield anchor
     finally:
-        os.close(root_fd)
+        _close_directory_walk(component_fds)
 
 
-def _revalidate_root(root_path: Path, root_fd: int, root_metadata: os.stat_result) -> None:
+@contextmanager
+def open_repository_cwd_anchor() -> Iterator[RepositoryRootAnchor]:
+    """Bind a CLI repository session to the process's actual CWD descriptor.
+
+    ``PWD`` is only a lexical consistency gate used to reject conventional
+    logical/symlink working directories.  The opened ``.`` descriptor and its
+    independently revalidated physical ``getcwd`` namespace entry are the
+    authority for repository identity.
+    """
+
+    inherited_pwd = os.environ.get("PWD")
+    if (
+        not isinstance(inherited_pwd, str)
+        or not inherited_pwd
+        or "\x00" in inherited_pwd
+        or not os.path.isabs(inherited_pwd)
+    ):
+        raise ValueError("repository_cli_cwd_binding_failed")
     try:
-        current_path = os.stat(root_path, follow_symlinks=False)
+        cwd_before = _root_path(os.getcwd())
+        inherited_path = _root_path(inherited_pwd)
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError("repository_cli_cwd_binding_failed") from exc
+    if inherited_path != cwd_before:
+        raise ValueError("repository_cli_cwd_binding_failed")
+    path = cwd_before
+    root_fd = -1
+    component_fds: tuple[int, ...] = ()
+    component_metadata: tuple[os.stat_result, ...] = ()
+    try:
+        component_fds, component_metadata = _open_stable_absolute_directory(path)
+        root_fd = os.open(".", _secure_directory_flags())
+        root_fd = _promote_root_fd(root_fd)
+        opened_before = os.fstat(root_fd)
+        _revalidate_root(
+            path,
+            root_fd,
+            opened_before,
+            component_fds,
+            component_metadata,
+        )
+        mount_resolution = _require_descriptor_mount_resolution(
+            root_fd,
+            reconcile=True,
+        )
+        cwd_after = _root_path(os.getcwd())
+        opened_after = os.fstat(root_fd)
+        _revalidate_root(
+            path,
+            root_fd,
+            opened_after,
+            component_fds,
+            component_metadata,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        if root_fd >= 0:
+            os.close(root_fd)
+        _close_directory_walk(component_fds)
+        raise ValueError("repository_cli_cwd_binding_failed") from exc
+    if (
+        cwd_before != cwd_after
+        or inherited_path != cwd_after
+        or not stat.S_ISDIR(opened_before.st_mode)
+        or not stat.S_ISDIR(opened_after.st_mode)
+        or not _same_identity(opened_before, opened_after)
+    ):
+        os.close(root_fd)
+        _close_directory_walk(component_fds)
+        raise ValueError("repository_cli_cwd_binding_failed")
+    anchor = RepositoryRootAnchor(
+        path=path,
+        fd=root_fd,
+        metadata=opened_after,
+        mount_identity=_opaque_mount_identity(mount_resolution),
+        mount_resolution=mount_resolution,
+        component_fds=component_fds,
+        component_metadata=component_metadata,
+    )
+    try:
+        revalidate_repository_root_anchor(anchor)
+        yield anchor
+    finally:
+        os.close(root_fd)
+        _close_directory_walk(component_fds)
+
+
+def _revalidate_root(
+    root_path: Path,
+    root_fd: int,
+    root_metadata: os.stat_result,
+    component_fds: Sequence[int],
+    component_metadata: Sequence[os.stat_result],
+) -> None:
+    components = root_path.parts
+    try:
+        if (
+            len(component_fds) != len(components)
+            or len(component_metadata) != len(components)
+            or not components
+            or components[0] != "/"
+        ):
+            raise _RepositoryRootWalkError("repository_root_component_chain_invalid")
+        for position, (descriptor, expected) in enumerate(
+            zip(component_fds, component_metadata)
+        ):
+            current = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or not stat.S_ISDIR(expected.st_mode)
+                or _directory_identity(current) != _directory_identity(expected)
+            ):
+                raise _RepositoryRootWalkError(
+                    "repository_root_component_identity_changed"
+                )
+            if position:
+                entry = os.stat(
+                    components[position],
+                    dir_fd=component_fds[position - 1],
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(entry.st_mode)
+                    or _directory_identity(entry) != _directory_identity(expected)
+                ):
+                    raise _RepositoryRootWalkError(
+                        "repository_root_component_identity_changed"
+                    )
         current_fd = os.fstat(root_fd)
-    except OSError as exc:
+    except (OSError, _RepositoryRootWalkError) as exc:
         raise ValueError("repository_root_identity_changed") from exc
     if (
-        not stat.S_ISDIR(current_path.st_mode)
-        or not stat.S_ISDIR(current_fd.st_mode)
-        or not _same_identity(root_metadata, current_path)
+        not stat.S_ISDIR(current_fd.st_mode)
+        or not _same_identity(root_metadata, component_metadata[-1])
         or not _same_identity(root_metadata, current_fd)
     ):
         raise ValueError("repository_root_identity_changed")
@@ -376,8 +633,16 @@ def _revalidate_root_mount(
     root_metadata: os.stat_result,
     root_mount_identity: tuple[object, ...],
     preferred_provider: str | None,
+    component_fds: Sequence[int],
+    component_metadata: Sequence[os.stat_result],
 ) -> None:
-    _revalidate_root(root_path, root_fd, root_metadata)
+    _revalidate_root(
+        root_path,
+        root_fd,
+        root_metadata,
+        component_fds,
+        component_metadata,
+    )
     if (
         _preferred_descriptor_mount_identity(root_fd, preferred_provider)
         != root_mount_identity
@@ -396,6 +661,8 @@ def revalidate_repository_root_anchor(anchor: RepositoryRootAnchor) -> None:
         anchor.metadata,
         anchor.mount_identity,
         anchor.mount_resolution.selected_provider,
+        anchor.component_fds,
+        anchor.component_metadata,
     )
 
 
@@ -426,6 +693,31 @@ def require_same_repository_mount(
     revalidate_repository_root_anchor(anchor)
 
 
+def require_descriptor_on_repository_mount(
+    anchor: RepositoryRootAnchor,
+    child_fd: int,
+    relative_path: object,
+) -> None:
+    """Bind a regular/symlink descriptor to the anchored repository mount."""
+
+    if not isinstance(anchor, RepositoryRootAnchor):
+        raise TypeError("repository_root_anchor_required")
+    path = normalize_repo_relative_path(relative_path)
+    try:
+        child_metadata = os.fstat(child_fd)
+    except OSError:
+        raise ValueError("secure_repository_mount_identity_unavailable") from None
+    if child_metadata.st_dev != anchor.metadata.st_dev:
+        raise ValueError("repository_nested_mount_rejected")
+    _require_descriptor_on_root_mount(
+        anchor.mount_identity,
+        child_fd,
+        path,
+        anchor.mount_resolution.selected_provider,
+    )
+    revalidate_repository_root_anchor(anchor)
+
+
 def _require_descriptor_on_root_mount(
     root_mount_identity: tuple[object, ...],
     child_fd: int,
@@ -446,6 +738,7 @@ def _verify_symlink_mount_identity(
     root_mount_identity: tuple[object, ...],
     relative_path: str,
     preferred_provider: str | None,
+    descriptor_authority_validator: DescriptorAuthorityValidator | None = None,
 ) -> None:
     try:
         symlink_fd = os.open(name, _secure_symlink_metadata_flags(), dir_fd=parent_fd)
@@ -455,11 +748,21 @@ def _verify_symlink_mount_identity(
         opened = os.fstat(symlink_fd)
         if not stat.S_ISLNK(opened.st_mode) or not _same_identity(metadata, opened):
             raise ValueError("repository_evidence_file_identity_changed")
+        _require_descriptor_authority(
+            descriptor_authority_validator,
+            symlink_fd,
+            relative_path,
+        )
         _require_descriptor_on_root_mount(
             root_mount_identity,
             symlink_fd,
             relative_path,
             preferred_provider,
+        )
+        _require_descriptor_authority(
+            descriptor_authority_validator,
+            symlink_fd,
+            relative_path,
         )
     finally:
         os.close(symlink_fd)
@@ -568,15 +871,19 @@ def _snapshot_one(
     root_metadata: os.stat_result,
     root_mount_identity: tuple[object, ...],
     root_mount_provider: str | None,
+    root_component_fds: Sequence[int],
+    root_component_metadata: Sequence[os.stat_result],
     path: str,
     max_bytes: int,
     budget: _SnapshotBudget,
     git_object_format: str | None = None,
+    descriptor_authority_validator: DescriptorAuthorityValidator | None = None,
 ) -> dict[str, object]:
     budget.consume_path()
     parts = path.split("/")
     current_fd = root_fd
     owned_fds: list[int] = []
+    authority_chain: list[tuple[int, str]] = []
     chain: list[DirectoryLink] = []
     try:
         for component in parts[:-1]:
@@ -604,6 +911,8 @@ def _snapshot_one(
                         root_metadata,
                         root_mount_identity,
                         root_mount_provider,
+                        root_component_fds,
+                        root_component_metadata,
                     )
                     return _missing_entry(path, git_object_format)
                 raise ValueError("repository_path_parent_identity_changed")
@@ -632,11 +941,18 @@ def _snapshot_one(
                     "/".join(parts[: len(chain) + 1]),
                     root_mount_provider,
                 )
+                authority_path = "/".join(parts[: len(chain) + 1])
+                _require_descriptor_authority(
+                    descriptor_authority_validator,
+                    child_fd,
+                    authority_path,
+                )
             except Exception:
                 os.close(child_fd)
                 raise
             chain.append((current_fd, component, child_fd, opened))
             owned_fds.append(child_fd)
+            authority_chain.append((child_fd, authority_path))
             current_fd = child_fd
 
         name = parts[-1]
@@ -664,6 +980,8 @@ def _snapshot_one(
                     root_metadata,
                     root_mount_identity,
                     root_mount_provider,
+                    root_component_fds,
+                    root_component_metadata,
                 )
                 return _missing_entry(path, git_object_format)
             raise ValueError("repository_evidence_file_identity_changed")
@@ -681,6 +999,7 @@ def _snapshot_one(
                 root_mount_identity,
                 path,
                 root_mount_provider,
+                descriptor_authority_validator,
             )
             try:
                 target_before = os.readlink(name, dir_fd=current_fd)
@@ -711,6 +1030,8 @@ def _snapshot_one(
                 root_metadata,
                 root_mount_identity,
                 root_mount_provider,
+                root_component_fds,
+                root_component_metadata,
             )
             return {
                 "path": path,
@@ -742,6 +1063,11 @@ def _snapshot_one(
                 path,
                 root_mount_provider,
             )
+            _require_descriptor_authority(
+                descriptor_authority_validator,
+                file_fd,
+                path,
+            )
             content_sha256, git_blob_oid, bytes_read = _read_expected_hashes(
                 file_fd,
                 before.st_size,
@@ -749,6 +1075,11 @@ def _snapshot_one(
                 git_object_format,
             )
             after_fd = os.fstat(file_fd)
+            _require_descriptor_authority(
+                descriptor_authority_validator,
+                file_fd,
+                path,
+            )
         finally:
             os.close(file_fd)
         try:
@@ -775,6 +1106,8 @@ def _snapshot_one(
             root_metadata,
             root_mount_identity,
             root_mount_provider,
+            root_component_fds,
+            root_component_metadata,
         )
         result: dict[str, object] = {
             "path": path,
@@ -792,8 +1125,16 @@ def _snapshot_one(
             )
         return result
     finally:
-        for directory_fd in reversed(owned_fds):
-            os.close(directory_fd)
+        try:
+            for directory_fd, authority_path in reversed(authority_chain):
+                _require_descriptor_authority(
+                    descriptor_authority_validator,
+                    directory_fd,
+                    authority_path,
+                )
+        finally:
+            for directory_fd in reversed(owned_fds):
+                os.close(directory_fd)
 
 
 def _snapshot_paths_from_anchor(
@@ -805,7 +1146,12 @@ def _snapshot_paths_from_anchor(
     max_paths: int,
     timeout_seconds: float,
     git_object_format: str | None,
+    descriptor_authority_validator: DescriptorAuthorityValidator | None,
 ) -> list[dict[str, object]]:
+    if descriptor_authority_validator is not None and not callable(
+        descriptor_authority_validator
+    ):
+        raise TypeError("repository_descriptor_authority_validator_invalid")
     revalidate_repository_root_anchor(anchor)
     byte_limit = _require_positive_limit(max_bytes)
     total_limit = _require_positive_limit(max_total_bytes)
@@ -819,6 +1165,11 @@ def _snapshot_paths_from_anchor(
     )
 
     def capture() -> list[dict[str, object]]:
+        _require_descriptor_authority(
+            descriptor_authority_validator,
+            anchor.fd,
+            ".",
+        )
         result: list[dict[str, object]] = []
         for path in normalized_paths:
             result.append(
@@ -828,12 +1179,20 @@ def _snapshot_paths_from_anchor(
                     anchor.metadata,
                     anchor.mount_identity,
                     anchor.mount_resolution.selected_provider,
+                    anchor.component_fds,
+                    anchor.component_metadata,
                     path,
                     byte_limit,
                     budget,
                     git_object_format,
+                    descriptor_authority_validator,
                 )
             )
+        _require_descriptor_authority(
+            descriptor_authority_validator,
+            anchor.fd,
+            ".",
+        )
         return result
 
     snapshot = capture()
@@ -853,6 +1212,7 @@ def snapshot_allowed_paths(
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
     max_paths: int = DEFAULT_MAX_PATHS,
     timeout_seconds: float = DEFAULT_SNAPSHOT_TIMEOUT_SECONDS,
+    descriptor_authority_validator: DescriptorAuthorityValidator | None = None,
 ) -> list[dict[str, object]]:
     """Snapshot exactly the supplied repository-relative path set.
 
@@ -870,6 +1230,7 @@ def snapshot_allowed_paths(
             max_paths=max_paths,
             timeout_seconds=timeout_seconds,
             git_object_format=None,
+            descriptor_authority_validator=descriptor_authority_validator,
         )
 
 
@@ -882,6 +1243,7 @@ def snapshot_git_paths(
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
     max_paths: int = DEFAULT_MAX_PATHS,
     timeout_seconds: float = DEFAULT_SNAPSHOT_TIMEOUT_SECONDS,
+    descriptor_authority_validator: DescriptorAuthorityValidator | None = None,
 ) -> list[dict[str, object]]:
     """Capture raw Git worktree blobs without invoking filters or following links.
 
@@ -899,6 +1261,7 @@ def snapshot_git_paths(
             max_total_bytes=max_total_bytes,
             max_paths=max_paths,
             timeout_seconds=timeout_seconds,
+            descriptor_authority_validator=descriptor_authority_validator,
         )
 
 
@@ -911,6 +1274,7 @@ def snapshot_git_paths_from_anchor(
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
     max_paths: int = DEFAULT_MAX_PATHS,
     timeout_seconds: float = DEFAULT_SNAPSHOT_TIMEOUT_SECONDS,
+    descriptor_authority_validator: DescriptorAuthorityValidator | None = None,
 ) -> list[dict[str, object]]:
     """Capture Git worktree blobs through an already-open root anchor."""
 
@@ -924,6 +1288,7 @@ def snapshot_git_paths_from_anchor(
         max_paths=max_paths,
         timeout_seconds=timeout_seconds,
         git_object_format=object_format,
+        descriptor_authority_validator=descriptor_authority_validator,
     )
 
 
@@ -1000,6 +1365,7 @@ def _capture_repository_inventory_pass(
     max_bytes: int,
     max_paths: int,
     budget: _SnapshotBudget,
+    descriptor_authority_validator: DescriptorAuthorityValidator | None,
 ) -> list[tuple[dict[str, object], tuple[int, int, int, int, int, int, int]]]:
     """Capture one descriptor-relative inventory pass including identity proof."""
 
@@ -1016,6 +1382,11 @@ def _capture_repository_inventory_pass(
         budget.check_deadline()
         if depth > 128:
             raise ValueError("repository_evidence_directory_depth_exceeded")
+        _require_descriptor_authority(
+            descriptor_authority_validator,
+            directory_fd,
+            parent or ".",
+        )
         try:
             directory_before = os.fstat(directory_fd)
             with os.scandir(directory_fd) as iterator:
@@ -1105,6 +1476,7 @@ def _capture_repository_inventory_pass(
                     anchor.mount_identity,
                     path,
                     anchor.mount_resolution.selected_provider,
+                    descriptor_authority_validator,
                 )
                 try:
                     target_before = os.readlink(name, dir_fd=directory_fd)
@@ -1163,12 +1535,22 @@ def _capture_repository_inventory_pass(
                         path,
                         anchor.mount_resolution.selected_provider,
                     )
+                    _require_descriptor_authority(
+                        descriptor_authority_validator,
+                        file_fd,
+                        path,
+                    )
                     content_sha256, _, bytes_read = _read_expected_hashes(
                         file_fd,
                         before.st_size,
                         budget,
                     )
                     after_fd = os.fstat(file_fd)
+                    _require_descriptor_authority(
+                        descriptor_authority_validator,
+                        file_fd,
+                        path,
+                    )
                 finally:
                     os.close(file_fd)
                 try:
@@ -1206,6 +1588,11 @@ def _capture_repository_inventory_pass(
 
             raise ValueError(f"repository_inventory_special_file_rejected={path}")
 
+        _require_descriptor_authority(
+            descriptor_authority_validator,
+            directory_fd,
+            parent or ".",
+        )
         _revalidate_directory_chain(
             chain,
             anchor.metadata.st_dev,
@@ -1226,6 +1613,7 @@ def snapshot_repository_inventory_from_anchor(
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
     max_paths: int = DEFAULT_MAX_PATHS,
     timeout_seconds: float = DEFAULT_SNAPSHOT_TIMEOUT_SECONDS,
+    descriptor_authority_validator: DescriptorAuthorityValidator | None = None,
 ) -> list[dict[str, object]]:
     """Inventory one full worktree through a stable root descriptor.
 
@@ -1236,6 +1624,10 @@ def snapshot_repository_inventory_from_anchor(
 
     if not isinstance(anchor, RepositoryRootAnchor):
         raise TypeError("repository_root_anchor_required")
+    if descriptor_authority_validator is not None and not callable(
+        descriptor_authority_validator
+    ):
+        raise TypeError("repository_descriptor_authority_validator_invalid")
     if exclude is None:
         exclusion: InventoryExclusion = lambda _path: False
     elif callable(exclude):
@@ -1258,6 +1650,7 @@ def snapshot_repository_inventory_from_anchor(
         max_bytes=byte_limit,
         max_paths=path_limit,
         budget=budget,
+        descriptor_authority_validator=descriptor_authority_validator,
     )
     second = _capture_repository_inventory_pass(
         anchor,
@@ -1265,6 +1658,7 @@ def snapshot_repository_inventory_from_anchor(
         max_bytes=byte_limit,
         max_paths=path_limit,
         budget=budget,
+        descriptor_authority_validator=descriptor_authority_validator,
     )
     if first != second:
         raise ValueError("repository_inventory_changed_during_capture")
@@ -1281,6 +1675,7 @@ def snapshot_repository_inventory(
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
     max_paths: int = DEFAULT_MAX_PATHS,
     timeout_seconds: float = DEFAULT_SNAPSHOT_TIMEOUT_SECONDS,
+    descriptor_authority_validator: DescriptorAuthorityValidator | None = None,
 ) -> list[dict[str, object]]:
     """Open and inventory an entire repository without following links."""
 
@@ -1292,7 +1687,23 @@ def snapshot_repository_inventory(
             max_total_bytes=max_total_bytes,
             max_paths=max_paths,
             timeout_seconds=timeout_seconds,
+            descriptor_authority_validator=descriptor_authority_validator,
         )
+
+
+def _require_descriptor_authority(
+    validator: DescriptorAuthorityValidator | None,
+    descriptor: int,
+    path: str,
+) -> None:
+    if validator is None:
+        return
+    try:
+        accepted = validator(descriptor, path)
+    except Exception:
+        raise ValueError("repository_evidence_descriptor_authority_rejected") from None
+    if accepted is not True:
+        raise ValueError("repository_evidence_descriptor_authority_rejected")
 
 
 def _read_regular_payload(
@@ -1300,11 +1711,14 @@ def _read_regular_payload(
     path: str,
     max_bytes: int,
     budget: _SnapshotBudget,
+    expected_identity: tuple[int, int, int, int, int, int, int] | None = None,
+    descriptor_authority_validator: DescriptorAuthorityValidator | None = None,
 ) -> AnchoredFilePayload:
     budget.consume_path()
     parts = path.split("/")
     current_fd = anchor.fd
     owned_fds: list[int] = []
+    authority_chain: list[tuple[int, str]] = []
     chain: list[DirectoryLink] = []
     try:
         for component in parts[:-1]:
@@ -1324,16 +1738,23 @@ def _read_regular_payload(
                 os.close(child_fd)
                 raise ValueError("repository_path_parent_identity_changed")
             try:
+                authority_path = "/".join(parts[: len(chain) + 1])
                 require_same_repository_mount(
                     anchor,
                     child_fd,
-                    "/".join(parts[: len(chain) + 1]),
+                    authority_path,
+                )
+                _require_descriptor_authority(
+                    descriptor_authority_validator,
+                    child_fd,
+                    authority_path,
                 )
             except Exception:
                 os.close(child_fd)
                 raise
             chain.append((current_fd, component, child_fd, opened))
             owned_fds.append(child_fd)
+            authority_chain.append((child_fd, authority_path))
             current_fd = child_fd
 
         name = parts[-1]
@@ -1347,6 +1768,8 @@ def _read_regular_payload(
             raise ValueError(
                 f"repository_evidence_target_must_be_owner_controlled_regular_file={path}"
             )
+        if expected_identity is not None and _stable_file_metadata(before) != expected_identity:
+            raise ValueError("repository_evidence_file_identity_changed")
         if before.st_size > max_bytes:
             raise ValueError(f"repository_evidence_file_too_large={path}")
         if before.st_size > budget.remaining_bytes:
@@ -1365,8 +1788,18 @@ def _read_regular_payload(
                 path,
                 anchor.mount_resolution.selected_provider,
             )
+            _require_descriptor_authority(
+                descriptor_authority_validator,
+                file_fd,
+                path,
+            )
             encoded = _read_expected_bytes(file_fd, before.st_size, budget)
             after_fd = os.fstat(file_fd)
+            _require_descriptor_authority(
+                descriptor_authority_validator,
+                file_fd,
+                path,
+            )
         finally:
             os.close(file_fd)
         try:
@@ -1394,8 +1827,16 @@ def _read_regular_payload(
             mode=0o755 if opened.st_mode & 0o111 else 0o644,
         )
     finally:
-        for directory_fd in reversed(owned_fds):
-            os.close(directory_fd)
+        try:
+            for directory_fd, authority_path in reversed(authority_chain):
+                _require_descriptor_authority(
+                    descriptor_authority_validator,
+                    directory_fd,
+                    authority_path,
+                )
+        finally:
+            for directory_fd in reversed(owned_fds):
+                os.close(directory_fd)
 
 
 def read_regular_files_from_anchor(
@@ -1406,26 +1847,69 @@ def read_regular_files_from_anchor(
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
     max_paths: int = DEFAULT_MAX_PATHS,
     timeout_seconds: float = DEFAULT_SNAPSHOT_TIMEOUT_SECONDS,
+    expected_identities: Mapping[str, tuple[int, int, int, int, int, int, int]] | None = None,
+    descriptor_authority_validator: DescriptorAuthorityValidator | None = None,
 ) -> list[AnchoredFilePayload]:
     """Read bounded regular-file payloads through one stable root descriptor."""
 
     if not isinstance(anchor, RepositoryRootAnchor):
         raise TypeError("repository_root_anchor_required")
+    if descriptor_authority_validator is not None and not callable(
+        descriptor_authority_validator
+    ):
+        raise TypeError("repository_descriptor_authority_validator_invalid")
     revalidate_repository_root_anchor(anchor)
     byte_limit = _require_positive_limit(max_bytes)
     total_limit = _require_positive_limit(max_total_bytes)
     path_limit = _require_positive_limit(max_paths)
     timeout_limit = _require_positive_timeout(timeout_seconds)
     normalized_paths = _normalize_allowed_paths(paths, max_items=path_limit)
+    if expected_identities is None:
+        expected: dict[str, tuple[int, int, int, int, int, int, int]] = {}
+    elif not isinstance(expected_identities, Mapping):
+        raise TypeError("repository_expected_identities_must_be_mapping")
+    else:
+        expected = {}
+        for raw_path, raw_identity in expected_identities.items():
+            path = normalize_repo_relative_path(raw_path)
+            if (
+                path != raw_path
+                or not isinstance(raw_identity, tuple)
+                or len(raw_identity) != 7
+                or any(not isinstance(value, int) or isinstance(value, bool) for value in raw_identity)
+            ):
+                raise ValueError("repository_expected_identity_invalid")
+            expected[path] = raw_identity
+        if any(path not in normalized_paths for path in expected):
+            raise ValueError("repository_expected_identity_path_mismatch")
     budget = _SnapshotBudget(
         remaining_bytes=total_limit,
         remaining_path_reads=len(normalized_paths),
         deadline=time.monotonic() + timeout_limit,
     )
-    payloads = [
-        _read_regular_payload(anchor, path, byte_limit, budget)
-        for path in normalized_paths
-    ]
+    _require_descriptor_authority(
+        descriptor_authority_validator,
+        anchor.fd,
+        ".",
+    )
+    try:
+        payloads = [
+            _read_regular_payload(
+                anchor,
+                path,
+                byte_limit,
+                budget,
+                expected.get(path),
+                descriptor_authority_validator,
+            )
+            for path in normalized_paths
+        ]
+    finally:
+        _require_descriptor_authority(
+            descriptor_authority_validator,
+            anchor.fd,
+            ".",
+        )
     budget.check_deadline()
     revalidate_repository_root_anchor(anchor)
     return payloads
@@ -1621,10 +2105,10 @@ def repository_state_digest(
     )
 
 
-def capture_repository_evidence(
-    root: str | os.PathLike[str],
+def repository_evidence_from_snapshots(
     allowed_paths: Iterable[object],
     baseline_snapshot: Sequence[dict[str, object]],
+    current_snapshot: Sequence[dict[str, object]],
     *,
     apply_run_id: str,
     task_id: str,
@@ -1632,15 +2116,16 @@ def capture_repository_evidence(
     contract_digest: str,
     generation: int,
     review_package_sha256: str,
-    max_bytes: int = DEFAULT_MAX_FILE_BYTES,
 ) -> dict[str, Any]:
-    """Re-snapshot allowed paths and return integration-ready evidence."""
+    """Build evidence from caller-supplied, already anchored snapshots."""
 
     normalized_paths = _normalize_allowed_paths(allowed_paths)
     baseline = _normalize_snapshot(baseline_snapshot)
     if [str(entry["path"]) for entry in baseline] != normalized_paths:
         raise ValueError("repository_baseline_allowed_path_mismatch")
-    current = snapshot_allowed_paths(root, normalized_paths, max_bytes=max_bytes)
+    current = _normalize_snapshot(current_snapshot)
+    if [str(entry["path"]) for entry in current] != normalized_paths:
+        raise ValueError("repository_current_allowed_path_mismatch")
     manifest = build_change_manifest(baseline, current)
     baseline_hash = baseline_digest(baseline)
     current_hash = repository_snapshot_digest(current)
@@ -1668,6 +2153,36 @@ def capture_repository_evidence(
     }
 
 
+def capture_repository_evidence(
+    root: str | os.PathLike[str],
+    allowed_paths: Iterable[object],
+    baseline_snapshot: Sequence[dict[str, object]],
+    *,
+    apply_run_id: str,
+    task_id: str,
+    apply_run_registration_id: str,
+    contract_digest: str,
+    generation: int,
+    review_package_sha256: str,
+    max_bytes: int = DEFAULT_MAX_FILE_BYTES,
+) -> dict[str, Any]:
+    """Legacy reader retained for non-planner callers; planners use RepositoryIO."""
+
+    normalized_paths = _normalize_allowed_paths(allowed_paths)
+    current = snapshot_allowed_paths(root, normalized_paths, max_bytes=max_bytes)
+    return repository_evidence_from_snapshots(
+        normalized_paths,
+        baseline_snapshot,
+        current,
+        apply_run_id=apply_run_id,
+        task_id=task_id,
+        apply_run_registration_id=apply_run_registration_id,
+        contract_digest=contract_digest,
+        generation=generation,
+        review_package_sha256=review_package_sha256,
+    )
+
+
 __all__ = [
     "AnchoredFilePayload",
     "DEFAULT_MAX_FILE_BYTES",
@@ -1682,10 +2197,13 @@ __all__ = [
     "changed_file_digest",
     "changed_file_manifest",
     "normalize_repo_relative_path",
+    "open_repository_cwd_anchor",
     "open_repository_root_anchor",
     "read_regular_files_from_anchor",
     "repository_snapshot_digest",
+    "repository_evidence_from_snapshots",
     "repository_state_digest",
+    "require_descriptor_on_repository_mount",
     "require_same_repository_mount",
     "snapshot_allowed_paths",
     "snapshot_git_paths",

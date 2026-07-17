@@ -42,7 +42,7 @@ Read-only unless explicitly asked otherwise. Checks tests, smoke paths, runtime-
 
 ### history_architecture_auditor
 
-Read-only. Uses bounded git history, docs, config, and source relations to identify churn, co-change signals, intended-vs-implemented architecture drift, and `ARC-*` candidates.
+Read-only. Uses only evolutionary metadata exposed by named RepositoryIO/controller receipts together with safe doc, config, and source projections to identify churn, co-change signals, intended-vs-implemented architecture drift, and `ARC-*` candidates. If receipt evidence is absent, reports the evolutionary signal as unknown; it never runs Git history commands.
 
 ### phase_planner
 

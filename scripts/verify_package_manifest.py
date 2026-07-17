@@ -230,11 +230,11 @@ def manifest_entries(manifest: dict[str, object]) -> tuple[list[dict[str, str]],
         ):
             errors.append(f"package_manifest_file_invalid=index-{index}")
             continue
-        if artifact_type in ARTIFACT_TYPES and denied_path_reason(path, artifact_type) is not None:
-            errors.append(f"package_manifest_denied_path=index-{index}")
-            continue
         if package_secret_path_match_locations(path):
             errors.append(f"package_manifest_secret_path=index-{index}")
+            continue
+        if artifact_type in ARTIFACT_TYPES and denied_path_reason(path, artifact_type) is not None:
+            errors.append(f"package_manifest_denied_path=index-{index}")
             continue
         if path == PACKAGE_MANIFEST_NAME or path in seen:
             errors.append(f"package_manifest_file_duplicate=index-{index}")

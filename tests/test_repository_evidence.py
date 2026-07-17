@@ -598,6 +598,197 @@ class RepositoryEvidenceTests(unittest.TestCase):
                         )
                     readlink.assert_not_called()
 
+    def test_regular_read_descriptor_authority_validator_observes_actual_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = self.write_owned_file(root, "evidence.txt", b"safe evidence\n")
+            target_identity = os.stat(target, follow_symlinks=False)
+            observed: list[tuple[str, int, int]] = []
+
+            def accept(descriptor: int, path: str) -> bool:
+                metadata = os.fstat(descriptor)
+                observed.append((path, metadata.st_dev, metadata.st_ino))
+                return True
+
+            with EVIDENCE.open_repository_root_anchor(root) as anchor:
+                payloads = EVIDENCE.read_regular_files_from_anchor(
+                    anchor,
+                    ["evidence.txt"],
+                    descriptor_authority_validator=accept,
+                )
+                self.assertEqual(payloads[0].data, b"safe evidence\n")
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "repository_evidence_descriptor_authority_rejected",
+                ):
+                    EVIDENCE.read_regular_files_from_anchor(
+                        anchor,
+                        ["evidence.txt"],
+                        descriptor_authority_validator=lambda _fd, _path: False,
+                    )
+
+            self.assertEqual(
+                observed,
+                [
+                    (".", os.stat(root, follow_symlinks=False).st_dev, os.stat(root, follow_symlinks=False).st_ino),
+                    ("evidence.txt", target_identity.st_dev, target_identity.st_ino),
+                    ("evidence.txt", target_identity.st_dev, target_identity.st_ino),
+                    (".", os.stat(root, follow_symlinks=False).st_dev, os.stat(root, follow_symlinks=False).st_ino),
+                ],
+            )
+
+    def test_regular_read_rejects_root_descriptor_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.write_owned_file(root, "evidence.txt", b"safe evidence\n")
+            root_identity = os.stat(root, follow_symlinks=False)
+            observed: list[tuple[int, int]] = []
+
+            def reject_root(descriptor: int, path: str) -> bool:
+                metadata = os.fstat(descriptor)
+                if path == ".":
+                    observed.append((metadata.st_dev, metadata.st_ino))
+                    return False
+                return True
+
+            with EVIDENCE.open_repository_root_anchor(root) as anchor:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "repository_evidence_descriptor_authority_rejected",
+                ):
+                    EVIDENCE.read_regular_files_from_anchor(
+                        anchor,
+                        ["evidence.txt"],
+                        descriptor_authority_validator=reject_root,
+                    )
+
+            self.assertEqual(
+                observed,
+                [(root_identity.st_dev, root_identity.st_ino)],
+            )
+
+    def test_inventory_and_snapshot_authority_use_root_parent_and_file_descriptors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            parent = root / "nested"
+            parent.mkdir()
+            target = self.write_owned_file(root, "nested/evidence.txt", b"safe evidence\n")
+            identities = {
+                ".": os.stat(root, follow_symlinks=False),
+                "nested": os.stat(parent, follow_symlinks=False),
+                "nested/evidence.txt": os.stat(target, follow_symlinks=False),
+            }
+
+            for operation in ("inventory", "snapshot"):
+                with self.subTest(operation=operation):
+                    observed: set[tuple[str, int, int]] = set()
+
+                    def accept(descriptor: int, path: str) -> bool:
+                        metadata = os.fstat(descriptor)
+                        observed.add((path, metadata.st_dev, metadata.st_ino))
+                        return True
+
+                    with EVIDENCE.open_repository_root_anchor(root) as anchor:
+                        if operation == "inventory":
+                            EVIDENCE.snapshot_repository_inventory_from_anchor(
+                                anchor,
+                                descriptor_authority_validator=accept,
+                            )
+                        else:
+                            EVIDENCE.snapshot_git_paths_from_anchor(
+                                anchor,
+                                ["nested/evidence.txt"],
+                                object_format="sha1",
+                                descriptor_authority_validator=accept,
+                            )
+
+                    for path, metadata in identities.items():
+                        self.assertIn(
+                            (path, metadata.st_dev, metadata.st_ino),
+                            observed,
+                        )
+
+    def test_snapshot_parent_authority_is_revalidated_after_use(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            parent = root / "nested"
+            parent.mkdir()
+            self.write_owned_file(root, "nested/evidence.txt", b"safe evidence\n")
+            parent_identity = os.stat(parent, follow_symlinks=False)
+            parent_calls: dict[tuple[int, str], int] = {}
+
+            def reject_second_parent_observation(descriptor: int, path: str) -> bool:
+                metadata = os.fstat(descriptor)
+                if (
+                    path == "nested"
+                    and metadata.st_dev == parent_identity.st_dev
+                    and metadata.st_ino == parent_identity.st_ino
+                ):
+                    key = (descriptor, path)
+                    parent_calls[key] = parent_calls.get(key, 0) + 1
+                    return parent_calls[key] == 1
+                return True
+
+            with EVIDENCE.open_repository_root_anchor(root) as anchor:
+                budget = EVIDENCE._SnapshotBudget(
+                    remaining_bytes=1024,
+                    remaining_path_reads=1,
+                    deadline=EVIDENCE.time.monotonic() + 5,
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "repository_evidence_descriptor_authority_rejected",
+                ):
+                    EVIDENCE._snapshot_one(
+                        anchor.path,
+                        anchor.fd,
+                        anchor.metadata,
+                        anchor.mount_identity,
+                        anchor.mount_resolution.selected_provider,
+                        anchor.component_fds,
+                        anchor.component_metadata,
+                        "nested/evidence.txt",
+                        1024,
+                        budget,
+                        "sha1",
+                        reject_second_parent_observation,
+                    )
+
+            self.assertEqual(max(parent_calls.values(), default=0), 2)
+
+    def test_git_symlink_authority_validator_observes_actual_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.write_owned_file(root, "target.txt", b"safe evidence\n")
+            link = root / "target-link"
+            link.symlink_to("target.txt")
+            link_identity = os.stat(link, follow_symlinks=False)
+            observed: list[tuple[int, int]] = []
+
+            def reject_symlink(descriptor: int, path: str) -> bool:
+                metadata = os.fstat(descriptor)
+                if path == "target-link":
+                    observed.append((metadata.st_dev, metadata.st_ino))
+                    return False
+                return True
+
+            with EVIDENCE.open_repository_root_anchor(root) as anchor:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "repository_evidence_descriptor_authority_rejected",
+                ):
+                    EVIDENCE.snapshot_git_paths_from_anchor(
+                        anchor,
+                        ["target-link"],
+                        object_format="sha1",
+                        descriptor_authority_validator=reject_symlink,
+                    )
+
+            self.assertEqual(
+                observed,
+                [(link_identity.st_dev, link_identity.st_ino)],
+            )
+
     def test_change_manifest_classifies_add_modify_delete_and_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -788,6 +979,112 @@ class RepositoryEvidenceTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "repository_root_must_be_real_directory"):
                 EVIDENCE.snapshot_allowed_paths(root_link, ["missing.txt"])
+
+    def test_root_anchor_rejects_symlinked_parent_and_ancestor_components(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            outside = base / "outside"
+            (outside / "nested" / "repository").mkdir(parents=True)
+            (outside / "repository").mkdir()
+
+            cases = (
+                ("parent-link", ("repository",)),
+                ("ancestor-link", ("nested", "repository")),
+            )
+            for link_name, suffix in cases:
+                with self.subTest(link_name=link_name):
+                    link = base / link_name
+                    link.symlink_to(outside, target_is_directory=True)
+                    root = link.joinpath(*suffix)
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "repository_root_must_be_real_directory",
+                    ):
+                        with EVIDENCE.open_repository_root_anchor(root):
+                            self.fail("symlinked repository ancestor was accepted")
+
+    def test_root_anchor_rejects_ancestor_swap_during_component_walk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            trusted = base / "trusted"
+            root = trusted / "project" / "repository"
+            root.mkdir(parents=True)
+            held = base / "trusted-held"
+            replacement = base / "trusted-replacement"
+            (replacement / "project" / "repository").mkdir(parents=True)
+            original_identity = os.stat(root, follow_symlinks=False)
+            real_open = EVIDENCE.os.open
+            swapped = False
+
+            def swap_ancestor_after_root_open(path, flags, *args, **kwargs):
+                nonlocal swapped
+                descriptor = real_open(path, flags, *args, **kwargs)
+                opened = os.fstat(descriptor)
+                if (
+                    not swapped
+                    and opened.st_dev == original_identity.st_dev
+                    and opened.st_ino == original_identity.st_ino
+                ):
+                    trusted.rename(held)
+                    replacement.rename(trusted)
+                    swapped = True
+                return descriptor
+
+            try:
+                with mock.patch.object(
+                    EVIDENCE.os,
+                    "open",
+                    side_effect=swap_ancestor_after_root_open,
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "repository_root_must_be_real_directory",
+                    ):
+                        with EVIDENCE.open_repository_root_anchor(root):
+                            self.fail("repository ancestor swap was accepted")
+            finally:
+                if swapped:
+                    trusted.rename(replacement)
+                    held.rename(trusted)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin platform alias")
+    def test_root_anchor_accepts_canonical_darwin_var_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            if not os.fspath(root).startswith("/var/"):
+                self.skipTest("temporary directory is not exposed through /var")
+            with EVIDENCE.open_repository_root_anchor(root) as anchor:
+                self.assertEqual(
+                    anchor.path,
+                    Path("/private") / root.relative_to("/"),
+                )
+                self.assertEqual(
+                    (anchor.metadata.st_dev, anchor.metadata.st_ino),
+                    (root.stat().st_dev, root.stat().st_ino),
+                )
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin platform alias")
+    def test_cwd_anchor_binds_darwin_var_pwd_to_physical_private_var(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            if not os.fspath(root).startswith("/var/"):
+                self.skipTest("temporary directory is not exposed through /var")
+            previous_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.chdir(root)
+                with mock.patch.dict(os.environ, {"PWD": os.fspath(root)}):
+                    with EVIDENCE.open_repository_cwd_anchor() as anchor:
+                        self.assertEqual(
+                            anchor.path,
+                            Path("/private") / root.relative_to("/"),
+                        )
+                        self.assertEqual(
+                            (anchor.metadata.st_dev, anchor.metadata.st_ino),
+                            (root.stat().st_dev, root.stat().st_ino),
+                        )
+            finally:
+                os.fchdir(previous_fd)
+                os.close(previous_fd)
 
     def test_root_anchor_promotes_closed_stdio_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

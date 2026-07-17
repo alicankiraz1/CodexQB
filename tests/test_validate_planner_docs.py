@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
 
+from tests.controller_test_support import controller_cli_command
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VALIDATOR = REPO_ROOT / "plugins/codexqb/skills/codexqb/scripts/validate_planner_docs.py"
@@ -177,7 +179,11 @@ def run_validator_cli(
     strict: bool = False,
     timeout: int = CLI_TIMEOUT_SECONDS,
 ) -> ValidatorResult:
-    command = [sys.executable, str(VALIDATOR), "--root", str(root), "--mode", mode]
+    command = controller_cli_command(
+        "planner-validator",
+        None,
+        ["--root", str(root), "--mode", mode],
+    )
     if strict:
         command.append("--strict")
     try:
@@ -655,6 +661,35 @@ def write_index_for_refs(
 
 
 class ValidatePlannerDocsTests(unittest.TestCase):
+
+    def test_validation_state_revalidates_inventory_after_each_listing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            docs = root / "Planner-docs"
+            docs.mkdir()
+            (docs / "initial.md").write_text("safe\n", encoding="utf-8")
+
+            with VALIDATOR_MODULE.open_repository_io(root) as repository:
+                state = VALIDATOR_MODULE.ValidationState(
+                    root=root,
+                    mode="all",
+                    strict=False,
+                    repository=repository,
+                )
+                self.assertIn(
+                    "Planner-docs/initial.md",
+                    state.regular_paths("step3"),
+                )
+                (docs / "late-secret.md").write_text(
+                    "sk-" + "R" * 40 + "\n",
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "repository_io_inventory_changed",
+                ):
+                    VALIDATOR_MODULE.scan_secrets(state)
 
     def test_step1_valid_main_plan_reports_phase_count(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

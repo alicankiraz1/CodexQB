@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -19,21 +18,80 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-APPLY_RUN = REPO_ROOT / "plugins/codexqb/skills/codexqb/scripts/apply_run.py"
 if REPO_ROOT.as_posix() not in sys.path:
     sys.path.insert(0, REPO_ROOT.as_posix())
 
+from tests.controller_test_support import (  # noqa: E402
+    assert_real_trust_store_unchanged,
+    controller_cli_command,
+    temporary_controller_home,
+)
 from tests.test_validate_planner_docs import write_audit, write_valid_step2_fixture  # noqa: E402
 
 
+_CONTROLLER_TEST_HOME: Path | None = None
+_SAFE_FAILURE_CODES = frozenset(
+    {
+        "apply_command_repository_root_mismatch",
+        "command_failed",
+        "command_unexpected_success",
+        "controller_test_home_not_initialized",
+        "expected_failure_missing",
+        "unhandled_exception",
+    }
+)
+
+
 def fail(message: str) -> None:
-    print(f"apply_behavior_smoke_failed={message}")
+    candidate = message.partition("=")[0]
+    code = candidate if candidate in _SAFE_FAILURE_CODES else "unspecified"
+    detail_sha256 = hashlib.sha256(message.encode("utf-8", errors="replace")).hexdigest()
+    print(f"apply_behavior_smoke_failed_code={code.lower()}")
+    print(f"apply_behavior_smoke_failed_detail_sha256={detail_sha256}")
     raise SystemExit(1)
+
+
+def subprocess_error_digest(*streams: str) -> str:
+    """Commit to one bounded controller error code without logging its value."""
+
+    candidates = {
+        candidate
+        for stream in streams
+        for line in stream.splitlines()
+        if line.startswith("error=")
+        for candidate in (line.removeprefix("error="),)
+        if 1 <= len(candidate) <= 128
+        and candidate.isascii()
+        and all(
+            character.islower() or character.isdigit() or character == "_"
+            for character in candidate
+        )
+    }
+    selected = next(iter(candidates)) if len(candidates) == 1 else "unclassified"
+    return hashlib.sha256(
+        f"codexqb-controller-error-v1:{selected}".encode("ascii")
+    ).hexdigest()
+
+
+def apply_controller_command(args: list[str], *, root: Path) -> list[str]:
+    if _CONTROLLER_TEST_HOME is None:
+        fail("controller_test_home_not_initialized")
+    rooted = list(args)
+    root_positions = [index for index, value in enumerate(rooted) if value == "--root"]
+    if not root_positions:
+        rooted.extend(["--root", root.as_posix()])
+    elif (
+        len(root_positions) != 1
+        or root_positions[0] + 1 >= len(rooted)
+        or Path(rooted[root_positions[0] + 1]).resolve() != root.resolve()
+    ):
+        fail("apply_command_repository_root_mismatch")
+    return controller_cli_command("apply", _CONTROLLER_TEST_HOME, rooted)
 
 
 def run_apply(args: list[str], *, cwd: Path) -> str:
     completed = subprocess.run(
-        [sys.executable, APPLY_RUN.as_posix(), *args],
+        apply_controller_command(args, root=cwd),
         cwd=cwd,
         text=True,
         capture_output=True,
@@ -41,13 +99,17 @@ def run_apply(args: list[str], *, cwd: Path) -> str:
         timeout=20,
     )
     if completed.returncode != 0:
+        print(
+            "apply_behavior_smoke_failed_command_error_sha256="
+            f"{subprocess_error_digest(completed.stdout, completed.stderr)}"
+        )
         fail(f"command_failed={' '.join(args)} stdout={completed.stdout.strip()} stderr={completed.stderr.strip()}")
     return completed.stdout
 
 
 def run_apply_expect_failure(args: list[str], *, cwd: Path, expected: str) -> str:
     completed = subprocess.run(
-        [sys.executable, APPLY_RUN.as_posix(), *args],
+        apply_controller_command(args, root=cwd),
         cwd=cwd,
         text=True,
         capture_output=True,
@@ -767,16 +829,23 @@ def drive_subagent_protocol_simulation(root: Path) -> Path:
 
 
 def main() -> int:
+    global _CONTROLLER_TEST_HOME
     with (
-        tempfile.TemporaryDirectory() as direct_dir,
-        tempfile.TemporaryDirectory() as protocol_dir,
-        tempfile.TemporaryDirectory() as outside_dir,
-        tempfile.TemporaryDirectory() as trust_dir,
+        assert_real_trust_store_unchanged(),
+        temporary_controller_home() as controller_home,
+        tempfile.TemporaryDirectory(
+            prefix=".codexqb-behavior-workspaces-",
+            dir=REPO_ROOT.parent,
+        ) as workspace_dir,
     ):
-        direct_root = Path(direct_dir)
-        protocol_root = Path(protocol_dir)
-        Path(trust_dir).chmod(0o700)
-        os.environ["CODEXQB_TRUST_ROOT"] = trust_dir
+        _CONTROLLER_TEST_HOME = Path(controller_home)
+        workspace_root = Path(workspace_dir)
+        direct_root = workspace_root / "direct"
+        protocol_root = workspace_root / "protocol"
+        outside_root = workspace_root / "outside"
+        workspace_root.chmod(0o700)
+        for root in (direct_root, protocol_root, outside_root):
+            root.mkdir(mode=0o700)
         write_fixture(direct_root)
         write_fixture(protocol_root)
 
@@ -875,7 +944,7 @@ def main() -> int:
         hostile_progress = json.loads(hostile_progress_before)
         hostile_task_id = hostile_progress["tasks"][0]["task_id"]
         victim_content = "external event victim must remain unchanged\n"
-        victim_path = Path(outside_dir) / "events-victim.jsonl"
+        victim_path = outside_root / "events-victim.jsonl"
         victim_path.write_text(victim_content, encoding="utf-8")
         hostile_events_path = hostile_run_dir / "Events.jsonl"
         hostile_events_path.unlink()
@@ -895,7 +964,7 @@ def main() -> int:
                 "external Events symlink must fail closed",
             ],
             cwd=root,
-            expected="artifact_target_must_be_regular_file",
+            expected="apply_run_provenance_unverified",
         )
         if victim_path.read_text(encoding="utf-8") != victim_content:
             fail("events_symlink_modified_external_victim")
@@ -915,4 +984,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:
+        fail(f"unhandled_exception={type(exc).__name__}:{exc}")

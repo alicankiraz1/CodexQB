@@ -21,7 +21,7 @@ If the audit status is `PASS_WITH_WARNINGS` with only open or accepted P2/P3 fin
 Before printing the canonical handoff, run the bundled strict validator when available:
 
 ```bash
-python3 plugins/codexqb/skills/codexqb/scripts/validate_planner_docs.py --root . --mode step4 --strict
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller planner-validator -- --root . --mode step4 --strict
 ```
 
 ## Operator Notes

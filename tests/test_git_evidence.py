@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -35,6 +38,73 @@ EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
 class GitEvidenceTests(unittest.TestCase):
+    def test_metadata_tree_enumeration_stops_at_budget_before_materializing_all_names(self) -> None:
+        class SyntheticScandir:
+            def __init__(self, counter: list[int]) -> None:
+                self.counter = counter
+
+            def __enter__(self):
+                def entries():
+                    for index in range(250_000):
+                        self.counter[0] += 1
+                        yield SimpleNamespace(name=f"entry-{index}")
+
+                return entries()
+
+            def __exit__(self, *_args):
+                return False
+
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:
+            source_fd = os.open(source_dir, os.O_RDONLY | os.O_DIRECTORY)
+            target_fd = os.open(target_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                for operation, expected in (
+                    (
+                        lambda: GIT_EVIDENCE._snapshot_refs_tree(mock.Mock(), source_fd),
+                        "git_evidence_refs_limit_exceeded",
+                    ),
+                    (
+                        lambda: GIT_EVIDENCE._copy_objects_tree(
+                            mock.Mock(),
+                            source_fd,
+                            target_fd,
+                        ),
+                        "git_evidence_objects_path_limit",
+                    ),
+                ):
+                    counter = [0]
+                    with self.subTest(expected=expected), mock.patch.object(
+                        GIT_EVIDENCE,
+                        "MAX_GIT_METADATA_TREE_PATHS",
+                        8,
+                    ), mock.patch.object(
+                        GIT_EVIDENCE.os,
+                        "scandir",
+                        side_effect=lambda _fd: SyntheticScandir(counter),
+                    ):
+                        with self.assertRaisesRegex(ValueError, expected):
+                            operation()
+                    self.assertEqual(counter[0], 9)
+            finally:
+                os.close(target_fd)
+                os.close(source_fd)
+
+    def test_exclusion_iterable_is_bounded_before_full_materialization(self) -> None:
+        counter = [0]
+
+        def paths():
+            for index in range(250_000):
+                counter[0] += 1
+                yield f"path-{index}"
+
+        with mock.patch.object(GIT_EVIDENCE, "MAX_GIT_EXCLUSION_PATHS", 8):
+            with self.assertRaisesRegex(
+                ValueError,
+                "git_evidence_exclusion_limit_exceeded",
+            ):
+                GIT_EVIDENCE._normalize_exclusions(paths())
+        self.assertEqual(counter[0], 9)
+
     def git(self, root: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
             ["git", *arguments],
@@ -73,6 +143,26 @@ class GitEvidenceTests(unittest.TestCase):
         program.chmod(0o755)
         return program, marker
 
+    def init_linked_worktree(self, base: Path) -> tuple[Path, Path, Path]:
+        main = base / "main"
+        main.mkdir()
+        self.init_repo(main)
+        worktree = base / "linked"
+        self.git(
+            main,
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked-test",
+            worktree.as_posix(),
+            "HEAD",
+        )
+        marker_text = (worktree / ".git").read_text(encoding="utf-8")
+        self.assertTrue(marker_text.startswith("gitdir: "))
+        git_dir = Path(marker_text.removeprefix("gitdir: ").strip())
+        return main, worktree, git_dir
+
     def test_clean_staged_unstaged_and_untracked_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -104,6 +194,173 @@ class GitEvidenceTests(unittest.TestCase):
             self.assertNotEqual(dirty["untracked_paths_sha256"], EMPTY_SHA256)
             self.assertNotEqual(dirty["untracked_entries_sha256"], EMPTY_SHA256)
             self.assertNotEqual(dirty["status_sha256"], EMPTY_SHA256)
+
+    def test_gitless_nested_directory_does_not_inherit_parent_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir)
+            self.init_repo(parent)
+            nested = parent / "copied-source"
+            nested.mkdir()
+            (nested / "README.md").write_text("copied source\n", encoding="utf-8")
+
+            evidence = GIT_EVIDENCE.capture_git_workspace_evidence(nested)
+
+            self.assertFalse(evidence["is_git"])
+            self.assertEqual(evidence["tracked_paths"], [])
+
+    def test_linked_worktree_gitdir_chain_is_nofollow_and_backlink_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            _main, worktree, git_dir = self.init_linked_worktree(base)
+            alias = base / "gitdir-alias"
+            alias.symlink_to(git_dir, target_is_directory=True)
+            (worktree / ".git").write_text(
+                f"gitdir: {alias.as_posix()}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "git_evidence_metadata_path_invalid",
+            ):
+                GIT_EVIDENCE.capture_git_workspace_evidence(worktree)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            _main, worktree, git_dir = self.init_linked_worktree(base)
+            (git_dir / "gitdir").write_text(
+                f"{(base / 'forged' / '.git').as_posix()}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "git_evidence_worktree_backlink_invalid",
+            ):
+                GIT_EVIDENCE.capture_git_workspace_evidence(worktree)
+
+    def test_linked_worktree_gitdir_cross_mount_is_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            _main, worktree, git_dir = self.init_linked_worktree(base)
+            git_dir_identity = (git_dir.stat().st_dev, git_dir.stat().st_ino)
+            original = GIT_EVIDENCE.require_same_repository_mount
+
+            def reject_git_dir(anchor, descriptor, relative_path):
+                metadata = os.fstat(descriptor)
+                if (metadata.st_dev, metadata.st_ino) == git_dir_identity:
+                    raise ValueError("synthetic_cross_mount")
+                return original(anchor, descriptor, relative_path)
+
+            with mock.patch.object(
+                GIT_EVIDENCE,
+                "require_same_repository_mount",
+                side_effect=reject_git_dir,
+            ), self.assertRaisesRegex(
+                ValueError,
+                "git_evidence_metadata_untrusted",
+            ):
+                GIT_EVIDENCE.capture_git_workspace_evidence(worktree)
+
+    def test_repository_config_include_and_object_alternates_are_rejected_pre_git(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.init_repo(root)
+            external = root / "external-config"
+            external.write_text("[core]\n\texcludesFile = /outside\n", encoding="utf-8")
+            with (root / ".git/config").open("a", encoding="utf-8") as stream:
+                stream.write(f"[include]\n\tpath = {external.as_posix()}\n")
+            with mock.patch.object(GIT_EVIDENCE.subprocess, "Popen") as popen:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "git_evidence_unsafe_repository_config",
+                ):
+                    GIT_EVIDENCE.capture_git_workspace_evidence(root)
+            popen.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.init_repo(root)
+            alternates = root / ".git/objects/info/alternates"
+            alternates.write_text("/outside/objects\n", encoding="utf-8")
+            with mock.patch.object(GIT_EVIDENCE.subprocess, "Popen") as popen:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "git_evidence_forbidden_metadata_present",
+                ):
+                    GIT_EVIDENCE.capture_git_workspace_evidence(root)
+            popen.assert_not_called()
+
+    def test_git_subprocess_reads_private_snapshot_and_detects_gitdir_aba(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            _main, worktree, git_dir = self.init_linked_worktree(base)
+            detached = base / "detached-gitdir"
+            real_popen = subprocess.Popen
+            invocation: dict[str, object] = {}
+
+            def swap_restore_before_child(*args, **kwargs):
+                if not invocation:
+                    invocation.update(kwargs)
+                    git_dir.rename(detached)
+                    detached.rename(git_dir)
+                return real_popen(*args, **kwargs)
+
+            with mock.patch.object(
+                GIT_EVIDENCE.subprocess,
+                "Popen",
+                side_effect=swap_restore_before_child,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "git_evidence_metadata_path_changed|git_evidence_metadata_changed",
+                ):
+                    GIT_EVIDENCE.capture_git_workspace_evidence(worktree)
+
+            environment = invocation["env"]
+            self.assertIsInstance(environment, dict)
+            runtime_git_dir = str(environment["GIT_DIR"])
+            self.assertNotEqual(runtime_git_dir, git_dir.as_posix())
+            self.assertTrue(str(environment["GIT_OBJECT_DIRECTORY"]).startswith(runtime_git_dir))
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" or sys.platform.startswith("linux"),
+        "Darwin/Linux Git metadata ACL probe",
+    )
+    def test_git_metadata_extended_acl_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.init_repo(root)
+            marker = root / ".git"
+            if sys.platform == "darwin":
+                tool = shutil.which("chmod", path=os.defpath)
+                command = [
+                    tool or "",
+                    "+a",
+                    "everyone allow read,write,append,delete,list,search",
+                    marker.as_posix(),
+                ]
+                cleanup = [tool or "", "-N", marker.as_posix()]
+            else:
+                tool = shutil.which("setfacl", path=os.defpath)
+                command = [
+                    tool or "",
+                    "-m",
+                    f"u:{os.geteuid()}:r-x,m::r-x",
+                    marker.as_posix(),
+                ]
+                cleanup = [tool or "", "-b", marker.as_posix()]
+            if not command[0]:
+                self.skipTest("ACL mutation tool unavailable")
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                self.skipTest("extended ACL creation unavailable")
+            try:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "git_evidence_metadata_untrusted",
+                ):
+                    GIT_EVIDENCE.capture_git_workspace_evidence(root)
+            finally:
+                subprocess.run(cleanup, capture_output=True, check=False)
 
     def test_tracked_and_untracked_content_share_one_descriptor_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -271,7 +528,11 @@ class GitEvidenceTests(unittest.TestCase):
             os.environ["GIT_EXTERNAL_DIFF"] = inherited.as_posix()
             os.environ["PATH"] = f"{fake_bin}{os.pathsep}{previous_path or ''}"
             try:
-                evidence = GIT_EVIDENCE.capture_git_workspace_evidence(root)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "git_evidence_unsafe_repository_config",
+                ):
+                    GIT_EVIDENCE.capture_git_workspace_evidence(root)
             finally:
                 if previous is None:
                     os.environ.pop("GIT_EXTERNAL_DIFF", None)
@@ -282,8 +543,6 @@ class GitEvidenceTests(unittest.TestCase):
                 else:
                     os.environ["PATH"] = previous_path
 
-            self.assertEqual([item["path"] for item in evidence["unstaged_changes"]], ["tracked.txt"])
-            self.assertNotEqual(evidence["unstaged_diff_sha256"], EMPTY_SHA256)
             for marker in (
                 external_marker,
                 textconv_marker,
@@ -342,24 +601,149 @@ class GitEvidenceTests(unittest.TestCase):
                 "PATH": "/usr/bin",
                 "GIT_DIR": "/tmp/attacker",
                 "git_external_diff": "/tmp/attacker-diff",
+                "LD_PRELOAD": "/tmp/attacker.so",
+                "LD_LIBRARY_PATH": "/tmp/attacker-lib",
+                "DYLD_INSERT_LIBRARIES": "/tmp/attacker.dylib",
+                "DYLD_LIBRARY_PATH": "/tmp/attacker-lib",
+                "PYTHONPATH": "/tmp/attacker-python",
+                "PYTHONHOME": "/tmp/attacker-python-home",
+                "BASH_ENV": "/tmp/attacker-bash-env",
+                "ENV": "/tmp/attacker-shell-env",
+                "PERL5OPT": "-M/tmp/attacker",
+                "RUBYOPT": "-r/tmp/attacker",
+                "NODE_OPTIONS": "--require=/tmp/attacker",
+                "HOME": "/tmp/attacker-home",
+                "XDG_CONFIG_HOME": "/tmp/attacker-xdg",
                 "LANG": "tr_TR.UTF-8",
                 "PWD": "/tmp/replaced-root",
                 "OLDPWD": "/tmp/old-root",
             }
         )
-        self.assertEqual(environment["PATH"], os.defpath)
-        self.assertEqual(environment["LANG"], "C")
-        self.assertEqual(environment["LC_ALL"], "C")
-        self.assertNotIn("GIT_DIR", environment)
-        self.assertNotIn("git_external_diff", environment)
-        self.assertNotIn("PWD", environment)
-        self.assertNotIn("OLDPWD", environment)
+        self.assertEqual(
+            environment,
+            {
+                "GIT_ATTR_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_NO_LAZY_FETCH": "1",
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": os.defpath,
+            },
+        )
         with self.assertRaisesRegex(ValueError, "git_evidence_command_not_allowed"):
             GIT_EVIDENCE.git_command(["diff", "--binary"])
+
+    def test_user_and_environment_git_config_do_not_reach_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            root = base / "repo"
+            root.mkdir()
+            self.init_repo(root)
+            untracked = root / "must-remain-visible.txt"
+            untracked.write_text("visible\n", encoding="utf-8")
+
+            attacker_home = base / "attacker-home"
+            attacker_xdg = base / "attacker-xdg"
+            attacker_home.mkdir()
+            (attacker_xdg / "git").mkdir(parents=True)
+            excludes = base / "attacker-excludes"
+            excludes.write_text("*\n", encoding="utf-8")
+            attacker_config = base / "attacker-config"
+            payload = f"[core]\n\texcludesFile = {excludes.as_posix()}\n"
+            attacker_config.write_text(payload, encoding="utf-8")
+            (attacker_home / ".gitconfig").write_text(payload, encoding="utf-8")
+            (attacker_xdg / "git/config").write_text(payload, encoding="utf-8")
+
+            injected = {
+                "HOME": attacker_home.as_posix(),
+                "XDG_CONFIG_HOME": attacker_xdg.as_posix(),
+                "GIT_CONFIG_GLOBAL": attacker_config.as_posix(),
+                "GIT_CONFIG_NOSYSTEM": "0",
+            }
+            previous = {key: os.environ.get(key) for key in injected}
+            os.environ.update(injected)
+            try:
+                evidence = GIT_EVIDENCE.capture_git_workspace_evidence(root)
+            finally:
+                for key, value in previous.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+            self.assertIn(untracked.name, evidence["untracked_paths"])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux loader regression")
+    def test_linux_ld_preload_cannot_reach_trusted_git_child(self) -> None:
+        compiler = shutil.which("cc", path=os.defpath)
+        if compiler is None:
+            self.skipTest("system C compiler unavailable")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "repo"
+            root.mkdir()
+            self.init_repo(root)
+            marker = Path(temp_dir) / "preload-constructor-ran"
+            source = Path(temp_dir) / "preload.c"
+            library = Path(temp_dir) / "preload.so"
+            source.write_text(
+                "#include <stdio.h>\n"
+                "__attribute__((constructor)) static void mark(void) {\n"
+                f"  FILE *stream = fopen({json.dumps(marker.as_posix())}, \"w\");\n"
+                "  if (stream != NULL) { fputs(\"ran\", stream); fclose(stream); }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [compiler, "-shared", "-fPIC", "-o", library.as_posix(), source.as_posix()],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            control_environment = os.environ.copy()
+            control_environment["LD_PRELOAD"] = library.as_posix()
+            subprocess.run(
+                [GIT_EVIDENCE.trusted_git_executable(), "--version"],
+                check=True,
+                env=control_environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertTrue(marker.is_file(), "LD_PRELOAD positive control did not run")
+            marker.unlink()
+
+            previous = os.environ.get("LD_PRELOAD")
+            os.environ["LD_PRELOAD"] = library.as_posix()
+            try:
+                evidence = GIT_EVIDENCE.capture_git_workspace_evidence(root)
+            finally:
+                if previous is None:
+                    os.environ.pop("LD_PRELOAD", None)
+                else:
+                    os.environ["LD_PRELOAD"] = previous
+
+            self.assertTrue(evidence["is_git"])
+            self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin loader regression")
+    def test_darwin_dyld_variables_are_not_preserved(self) -> None:
+        environment = GIT_EVIDENCE.git_subprocess_environment(
+            {
+                "DYLD_INSERT_LIBRARIES": "/tmp/attacker.dylib",
+                "DYLD_LIBRARY_PATH": "/tmp/attacker-lib",
+                "DYLD_FRAMEWORK_PATH": "/tmp/attacker-frameworks",
+                "DYLD_PRINT_LIBRARIES": "1",
+            }
+        )
+        self.assertFalse(any(key.startswith("DYLD_") for key in environment))
 
     def test_git_command_output_is_bounded_before_buffering(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            self.init_repo(root)
             noisy_git = root / "noisy-git"
             noisy_git.write_text(
                 "#!/bin/sh\n/usr/bin/yes A | /usr/bin/head -c 10000\n",
@@ -386,25 +770,29 @@ class GitEvidenceTests(unittest.TestCase):
                     )
 
     def test_preexec_git_runner_rejects_multithreaded_parent_before_popen(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
-            GIT_EVIDENCE.threading,
-            "active_count",
-            return_value=2,
-        ), mock.patch.object(GIT_EVIDENCE.subprocess, "Popen") as popen:
-            with self.assertRaisesRegex(
-                ValueError,
-                "git_evidence_preexec_requires_single_thread",
-            ):
-                GIT_EVIDENCE.run_git_bytes(
-                    Path(temp_dir),
-                    ("rev-parse", "--show-object-format"),
-                    operation="thread_guard",
-                )
-            popen.assert_not_called()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.init_repo(root)
+            with mock.patch.object(
+                GIT_EVIDENCE.threading,
+                "active_count",
+                return_value=2,
+            ), mock.patch.object(GIT_EVIDENCE.subprocess, "Popen") as popen:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "git_evidence_preexec_requires_single_thread",
+                ):
+                    GIT_EVIDENCE.run_git_bytes(
+                        root,
+                        ("rev-parse", "--show-object-format"),
+                        operation="thread_guard",
+                    )
+                popen.assert_not_called()
 
     def test_all_post_popen_setup_failures_kill_reap_and_close_pipes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            self.init_repo(root)
             incomplete = mock.Mock()
             incomplete.pid = 4242
             incomplete.stdout = None
@@ -470,14 +858,27 @@ class GitEvidenceTests(unittest.TestCase):
             interrupted.stderr = mock.Mock()
             interrupted.wait.return_value = 0
 
+            real_monotonic = GIT_EVIDENCE.time.monotonic
+            child_started = False
+
+            def start_interrupted_child(*_args, **_kwargs):
+                nonlocal child_started
+                child_started = True
+                return interrupted
+
+            def interrupt_after_child_start():
+                if child_started:
+                    raise KeyboardInterrupt
+                return real_monotonic()
+
             with mock.patch.object(
                 GIT_EVIDENCE.subprocess,
                 "Popen",
-                return_value=interrupted,
+                side_effect=start_interrupted_child,
             ), mock.patch.object(
                 GIT_EVIDENCE.time,
                 "monotonic",
-                side_effect=KeyboardInterrupt,
+                side_effect=interrupt_after_child_start,
             ), mock.patch.object(
                 GIT_EVIDENCE,
                 "_terminate_git_process_group",

@@ -31,6 +31,7 @@ LINUX_STATX_PROVIDER = "linux_statx"
 LINUX_NAME_TO_HANDLE_PROVIDER = "linux_name_to_handle_at"
 DARWIN_FSTATFS_PROVIDER = "darwin_fstatfs"
 FILESYSTEM_FSTAT_PROVIDER = "filesystem_fstat"
+DARWIN_MNT_LOCAL = 0x00001000
 
 READ_ONLY_EVIDENCE = "read_only_evidence"
 NON_DESTRUCTIVE_ARTIFACT_PACKAGE_CREATION = "non_destructive_artifact_package_creation"
@@ -609,6 +610,7 @@ def probe_darwin_fstatfs(
             int(payload.f_fsid.value[1]),
             int(payload.f_type),
             filesystem_type,
+            int(payload.f_flags),
             mount_on,
             mount_from,
         ),
@@ -863,6 +865,7 @@ __all__ = [
     "ASSURANCE_RANK",
     "AT_EMPTY_PATH",
     "DARWIN_FSTATFS_PROVIDER",
+    "DARWIN_MNT_LOCAL",
     "DEFAULT_PROVIDERS",
     "FILESYSTEM_FSTAT_PROVIDER",
     "KNOWN_PROVIDER_NAMES",

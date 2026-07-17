@@ -4,10 +4,10 @@ The Apply Orchestrator defines a resumable Step 4 artifact protocol. It does not
 
 ## Runtime Location
 
-Target repositories store apply artifacts under:
+CodexQB stores Apply artifacts outside the target repository in a fixed, repository-identity-bound controller-state directory:
 
 ```text
-.codexqb/apply-runs/<apply-run-id>/
+<passwd-home>/.codex/codexqb-trust/controller-state-v1/<repository-identity>/.codexqb/apply-runs/<apply-run-id>/
   Apply-Run.json
   Progress.json
   Events.jsonl
@@ -27,30 +27,106 @@ Target repositories store apply artifacts under:
   Result.json
 ```
 
-These runtime directories are created in the target repository, not in the CodexQB source tree except for tests and examples.
+Production derives the controller store from the effective account's passwd home and accepts no `HOME`, `CODEXQB_TRUST_ROOT`, or `CODEXQB_CONTROLLER_STORE_ROOT` path override. Tests may inject a private home provider. Legacy in-repository `.codexqb/apply-runs/` trees are archive-only and cannot be resumed, replaced, mutated, verified, or finalized.
 Non-`no_action` runs derive initial task briefs from Step 4 READY or READY_WITH_WARNINGS entries in `Planner-docs/Sub-Planing-Audit.md` when available. The audit-derived source sub-plan path and hash are recorded in both `Progress.json` and `Brief.md`.
 When present in the active sub-plan, the controller also copies the source sub-plan SHA-256, the full structured Implementation Contract, `implementation_contract_digest`, `task_contract_digest`, and fresh-context contract signals into each task: acceptance criteria, allowed/forbidden paths, parent signals, dependencies, framework ownership, algorithmic invariants, planned validation commands, `validation_command_ids`, outputs, risk/security requirements, and the security review flag. The same structured contract is included in `Brief.md`, verified reports, and subagent dispatch prompts so fresh agents can work from the task contract without inheriting parent chat history.
-`apply_run.py prepare` must run strict Step 4 validation before writing action artifacts. `Apply-Run.json.step4_readiness` records validator status, a validator output hash, and the execution queue state used to accept READY tasks or `NO_ACTION_REQUIRED`.
-Use `apply_run.py prepare` for new runs; `init` remains a compatibility alias. Use `apply_run.py dispatch` before `subagent_serial` implementation to write a fresh-context `Dispatch-Packet.json` that can be converted into a Codex `multi_agent_v1.spawn_agent` call by the parent agent. After the parent calls the actual Codex tool, use `apply_run.py record-agent` to record the spawned agent ID and later the completed or failed result. Implementers and fixers return one structured JSON payload and write no Apply artifact; the controller must pass it to `apply_run.py normalize-writer` before recording completion or advancing writer state. Writer normalization rejects fields outside the public report schema. A `PENDING` report is the exact one-field placeholder; the first accepted controller-normalized writer report records task/agent identity and writer output, while later evidence-bound completion adds immutable contract, change-set, diff, and receipt digests. Reviewer dispatch and lifecycle calls must carry the matching `--review-phase spec`, `quality`, `security`, or `final`. Reviewers stay read-only and return exactly one structured JSON payload; the controller passes that payload to `apply_run.py normalize-review` before `record-agent --status completed`. Use `apply_run.py transition` for state changes so `Events.jsonl` remains the append-only transition truth. After implementation reaches `IMPLEMENTED`, use `apply_run.py capture-evidence`, then run `apply_run.py run-validation` for every planned validation ID and normalize the enriched writer report again so it binds the controller-issued receipt, change-set, contract, and patch digests. After the controller normalizes a reviewer return and records that lifecycle completed, use `apply_run.py publish-review` to issue its signed completion receipt. Use `apply_run.py recover-lock` only for expired writer locks to move an abandoned `IMPLEMENTING` task to `BLOCKED` or `NEEDS_CONTEXT`. Use `apply_run.py reconcile` for external adapter fallback before dispatch. `finalize` remains fail-closed until every task is VERIFIED, which the current controller-only evidence protocol cannot achieve without host-issued agent attestation. `Progress.json` is the current state snapshot.
+The launcher-backed Apply `prepare` operation must run strict Step 4 validation before writing action artifacts. `Apply-Run.json.step4_readiness` records validator status, a validator output hash, and the execution queue state used to accept READY tasks or `NO_ACTION_REQUIRED`.
+Every Apply operation named in this section is invoked only through the exact
+launcher command shown with each request below. Dynamic root, run, task, agent,
+report, and body values exist only in the adjacent non-executable JSON data
+object. The host process must pass exactly one bounded object directly to the
+child process's stdin. Never materialize a request with echo, printf, a pipe,
+redirection, a heredoc, command substitution, environment variables, shell
+interpolation, or a temporary/repository file. If direct host-to-child stdin is
+unavailable, stop as `BLOCKED`.
+
+Use `prepare` for new runs; `init` remains a compatibility alias. Use `dispatch` before `subagent_serial` implementation to write a fresh-context `Dispatch-Packet.json` that can be converted into a Codex `multi_agent_v1.spawn_agent` call by the parent agent. After the parent calls the actual Codex tool, use `record-agent` to record the spawned agent ID and later the completed or failed result. Implementers and fixers return one structured JSON payload and write no Apply artifact; the controller must pass it to `normalize-writer` before recording completion or advancing writer state. Writer normalization rejects fields outside the public report schema. A `PENDING` report is the exact one-field placeholder; the first accepted controller-normalized writer report records task/agent identity and writer output, while later evidence-bound completion adds immutable contract, change-set, diff, and receipt digests. Reviewer dispatch and lifecycle calls must carry the matching `--review-phase spec`, `quality`, `security`, or `final`. Reviewers stay read-only and return exactly one structured JSON payload; the controller passes that payload to `normalize-review` before `record-agent --status completed`. Use `transition` for state changes so `Events.jsonl` remains the append-only transition truth. After implementation reaches `IMPLEMENTED`, use `capture-evidence`, then run `run-validation` for every planned validation ID and normalize the enriched writer report again so it binds the controller-issued receipt, change-set, contract, and patch digests. After the controller normalizes a reviewer return and records that lifecycle completed, use `publish-review` to issue its signed completion receipt. Use `recover-lock` only for expired writer locks to move an abandoned `IMPLEMENTING` task to `BLOCKED` or `NEEDS_CONTEXT`. Use `reconcile` for external adapter fallback before dispatch. `finalize` remains fail-closed until every task is VERIFIED, which the current controller-only evidence protocol cannot achieve without host-issued agent attestation. `Progress.json` is the current state snapshot.
 
 The evidence and review portion of the public CLI is:
 
 ```bash
-apply_run.py normalize-writer --run-dir <run-dir> --task-id <task-id> --role implementer --agent-id <agent-id> --report-json '{"status":"DONE","task_id":"<task-id>","implementer_agent_id":"<agent-id>","files_changed":["src/example.py"],"concerns":[]}' --actor controller
-apply_run.py record-agent --run-dir <run-dir> --task-id <task-id> --role implementer --agent-id <agent-id> --status completed --actor controller
-apply_run.py transition --run-dir <run-dir> --task-id <task-id> --to IMPLEMENTED --actor <agent-id>
-apply_run.py capture-evidence --run-dir <run-dir> --task-id <task-id> --actor controller
-apply_run.py run-validation --run-dir <run-dir> --task-id <task-id> --validation-id VAL-01 --actor controller
-apply_run.py dispatch --run-dir <run-dir> --task-id <task-id> --role task_reviewer --review-phase spec --actor controller
-apply_run.py record-agent --run-dir <run-dir> --task-id <task-id> --role task_reviewer --review-phase spec --agent-id <agent-id> --status spawned --actor controller
-apply_run.py normalize-review --run-dir <run-dir> --task-id <task-id> --review-phase spec --agent-id <agent-id> --report-json '{"status":"COMPLETE","phase":"spec","verdict":"pass","task_id":"<task-id>","reviewer_agent_id":"<agent-id>","evidence":["reviewed current patch and receipts"]}' --actor controller
-apply_run.py record-agent --run-dir <run-dir> --task-id <task-id> --role task_reviewer --review-phase spec --agent-id <agent-id> --status completed --actor controller
-apply_run.py publish-review --run-dir <run-dir> --task-id <task-id> --review-phase spec --actor controller
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller apply -- request-stdin
+```
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["normalize-writer","--root","<project-root>","--run-dir","<run-dir>","--task-id","<task-id>","--role","implementer","--agent-id","<agent-id>","--report-json","{\"status\":\"DONE\",\"task_id\":\"<task-id>\",\"implementer_agent_id\":\"<agent-id>\",\"files_changed\":[\"src/example.py\"],\"concerns\":[]}","--actor","controller"]}
+```
+
+```bash
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller apply -- request-stdin
+```
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["record-agent","--root","<project-root>","--run-dir","<run-dir>","--task-id","<task-id>","--role","implementer","--agent-id","<agent-id>","--status","completed","--actor","controller"]}
+```
+
+```bash
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller apply -- request-stdin
+```
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["transition","--root","<project-root>","--run-dir","<run-dir>","--task-id","<task-id>","--to","IMPLEMENTED","--actor","<agent-id>"]}
+```
+
+```bash
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller apply -- request-stdin
+```
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["capture-evidence","--root","<project-root>","--run-dir","<run-dir>","--task-id","<task-id>","--actor","controller"]}
+```
+
+```bash
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller apply -- request-stdin
+```
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["run-validation","--root","<project-root>","--run-dir","<run-dir>","--task-id","<task-id>","--validation-id","VAL-01","--actor","controller"]}
+```
+
+```bash
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller apply -- request-stdin
+```
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["dispatch","--root","<project-root>","--run-dir","<run-dir>","--task-id","<task-id>","--role","task_reviewer","--review-phase","spec","--actor","controller"]}
+```
+
+```bash
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller apply -- request-stdin
+```
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["record-agent","--root","<project-root>","--run-dir","<run-dir>","--task-id","<task-id>","--role","task_reviewer","--review-phase","spec","--agent-id","<agent-id>","--status","spawned","--actor","controller"]}
+```
+
+```bash
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller apply -- request-stdin
+```
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["normalize-review","--root","<project-root>","--run-dir","<run-dir>","--task-id","<task-id>","--review-phase","spec","--agent-id","<agent-id>","--report-json","{\"status\":\"COMPLETE\",\"phase\":\"spec\",\"verdict\":\"pass\",\"task_id\":\"<task-id>\",\"reviewer_agent_id\":\"<agent-id>\",\"evidence\":[\"reviewed current patch and receipts\"]}","--actor","controller"]}
+```
+
+```bash
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller apply -- request-stdin
+```
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["record-agent","--root","<project-root>","--run-dir","<run-dir>","--task-id","<task-id>","--role","task_reviewer","--review-phase","spec","--agent-id","<agent-id>","--status","completed","--actor","controller"]}
+```
+
+```bash
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller apply -- request-stdin
+```
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["publish-review","--root","<project-root>","--run-dir","<run-dir>","--task-id","<task-id>","--review-phase","spec","--actor","controller"]}
 ```
 
 Repeat the read-only reviewer lifecycle with `task_reviewer`/`quality`, then `security_reviewer`/`security` when required, and finally `final_reviewer`/`final`. The order is always `dispatch -> record spawned -> normalize-review -> record completed -> publish-review`. `publish-review` requires the matching controller-recorded completed lifecycle and normalized phase report; it cannot manufacture a host-issued reviewer identity or completion attestation.
 
-`apply_spec_id` is deterministic for the selected mode, source snapshot, workspace baseline, and Step 4 READY queue. `apply_run_id` is unique per invocation. Explicit output directories must be direct, non-symlink children of `.codexqb/apply-runs/`. To continue a schema-v3 run, pass `--resume` with the exact `--output-dir`. Apply schema-v1 and schema-v2 artifacts predate the live receipt contract and are archive-only: they cannot be validated, resumed, replaced, trusted-verified, finalized, or migrated by synthesizing receipts. Preserve/archive them and create a new v3 run. To intentionally regenerate a v3 run, pass `--replace`. Replacement requires a complete manifest digest, matching marker, run/root inode binding, and a registry receipt authenticated by the private out-of-repository HMAC key (default `~/.codex/codexqb-trust/apply-run-hmac-v1.key`). Its adjacent trust-state record binds the initialized key ID: a missing or mismatched key is recovery-required and is never silently rotated. Initialization writes through the freshly created run descriptor and publishes that receipt only after all initial artifacts and the marker are durable. Copied, partial, self-attested, unsigned, and pre-registration runs fail closed on replacement. The replace guard binds the entry repository root descriptor, then rejects the repository root, unmanaged or nested directories, indirect targets, mounts, and changed root/parent/run identities before deletion. Managed run creation requires directory-descriptor and no-follow filesystem primitives; replacement additionally requires atomic no-replace rename support. Unsupported hosts fail closed instead of falling back to path-based deletion. Quarantine conflicts, stale registry receipts, missing trust keys, and interrupted deletion states block later replacement/recreation until manually inspected. The HMAC boundary does not claim protection from a process that can read the same OS account's trust key.
+`apply_spec_id` is deterministic for the selected mode, source snapshot, workspace baseline, and Step 4 READY queue. `apply_run_id` is unique per invocation. Explicit output directories must be direct, non-symlink children of the repository-bound external controller-state `.codexqb/apply-runs/` directory. To continue a schema-v3 run, pass `--resume` with the exact `--output-dir`. Apply schema-v1 and schema-v2 artifacts and legacy in-repository Apply trees are archive-only: they cannot be validated, resumed, replaced, trusted-verified, finalized, or migrated by synthesizing receipts. Preserve/archive them and create a new external v3 run. To intentionally regenerate a v3 run, pass `--replace`. Replacement requires a complete manifest digest, matching marker, run/root inode binding, and a registry receipt authenticated by the private HMAC key at `<passwd-home>/.codex/codexqb-trust/apply-run-hmac-v1.key`. Its adjacent trust-state record binds the initialized key ID: a missing or mismatched key is recovery-required and is never silently rotated. Initialization writes through the freshly created run descriptor and publishes that receipt only after all initial artifacts and the marker are durable. Copied, partial, self-attested, unsigned, and pre-registration runs fail closed on replacement. The replace guard binds the entry repository root descriptor, then rejects the repository root, unmanaged or nested directories, indirect targets, mounts, and changed root/parent/run identities before deletion. Managed run creation requires directory-descriptor and no-follow filesystem primitives; replacement additionally requires atomic no-replace rename support. Unsupported hosts fail closed instead of falling back to path-based deletion. Quarantine conflicts, stale registry receipts, missing trust keys, and interrupted deletion states block later replacement/recreation until manually inspected. The HMAC boundary does not claim protection from a process that can read the same OS account's trust key.
 
 Normal Apply mutations open only a registered and HMAC-verified direct run child, then open its task directory and artifact names relative to retained descriptors. A symlinked managed parent, run/task directory, or final target fails closed. Shared `scripts/artifact_io.py` replacement uses a random same-directory `O_EXCL | O_NOFOLLOW` temporary, a full write loop, file `fsync`, descriptor-relative atomic replace, directory `fsync`, and cleanup before commit. The controller holds a run-directory `flock` across each cooperating mutation. `Events.jsonl` is parsed as a complete contiguous history and published by full-file atomic replace with the unique next sequence while that lock is held. Each event binds `previous_event_sha256` and a canonical `event_sha256`; partial trailing lines, malformed records, colliding or reordered sequences, and broken links fail closed. If directory `fsync` fails after replace, the controller reconciles exact intended bytes under the lock and retries; `event_log_commit_state_unknown` requires inspection and validation, not a blind mutation retry. A transition-event/`Progress.json` mismatch fails validation and has no automatic multi-file recovery; archive the run and prepare a fresh one. This preserves logical append-only behavior with per-file atomicity, not a multi-file transaction. The unkeyed chain has no trusted external head anchor and therefore does not detect deletion of a complete valid tail or whole-file replacement with a recomputed chain; it is an integrity link rather than independent host attestation. The current unreleased schema-v3 contract requires `event_chain_version: 1`, so pre-chain v3 development snapshots are archive-only and require a fresh run. Hosts without the required descriptor, no-follow, locking, or replace primitives fail closed.
 
@@ -84,7 +160,7 @@ The packaged public schema reference is `references/apply-run-schema.json`. Runt
 
 - `direct`: parent-only execution for a bounded selected batch. It may implement, capture the live change set, and run planned validation, but it cannot independently publish the reviewer receipt chain.
 - `subagent_serial`: parent controller dispatches one fresh implementer at a time, then runs read-only independent reviews. It can build a complete controller-evidence chain, but that chain remains unattested until the host supplies identity/completion proof and therefore cannot currently reach `VERIFIED` or finalize.
-- `external_superpowers`: optional adapter when Superpowers is already installed; CodexQB remains top-level controller. Availability must be checked before dispatch. If unavailable, run `apply_run.py reconcile` so the artifact mode becomes `subagent_serial` before implementation starts.
+- `external_superpowers`: optional adapter when Superpowers is already installed; CodexQB remains top-level controller. Availability must be checked before dispatch. If unavailable, run the launcher-backed Apply `reconcile` operation so the artifact mode becomes `subagent_serial` before implementation starts.
 - `no_action`: record NO_ACTION_REQUIRED without starting implementation.
 
 ## State Machine

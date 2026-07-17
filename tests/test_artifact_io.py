@@ -31,6 +31,35 @@ class ArtifactIOTests(unittest.TestCase):
     def open_directory(self, path: Path) -> int:
         return os.open(path, ARTIFACT_IO.secure_directory_open_flags())
 
+    def test_parent_authority_failure_rolls_back_new_directory(self) -> None:
+        for failing_call in (1, 2, 3):
+            with self.subTest(failing_call=failing_call), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                root_fd = self.open_directory(root)
+                calls = 0
+
+                def authority(_descriptor: int) -> bool:
+                    nonlocal calls
+                    calls += 1
+                    return calls != failing_call
+
+                try:
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "artifact_parent_authority_rejected",
+                    ):
+                        ARTIFACT_IO.open_or_create_child_directory(
+                            root_fd,
+                            "Planner-docs",
+                            create=True,
+                            parent_authority_validator=authority,
+                        )
+                finally:
+                    os.close(root_fd)
+
+                self.assertEqual(calls, failing_call)
+                self.assertFalse((root / "Planner-docs").exists())
+
     def test_atomic_write_rejects_final_target_symlink_without_modifying_victim(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

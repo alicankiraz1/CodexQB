@@ -26,6 +26,27 @@ PLUGIN_ARTIFACT = "plugin"
 SOURCE_ARTIFACT = "source"
 ARTIFACT_TYPES = {PLUGIN_ARTIFACT, SOURCE_ARTIFACT}
 
+# These files are local-checkout controllers, not package payload.  An
+# extracted tree is evidence consumed by the trusted outer launcher and must
+# never carry a self-validation entry point that can be mistaken for authority.
+SOURCE_CONTROLLER_ONLY_PATHS = frozenset(
+    {
+        "scripts/run_extracted_validation.py",
+        "scripts/validate.sh",
+    }
+)
+SOURCE_FORBIDDEN_CONTROLLER_PATHS = frozenset(
+    {
+        *SOURCE_CONTROLLER_ONLY_PATHS,
+        # Reserved permanently: repo-owned HMAC/source-authority issuance was
+        # removed because same-UID repository code cannot protect such a key.
+        "scripts/issue_trusted_source_authority.py",
+    }
+)
+_SOURCE_CONTROLLER_ONLY_FOLDED_PATHS = frozenset(
+    path.casefold() for path in SOURCE_FORBIDDEN_CONTROLLER_PATHS
+)
+
 PLUGIN_SOURCE_PREFIX = "plugins/codexqb/"
 SOURCE_ARCHIVE_PREFIX = "CodexQB/"
 PLUGIN_SKILL_PATH = "skills/codexqb/SKILL.md"
@@ -147,6 +168,8 @@ def source_to_artifact_path(source_path: str, artifact_type: str) -> str | None:
     if canonical is None:
         raise ValueError("package_manifest_preflight_failed=path_not_portable")
     if artifact_type == SOURCE_ARTIFACT:
+        if source_controller_path(canonical):
+            return None
         return canonical
     if artifact_type != PLUGIN_ARTIFACT:
         raise ValueError("package_artifact_type_invalid")
@@ -164,6 +187,8 @@ def denied_path_reason(path: str, artifact_type: str) -> str | None:
     canonical = canonical_relative_path(path)
     if canonical is None:
         return "path_not_portable"
+    if artifact_type == SOURCE_ARTIFACT and source_controller_path(canonical):
+        return "source_controller_path"
     pure = PurePosixPath(canonical)
     folded_parts = tuple(part.casefold() for part in pure.parts)
     folded_name = pure.name.casefold()
@@ -204,6 +229,22 @@ def denied_path_reason(path: str, artifact_type: str) -> str | None:
     elif artifact_type != SOURCE_ARTIFACT:
         return "artifact_type_invalid"
     return None
+
+
+def source_controller_path(path: str) -> bool:
+    """Return whether a portable source path aliases controller-only code.
+
+    Portable package policy is intentionally stricter than the current host's
+    filesystem.  A case-only alias that is distinct on Linux aliases the
+    controller entrypoint on default macOS and Windows filesystems, so it must
+    be denied at export, ZIP verification, extraction, and root verification.
+    """
+
+    canonical = canonical_relative_path(path)
+    return (
+        canonical is not None
+        and canonical.casefold() in _SOURCE_CONTROLLER_ONLY_FOLDED_PATHS
+    )
 
 
 def payload_has_zip_magic(data: bytes | bytearray) -> bool:

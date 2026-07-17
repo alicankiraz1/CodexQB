@@ -68,7 +68,7 @@ CodexQB publishes two different ZIP layouts. They are deliberately not interchan
 | Artifact | Extracted root | Intended use |
 | --- | --- | --- |
 | `codexqb-plugin-<version>.zip` | `.codex-plugin/`, `skills/`, `PACKAGE-MANIFEST.json` | Plugin payload for a marketplace publisher, cache, or air-gapped local-marketplace assembly |
-| `CodexQB-source-<version>.zip` | `CodexQB/` | Complete source, tests, docs, CI, and maintenance tooling |
+| `CodexQB-source-<version>.zip` | `CodexQB/` | Reviewable source, tests, docs, CI, and maintenance tooling, excluding the two checkout-only validation controllers |
 
 The Codex CLI installs plugins from a configured marketplace snapshot; `codex plugin add` does not accept a ZIP path directly. The repository marketplace commands above are therefore the canonical end-user installation path. If a plugin ZIP is used for offline assembly, verify it before extraction, place the extracted plugin root at the path referenced by a local marketplace's `.agents/plugins/marketplace.json`, add that marketplace, and then install `codexqb@<marketplace-name>`.
 
@@ -147,7 +147,7 @@ CodexQB 0.3.0 keeps older planner artifacts readable outside strict execution ga
 
 New Apply runs use `apply_run_schema_version: 3`. Apply schema-v1 and schema-v2 run directories predate the signed live change-set, complete command-receipt, and ordered reviewer-receipt contract; preserve them as archive-only evidence and prepare a new v3 run instead of attempting validation, resume, replacement, trusted verification, finalization, or in-place migration. A v3 evidence chain uses `capture-evidence`, `run-validation`, and phase-aware reviewer `dispatch`/`record-agent` followed by `publish-review` in spec, quality, optional security, and final order. Direct mode cannot independently produce that reviewer-agent chain. `subagent_serial` can build the complete but unattested chain, but in the current runtime trusted `VERIFIED` and `finalize` remain blocked until a host-issued agent attestation contract is available.
 
-Extracted source packages without `.git/` metadata verify `PACKAGE-MANIFEST.json` before Git discovery and then validate in filesystem hygiene mode. Use `CODEXQB_VALIDATE_SKIP_UNITTESTS=1 CODEXQB_VALIDATE_SKIP_BEHAVIOR_SMOKE=1 bash scripts/validate.sh` only for that bounded package-copy fallback; normal repository validation should run the behavior smokes and release privacy scan. A plugin payload intentionally omits repository-level validation tooling and is verified through its manifest plus the local-marketplace installation smoke.
+Extracted source packages have no self-validation authority and case-insensitively omit the checkout-only `scripts/validate.sh` and `scripts/run_extracted_validation.py` entrypoints. From the exact selected checkout, run `python3 -I -S -B scripts/run_extracted_validation.py --expected-head <externally-asserted-full-HEAD> --zip <source.zip> --root <extracted-root> --profile static`. The launcher pair-binds that HEAD, checkout/root identity, held controller bundle, archive, manifest, and extracted inventory; materializes controller bytes into a private fsynced snapshot; and treats the target only as descriptor-bound data for static policy. Its unsigned diagnostic explicitly reports `controller_observed_explicit_source_selection`, `host_attested=false`, `verified=false`, and `finalization_allowed=false`. It is not publisher authentication, host attestation, Goal/Apply authority, Step 4 readiness, or release finalization. Dynamic extracted tests remain deferred until the PR4 host-native sandbox. A plugin payload likewise omits repository-level validation tooling and is verified through its manifest plus the local-marketplace installation smoke.
 
 Package export CLI failures emit stable path-safe error codes. A successful export reports `output=created` instead of echoing the destination path; treat the requested destination supplied by the caller as the location to inspect.
 
@@ -178,8 +178,8 @@ If `$codexqb` is not recognized:
 If Goal preparation, repository evidence capture, packaging, or Apply reports `secure_repository_mount_identity_unavailable`, run the dependency-free capability doctor:
 
 ```bash
-python3 plugins/codexqb/skills/codexqb/scripts/doctor.py
-python3 plugins/codexqb/skills/codexqb/scripts/doctor.py --json
+python3 -I -S -B plugins/codexqb/skills/codexqb/scripts/doctor.py
+python3 -I -S -B plugins/codexqb/skills/codexqb/scripts/doctor.py --json
 ```
 
 `status=expected_unsupported` means the runtime offers no usable descriptor-bound mount provider; move the operation to a supported Linux or macOS host. `status=probe_failed` means an advertised provider failed or comparable providers disagreed; treat that as a blocker and repair the host/runtime before retrying. The report never includes raw mount IDs, repository/home paths, credentials, or environment values.

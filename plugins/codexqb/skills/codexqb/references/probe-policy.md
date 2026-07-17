@@ -4,12 +4,12 @@ Use probes to resolve evidence gaps without turning planning into uncontrolled e
 
 ## Tier 0: Static Local Probe
 
-Read-only file inspection, manifest parsing, git history inspection, and local documentation review.
+Named RepositoryIO inspect/search receipts, safe model projections for exact paths, manifest evidence, controller-owned workspace evidence, and local documentation review. Missing history or workspace evidence stays unknown; Tier 0 never falls back to raw Git or filesystem commands.
 
 - Approval: not required.
 - Timeout: keep commands short and bounded.
 - Cleanup: none expected.
-- Evidence artifact: concise path, line, or command summary.
+- Evidence artifact: concise receipt ID/hash, safe path/line location, or approved validation-command summary.
 
 ## Tier 1: Bounded Local Probe
 

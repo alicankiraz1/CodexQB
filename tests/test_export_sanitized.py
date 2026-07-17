@@ -2284,10 +2284,22 @@ class ExportSanitizedTests(unittest.TestCase):
 
     def test_export_rejects_invalid_utf8_text_and_binary_secret_without_replacing_output(self) -> None:
         utf32_fixture = "sk-" + "U" * 40
+        non_ascii_assignment = "password=" + "密碼值" * 16
         fixtures = (
             ("invalid.py", b"print('safe')\n\xff"),
             ("payload.bin", b"\xff" + ("sk-" + "B" * 40).encode("ascii")),
             ("payload-utf32.bin", utf32_fixture.encode("utf-32-le")),
+            ("payload-utf8", non_ascii_assignment.encode("utf-8")),
+            ("payload-utf16", non_ascii_assignment.encode("utf-16-be")),
+            ("payload-opaque", b"password=" + b"\xff" * 40),
+            (
+                "opaque-wide-block",
+                b"\x81" * 61
+                + b"\xff\xfe"
+                + (
+                    "name: password\nvalue: this-is-a-real-long-password-value\n"
+                ).encode("utf-16-le"),
+            ),
         )
         for name, data in fixtures:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_dir:
@@ -2303,6 +2315,7 @@ class ExportSanitizedTests(unittest.TestCase):
 
                 self.assertEqual(output.read_bytes(), original)
                 self.assertNotIn(utf32_fixture, str(caught.exception))
+                self.assertNotIn(non_ascii_assignment, str(caught.exception))
 
     def test_source_export_rejects_semantic_credential_assignments_without_disclosure(self) -> None:
         fixture = "this-is-a-real-long-password-value"
@@ -2370,6 +2383,74 @@ class ExportSanitizedTests(unittest.TestCase):
                 + repr(neutral_join_tail.encode())
                 + ")))\n",
             ),
+            (
+                "credential-pair.md",
+                "release failure: password, '" + fixture + "'\n",
+            ),
+            (
+                "credential-table.md",
+                "| Field | Value |\n| --- | --- |\n| password | " + fixture + " |\n",
+            ),
+            (
+                "credential-failure.txt",
+                "failure=('password', {'value': '" + fixture + "'})\n",
+            ),
+            (
+                "credential-record.yaml",
+                "- name: AWS_SECRET_ACCESS_KEY\n  value: " + fixture + "\n",
+            ),
+            ("opaque-pair", "failure=('password','" + fixture + "')\n"),
+            (
+                "opaque-record",
+                json.dumps({"name": "password", "value": fixture}) + "\n",
+            ),
+            ("opaque-block", "name: password\nvalue: " + fixture + "\n"),
+            ("opaque-table", "| password | " + fixture + " |\n"),
+            (
+                "credential-concat.txt",
+                "failure=('password', '" + fixture + "' + '')\n",
+            ),
+            (
+                "credential-concat-terminator",
+                "failure=('password', ('$PASSWORD' + '') and '"
+                + fixture
+                + "')\n",
+            ),
+            (
+                "credential-fstring.txt",
+                "failure=('password', f'" + fixture + "' + '')\n",
+            ),
+            (
+                "credential-concat-boundary.txt",
+                "failure=('password', '$PASSWORD'"
+                + (" " * 4084)
+                + "+ '"
+                + fixture
+                + "')\n",
+            ),
+            (
+                "credential-rendered.md",
+                "| Field | Value |\n| --- | --- |\n| pass&#119;ord | "
+                + fixture
+                + " |\n",
+            ),
+            ("credential-rendered-direct.md", "**password**=" + fixture + "\n"),
+            ("credential-rendered.rst", "``password``=" + fixture + "\n"),
+            ("credential-rendered.html", "<b>password</b>=" + fixture + "\n"),
+            ("credential-rendered.xml", "<label>password</label>=" + fixture + "\n"),
+            ("credential-rendered.txt", "pass&#119;ord=" + fixture + "\n"),
+            (
+                "credential-structural.html",
+                "<table><tr><td>password</td><td>"
+                + fixture
+                + "</td></tr></table>\n",
+            ),
+            (
+                "credential-structural.xml",
+                "<record><name>password</name><value>"
+                + fixture
+                + "</value></record>\n",
+            ),
         )
         for name, text in variants:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_dir:
@@ -2416,6 +2497,10 @@ class ExportSanitizedTests(unittest.TestCase):
             write_minimal_codexqb_tree(root)
             (root / "settings.py").write_text(
                 "PASSWORD = " + repr(b"${PASSWORD}") + "\n",
+                encoding="utf-8",
+            )
+            (root / "credential-placeholder.txt").write_text(
+                "failure=('password', '${' + 'PASSWORD}')\n",
                 encoding="utf-8",
             )
             output = base / "package.zip"
@@ -2478,6 +2563,61 @@ class ExportSanitizedTests(unittest.TestCase):
             self.assertIn("error_code=secret_like_path", result.stdout)
             self.assertNotIn(fixture, combined)
             self.assertNotIn("Traceback", combined)
+    def test_package_export_scans_binary_secret_across_eight_mib_window(self) -> None:
+        """The byte-safe overlap catches a token split at the 8 MiB boundary."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            git(root, "init")
+            write_minimal_codexqb_tree(root)
+            git_commit_all(root)
+            secret = b"sk-" + b"proj-" + b"C" * 40
+            boundary = 8 * 1024 * 1024
+            # Start the token four bytes before the core boundary and keep a
+            # non-word byte on either side so the credential boundary itself,
+            # not an unrelated regex boundary, is what the overlap exercises.
+            payload = b"\xff" * (boundary - 4) + secret + b"\x80"
+            (root / "payload").write_bytes(payload)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "^secret_like_content$",
+            ) as raised:
+                EXPORT_MODULE.create_zip(
+                    root,
+                    root / "CodexQB-sanitized.zip",
+                    include_untracked=True,
+                    allow_dirty=True,
+                    allow_head_mismatch=True,
+                )
+            self.assertNotIn(secret.decode("ascii"), str(raised.exception))
+
+    def test_tracked_suffixless_structural_record_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            git(root, "init")
+            write_minimal_codexqb_tree(root)
+            secret = "V" * 40
+            (root / "Dispatch-Packet").write_text(
+                json.dumps({"name": "password", "value": secret}) + "\n",
+                encoding="utf-8",
+            )
+            git_commit_all(root)
+            output = root / "CodexQB-sanitized.zip"
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "^secret_like_content$",
+            ) as caught:
+                EXPORT_MODULE.create_zip(
+                    root,
+                    output,
+                    allow_dirty=True,
+                    allow_head_mismatch=True,
+                )
+
+            self.assertNotIn(secret, str(caught.exception))
+            self.assertFalse(output.exists())
 
     def test_worktree_export_can_include_scanned_untracked_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

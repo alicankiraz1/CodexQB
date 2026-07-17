@@ -153,26 +153,50 @@ Repository inspection requirements:
 
 Before writing sub-plans, inspect the repository safely.
 
-Run only safe read-only commands such as:
-- pwd
-- git status --short --branch
-- git branch --show-current
-- git log --oneline -n 10
-- if [ -d Planner-docs ]; then find Planner-docs -maxdepth 3 -type f | sort; fi
-- cat Planner-docs/Main-Planing.md
-- if [ -f Planner-docs/Autopsy.md ]; then cat Planner-docs/Autopsy.md; fi
-- if [ -f Planner-docs/Project-Ontology.md ]; then cat Planner-docs/Project-Ontology.md; fi
-- if [ -f Planner-docs/Project-Comprehension.md ]; then cat Planner-docs/Project-Comprehension.md; fi
-- if [ -f Planner-docs/Planing-Ledger.md ]; then cat Planner-docs/Planing-Ledger.md; fi
-- ls
-- find . -maxdepth 3 \( -path './.git' -o -path './node_modules' -o -path './.venv' -o -path './dist' -o -path './build' -o -path './artifacts' \) -prune -o -type f -print | sort | head -300
-- for d in Planner-docs docs configs scripts services packages tests infra .github; do [ -d "$d" ] && find "$d" -maxdepth 2 -type f | sort | head -80; done
-- cat README.md if present
-- cat AGENTS.md if present
-- inspect pyproject.toml, package.json, Makefile, docker-compose files, CI workflow files, docs indexes, architecture docs, runbooks, test files, config examples, service skeletons, package skeletons, and policy files if present
+Use the mandatory Step 2 repository boundary:
 
-You may use ripgrep/grep for discovery:
-- rg "Faz|Phase|Stage|roadmap|plan|architecture|maturity|readiness|activation|production|security|policy|worker|scheduler|gateway|adapter|test|smoke|CI|API|database|Postgres|queue|artifact|approval|review|risk|acceptance|Linear|GitHub|Temporal|LangGraph|LiteLLM|Codex|OpenCode|Claude|Gemini" . --glob '!.git/**' --glob '!node_modules/**' --glob '!.venv/**' --glob '!dist/**' --glob '!build/**' --glob '!artifacts/**'
+```bash
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller repository-io -- request-stdin
+```
+
+Send each request below as one bounded JSON object directly to the child
+process's stdin through the host process API, invoking the fixed command once
+per object:
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["--root",".","inspect","--profile","step2"]}
+```
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["--root",".","search","--profile","step2"]}
+```
+
+The inspection receipt is the sole repository/worktree/VCS evidence source;
+never supplement it with raw Git or filesystem commands.
+
+Read Main-Planing and optional continuity artifacts only with the fixed
+request-stdin command and this stdin data request:
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["--root",".","read-model","--path","<repository-relative-path>"]}
+```
+
+Do not use raw enumeration or arbitrary content-search commands.
+
+Publish the index, ledger, Step2-Blocked document, and phase plans sequentially
+with this stdin data request (substitute only a stage-allowed path):
+
+```json
+{"schema":"codexqb.controller-argv/v1","argv":["--root",".","write-planner","--stage","step2","--path","<allowed-path>","--expected-sha256","<CURRENT_SHA256>"],"body":"<planner-markdown-body>"}
+```
+
+Use a separate validated JSON request containing `--expected-missing` only when
+absence is confirmed. Every write carries the receipt-derived CAS precondition.
+Never materialize requests with echo, printf, a pipe, redirection, a heredoc,
+command substitution, environment variables, shell interpolation, or a
+temporary/repository file. Validate after the sequence; report partial
+publication and stop on the first failure. Never silently retry or use a generic
+write fallback.
 
 If Planner-docs/Main-Planing.md is missing:
 - Do not attempt full Step 2 decomposition.
@@ -716,12 +740,14 @@ Operational validation requirements:
 5. Validate every generated sub-plan, not only a sample.
 6. Prefer the bundled read-only validator over ad hoc validation snippets:
 
-   python3 plugins/codexqb/skills/codexqb/scripts/validate_planner_docs.py --root . --mode step2 --strict
+   python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller planner-validator -- --root . --mode step2 --strict
 
-7. If an installed plugin exposes a different active skill script path, use that bundled validator path instead.
-8. If the validator is unavailable, perform equivalent all-file validation manually for every file and state that fallback clearly.
+7. Resolve `<CODEXQB_SKILL_ROOT>` only from the active Codex skill-loader path contract in `SKILL.md`.
+8. If the loader-supplied, controller-bound active root or validator is unavailable, stop as `BLOCKED`; manual/raw all-file validation is not an authority substitute.
 9. Avoid large noisy inline generation scripts unless unavoidable. If used, keep stdout concise and validate all outputs afterward.
-10. Use length-bounded secret checks. Do not use one-character `sk-` prefix patterns, because they can false-positive on normal filenames like task-spec.yaml. Do not run grep/ripgrep commands that print matched secret-bearing lines; prefer the bundled validator or file-name-only fallback scans such as `rg -l`.
+10. Use the bundled validator and named repository search profile for secret
+    discipline. If they are unavailable, stop as `BLOCKED`; no raw content
+    search fallback is permitted.
 
 Goal-following behavior:
 
@@ -742,10 +768,10 @@ A. Success:
 - no deferred phase has detailed files unless the index gives an explicit justification;
 - Planning Scope Manifest limits are respected;
 - every active sub-plan uses the required section structure and machine-readable implementation contract;
-- the bundled validator passes, or equivalent all-file validation has been completed and reported;
+- the bundled validator passes through the loader-supplied, controller-bound active skill root;
 - all generated content follows the language contract;
 - no files outside Planner-docs/ were modified;
-- git diff confirms only Planner-docs/ changes.
+- repository I/O receipts and workspace metadata confirm only the allowed Planner-docs targets changed.
 
 B. Blocked:
 - Planner-docs/Main-Planing.md is missing; or
@@ -762,39 +788,36 @@ Validation after writing:
 
 After generating all files:
 
-1. Run:
-   find Planner-docs -maxdepth 3 -type f | sort
+1. Invoke the fixed repository-io request-stdin command with this JSON object on
+   host-provided stdin and retain the inventory receipt:
+
+   ```json
+   {"schema":"codexqb.controller-argv/v1","argv":["--root",".","inspect","--profile","step2"]}
+   ```
 
 2. Verify all generated folders and files exist.
 
-3. Read back:
-   Planner-docs/Sub-Planing-Index.md
+3. Invoke the same fixed command with this JSON object on host-provided stdin
+   and retain its content hash receipt:
 
-4. Run the bundled validator if available:
-   python3 plugins/codexqb/skills/codexqb/scripts/validate_planner_docs.py --root . --mode step2 --strict
+   ```json
+   {"schema":"codexqb.controller-argv/v1","argv":["--root",".","read-model","--path","Planner-docs/Sub-Planing-Index.md"]}
+   ```
 
-5. If the bundled validator is unavailable, perform equivalent all-file validation by manually checking every generated sub-plan for:
-   - filename convention;
-   - folder/file phase number match;
-   - 13 required sections in the required order;
-   - duplicate numbering;
-   - missing or unindexed files;
-   - placeholder or repeated generic content.
+4. Run the bundled validator through the loader-supplied, controller-bound active skill root:
+   python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller planner-validator -- --root . --mode step2 --strict
 
-6. Run:
-   git diff -- Planner-docs
+5. If the loader-supplied, controller-bound active root or bundled validator is unavailable, stop as
+   `BLOCKED`; do not substitute repository-local discovery or manual/raw reads.
 
-7. Run:
-   git status --short -- Planner-docs
+6. Compare the before/after Step 2 inspection receipts and confirm that no
+   files outside the stage allowlist were modified.
 
-8. Run:
-   git status --short
+7. Treat the repository I/O inventory receipt as the authoritative all-file
+   list, including previously untracked Planner docs.
 
-9. Confirm no files outside Planner-docs were modified.
-
-10. Remember that git diff does not show untracked files. Use git status --short -- Planner-docs and find output when Planner-docs contains new untracked files.
-
-11. Check generated docs for secret leakage through the bundled validator. If the validator is unavailable, use only file-name-only fallback scans such as `rg -l` and never print matched secret values.
+8. Check generated docs for secret leakage through the bundled validator. If
+    it is unavailable, stop as `BLOCKED`; do not use a raw scan fallback.
    - do not include tokens;
    - do not include local private endpoint credentials;
    - do not include private keys.

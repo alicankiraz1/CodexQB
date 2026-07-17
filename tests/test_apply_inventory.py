@@ -6,10 +6,45 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tests.test_apply_run import APPLY_MODULE
+from tests.controller_test_support import real_trust_store_snapshot, temporary_controller_home
+from tests.held_runtime_test_support import held_runtime_test_provider
+from tests.test_apply_run import APPLY_MODULE, CONTROLLER_STORE_MODULE
+from tests.test_validate_planner_docs import write_audit, write_valid_step2_fixture
 
 
 class ApplyInventoryBoundsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls._real_trust_store_before_class = real_trust_store_snapshot()
+        cls._controller_home = temporary_controller_home()
+        cls._controller_home_provider = mock.patch.object(
+            CONTROLLER_STORE_MODULE,
+            "controller_home_directory",
+            return_value=Path(cls._controller_home.name).resolve(),
+        )
+        cls._controller_home_provider.start()
+        cls._held_runtime_provider = held_runtime_test_provider()
+        cls._held_runtime_provider.__enter__()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            cls._held_runtime_provider.__exit__(None, None, None)
+            cls._controller_home_provider.stop()
+            cls._controller_home.cleanup()
+            if real_trust_store_snapshot() != cls._real_trust_store_before_class:
+                raise AssertionError("real_controller_trust_store_changed_during_apply_inventory_tests")
+        finally:
+            super().tearDownClass()
+
+    def setUp(self) -> None:
+        self._real_trust_store_before_test = real_trust_store_snapshot()
+
+    def tearDown(self) -> None:
+        if real_trust_store_snapshot() != self._real_trust_store_before_test:
+            raise AssertionError("real_controller_trust_store_changed_during_apply_inventory_test")
+
     def git(self, root: Path, *arguments: str) -> None:
         subprocess.run(
             ["git", *arguments],
@@ -76,7 +111,7 @@ class ApplyInventoryBoundsTests(unittest.TestCase):
 
             with included.open("r+b") as handle:
                 handle.truncate(oversized)
-            with self.assertRaisesRegex(ValueError, "repository_evidence_file_too_large"):
+            with self.assertRaisesRegex(ValueError, "repository_io_workspace_proof_failed"):
                 APPLY_MODULE.workspace_baseline(root)
 
     def test_workspace_inventory_path_and_shared_total_limits_fail_closed(self) -> None:
@@ -163,6 +198,17 @@ class ApplyInventoryBoundsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             low_assurance = object()
+            docs = write_valid_step2_fixture(root)
+            write_audit(
+                docs,
+                "PASS",
+                readiness_rows=[
+                    "| Sub-Plan Path | Status | Finding IDs | Dependency State | Reason | Required Repair |",
+                    "|---|---|---|---|---|---|",
+                    "| Planner-docs/Faz-1-Plans/Faz1.1-local-contract.md | COMPLETE | none | satisfied | Already verified. | none |",
+                    "| Planner-docs/Faz-2-Plans/Faz2.1-live-gateway.md | SUPERSEDED | none | satisfied | Replaced by later plan. | none |",
+                ],
+            )
 
             with mock.patch.object(
                 APPLY_MODULE,

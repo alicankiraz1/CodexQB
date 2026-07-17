@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -13,6 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from tests.controller_test_support import assert_real_trust_store_unchanged
 from tests.test_export_sanitized import (
     EXPORT_MODULE,
     VALID_PLUGIN_SKILL,
@@ -20,6 +22,7 @@ from tests.test_export_sanitized import (
     write_minimal_codexqb_tree,
 )
 from tests.test_package_manifest import (
+    append_manifest_bound_file,
     create_plugin_package,
     rewrite_manifest_bound_file,
 )
@@ -100,6 +103,54 @@ class PackageExtractionTests(unittest.TestCase):
             self.assertFalse(output.exists())
             self.assert_no_extraction_residue(base, output.name)
 
+    def test_extractor_rejects_suffixless_structural_secret_before_publish(self) -> None:
+        secret = "V" * 40
+        fixtures = (
+            (
+                "opaque-pair",
+                ("failure=('password','" + secret + "')\n").encode("utf-8"),
+            ),
+            (
+                "opaque-wide-block",
+                b"\x81" * 61
+                + b"\xff\xfe"
+                + ("name: password\nvalue: " + secret + "\n").encode(
+                    "utf-16-le"
+                ),
+            ),
+            (
+                "credential-structural.html",
+                (
+                    "<table><tr><td>password</td><td>"
+                    + secret
+                    + "</td></tr></table>\n"
+                ).encode("utf-8"),
+            ),
+        )
+        for relative_path, data in fixtures:
+            with self.subTest(path=relative_path), tempfile.TemporaryDirectory() as temp_dir:
+                base = Path(temp_dir)
+                package = create_source_package(base)
+                forged = base / "forged-structural-secret.zip"
+                append_manifest_bound_file(
+                    package,
+                    forged,
+                    artifact_type="source",
+                    relative_path=relative_path,
+                    data=data,
+                )
+                output = base / "unpacked"
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^package_zip_secret_content_rejected$",
+                ) as caught:
+                    EXTRACT_MODULE.extract_verified_package(forged, output, "source")
+
+                self.assertNotIn(secret, str(caught.exception))
+                self.assertFalse(output.exists())
+                self.assert_no_extraction_residue(base, output.name)
+
     def test_valid_plugin_and_source_artifacts_restore_modes_and_verify_strictly(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -167,6 +218,77 @@ class PackageExtractionTests(unittest.TestCase):
                             0o755,
                             path.relative_to(artifact_root).as_posix(),
                         )
+
+    def test_extracted_active_skill_script_runs_by_absolute_path_from_foreign_repository(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".codexqb-extracted-launcher-",
+            dir=REPO_ROOT.parent,
+        ) as temp_dir:
+            base = Path(temp_dir)
+            base.chmod(0o700)
+            source = base / "plugin-source"
+            source.mkdir()
+            write_minimal_codexqb_tree(source)
+            shutil.copytree(
+                REPO_ROOT / "plugins/codexqb",
+                source / "plugins/codexqb",
+                dirs_exist_ok=True,
+            )
+            package = base / "codexqb-plugin-0.3.0.zip"
+            EXPORT_MODULE.create_zip(
+                source,
+                package,
+                source_package=True,
+                artifact_type="plugin",
+            )
+            plugin_root = EXTRACT_MODULE.extract_verified_package(
+                package,
+                base / "plugin-unpacked",
+                "plugin",
+            )
+            skill_root = (plugin_root / "skills/codexqb").resolve(strict=True)
+            skill_md = (skill_root / "SKILL.md").resolve(strict=True)
+            launcher = (skill_root / "scripts/skill_launcher.py").resolve(strict=True)
+            self.assertTrue(launcher.is_file())
+            self.assertFalse(launcher.is_symlink())
+
+            foreign_root = base / "foreign-target"
+            foreign_root.mkdir()
+            (foreign_root / "README.md").write_text("architecture boundary\n", encoding="utf-8")
+            self.assertFalse((foreign_root / "repository_io.py").exists())
+            self.assertFalse((foreign_root / "plugins").exists())
+
+            with assert_real_trust_store_unchanged():
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-S",
+                        "-B",
+                        launcher.as_posix(),
+                        "--active-skill-md",
+                        skill_md.as_posix(),
+                        "--controller",
+                        "repository-io",
+                        "--",
+                        "--root",
+                        ".",
+                        "inspect",
+                        "--profile",
+                        "intake",
+                    ],
+                    cwd=foreign_root,
+                    env={**os.environ, "PWD": foreign_root.resolve(strict=True).as_posix()},
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["profile"], "intake")
+            self.assertIn("README.md", payload["paths"])
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
     def test_fifo_input_is_rejected_promptly_with_sanitized_output(self) -> None:

@@ -21,7 +21,7 @@ import re
 import shlex
 import tokenize
 import unicodedata
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 
@@ -31,6 +31,9 @@ PACKAGE_BINARY_SCAN_WINDOW_BYTES = 8 * 1024 * 1024
 PACKAGE_BINARY_SCAN_OVERLAP_BYTES = 264 * 1024
 PACKAGE_UTF16_MIN_ASCII_UNITS = 8
 PACKAGE_UTF32_MIN_ASCII_UNITS = 8
+PACKAGE_BINARY_SEPARATOR_DENSITY_DENOMINATOR = 64
+PACKAGE_STRUCTURAL_CUE_PREFIX_CHARACTERS = 512
+PACKAGE_STRUCTURAL_CUE_SUFFIX_CHARACTERS = 8192
 PACKAGE_SECRET_SCAN_CACHE_MAX_ENTRIES = 4096
 PACKAGE_PYTHON_CONSTANT_MAX_CHARACTERS = 4096
 PACKAGE_PYTHON_CONSTANT_MAX_DEPTH = 64
@@ -70,10 +73,27 @@ PACKAGE_KNOWN_TEXT_SUFFIXES = frozenset(
 )
 PACKAGE_CONFIG_TEXT_SUFFIXES = frozenset({".cfg", ".conf", ".ini", ".toml", ".yaml", ".yml"})
 PACKAGE_SCRIPT_TEXT_SUFFIXES = frozenset({".js", ".jsx", ".ts", ".tsx"})
+PACKAGE_STRUCTURAL_CONTEXT_TEXT_SUFFIXES = frozenset(
+    {".md", ".rst", ".txt"}
+) | PACKAGE_CONFIG_TEXT_SUFFIXES
+PACKAGE_RENDERED_TEXT_SUFFIXES = frozenset(
+    {".html", ".md", ".rst", ".txt", ".xml"}
+)
 PACKAGE_BINARY_PROJECTION_TABLE = bytes(
     value if value in {9, 10, 13} or 0x20 <= value <= 0x7E else 10
     for value in range(256)
 )
+# Preserve the existence, but never the content, of a non-ASCII UTF code unit.
+# Mapping such units to a line break can erase the non-ASCII value that follows
+# an otherwise ordinary ASCII credential label.
+PACKAGE_BINARY_NON_ASCII_UNIT_SENTINEL = ord("?")
+PACKAGE_BINARY_WIDE_PROJECTION_TABLE = bytes(
+    value
+    if value in {9, 10, 13} or 0x20 <= value <= 0x7E
+    else PACKAGE_BINARY_NON_ASCII_UNIT_SENTINEL
+    for value in range(256)
+)
+PACKAGE_BINARY_ASCII_LETTER_RE = re.compile(rb"[A-Za-z]")
 PACKAGE_UTF16_LE_ASCII_RUN_RE = re.compile(
     rb"(?:[\x09\x0a\x0d\x20-\x7e]\x00){%d}" % PACKAGE_UTF16_MIN_ASCII_UNITS
 )
@@ -244,6 +264,11 @@ _GENERIC_CREDENTIAL_STEM_EXPRESSION = (
     r"refresh[ ._-]?token|password|signing[ ._-]?secret|webhook[ ._-]?secret|"
     r"secret[ ._-]?key(?:[ ._-]?base)?|app[ ._-]?secret|private[ ._-]?token"
 )
+PACKAGE_STRUCTURAL_CREDENTIAL_CUE_RE = re.compile(
+    rf"(?:{_PROVIDER_CREDENTIAL_NAME_EXPRESSION}|"
+    rf"{_GENERIC_CREDENTIAL_STEM_EXPRESSION}|authorization|proxy[ ._-]?authorization)",
+    re.IGNORECASE,
+)
 _CREDENTIAL_NAME_SEGMENT_EXPRESSION = r"[A-Za-z][A-Za-z0-9]{0,31}"
 _CAMEL_CREDENTIAL_NAME_EXPRESSION = (
     r"(?:[A-Za-z][A-Za-z0-9]{0,63})?"
@@ -269,10 +294,25 @@ CREDENTIAL_ASSIGNMENT_RE = re.compile(
     rf"(?P<bare>[^\s#|]{{1,4096}}))",
     re.IGNORECASE,
 )
-CREDENTIAL_NAME_FULL_RE = re.compile(rf"(?:{_CREDENTIAL_NAME_EXPRESSION})", re.IGNORECASE)
-PAIR_CONTEXT_LABEL_RE = re.compile(
-    rf"(?:{_CREDENTIAL_NAME_EXPRESSION}|Authorization|Proxy[ ._-]+Authorization)",
-    re.IGNORECASE,
+MAX_PAIR_CONTEXT_LABEL_CHARACTERS = 256
+PAIR_CONTEXT_ENV_SUFFIXES = frozenset({"PROD", "DEV", "TEST", "STAGING", "CI"})
+PAIR_CONTEXT_GENERIC_STEMS = (
+    ("API", "KEY"),
+    ("ACCESS", "TOKEN"),
+    ("AUTH", "TOKEN"),
+    ("CLIENT", "SECRET"),
+    ("REFRESH", "TOKEN"),
+    ("PASSWORD",),
+    ("SIGNING", "SECRET"),
+    ("WEBHOOK", "SECRET"),
+    ("SECRET", "KEY"),
+    ("SECRET", "KEY", "BASE"),
+    ("APP", "SECRET"),
+    ("PRIVATE", "TOKEN"),
+)
+PAIR_CONTEXT_CREDENTIAL_SUFFIX_MAX_TOKENS = max(
+    max(len(stem) + 1 for stem in PAIR_CONTEXT_GENERIC_STEMS),
+    max(name.count("_") + 1 for name in PROVIDER_CREDENTIAL_NAMES),
 )
 CONTEXT_FIELD_LINE_RE = re.compile(
     r"^(?P<indent>[ \t]*)(?:[-*+][ \t]+)?"
@@ -839,6 +879,71 @@ def _html_projection(text: str, *, remove_element_content: bool) -> str:
     return _remove_text_ranges(text, ranges)
 
 
+def _html_structural_projection(text: str) -> str:
+    """Preserve credential-bearing table and field structure across markup.
+
+    The ordinary visible-text projection removes tags, which can concatenate
+    adjacent cells or XML fields and erase the relationship between a
+    credential label and its value.  This bounded projection replaces only a
+    small allowlist of structural tags with the syntax already understood by
+    the package structural scanners.
+    """
+
+    tokens = _html_markup_tokens(text)
+    if not tokens:
+        return text
+    label_fields = {
+        "name",
+        "key",
+        "credential",
+        "credential_name",
+        "secret_name",
+    }
+    value_fields = {"value", "credential_value", "secret_value"}
+    block_tags = {
+        "article",
+        "br",
+        "div",
+        "dl",
+        "entry",
+        "item",
+        "li",
+        "p",
+        "pre",
+        "record",
+        "section",
+        "table",
+    }
+    pieces: list[str] = []
+    cursor = 0
+    for start, end, name, closing, _self_closing in tokens:
+        pieces.append(text[cursor:start])
+        replacement = ""
+        if name != "#comment":
+            local_name = name.rsplit(":", 1)[-1]
+            canonical_name = local_name.replace("-", "_")
+            if canonical_name in label_fields:
+                replacement = "\n" if closing else f"{canonical_name}:"
+            elif canonical_name in value_fields:
+                replacement = "\n" if closing else f"{canonical_name}:"
+            elif local_name in {"td", "th", "dt", "dd"}:
+                if not closing:
+                    replacement = "|"
+                elif local_name == "dd":
+                    replacement = "|\n"
+            elif local_name == "tr":
+                replacement = "|\n" if closing else "\n"
+            elif local_name in block_tags:
+                replacement = "\n"
+        pieces.append(replacement)
+        cursor = end
+    pieces.append(text[cursor:])
+    projected = "".join(pieces)
+    if len(projected) > MAX_SECRET_SCAN_CHARACTERS:
+        raise ValueError("secret_scan_semantic_expansion_limit")
+    return projected
+
+
 def _markdown_visible_projection(text: str, *, remove_html_content: bool = False) -> str:
     projected = _html_projection(text, remove_element_content=remove_html_content)
     projected = _markdown_link_projection(projected)
@@ -881,6 +986,9 @@ def _semantic_secret_scan_candidates(text: str) -> Iterator[str]:
             raise ValueError("secret_scan_semantic_expansion_limit")
         if decoded != normalized:
             yield decoded
+        structural_projected = _html_structural_projection(decoded)
+        if structural_projected != decoded:
+            yield structural_projected
         projected = _markdown_visible_projection(decoded)
         if projected != decoded:
             yield projected
@@ -905,6 +1013,40 @@ def _canonical_context_field_name(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
 
 
+def _is_pair_context_credential_name(value: str) -> bool:
+    """Recognize the bounded credential-label grammar without an ambiguous regex."""
+
+    value = value.strip()
+    if not value or len(value) > MAX_PAIR_CONTEXT_LABEL_CHARACTERS or not value.isascii():
+        return False
+    if any(not (character.isalnum() or character in " ._-") for character in value):
+        return False
+    canonical = _canonical_credential_name(value)
+    if canonical in PROVIDER_CREDENTIAL_NAMES:
+        return True
+    normalized = _canonical_context_field_name(value).upper()
+    if normalized in {"AUTHORIZATION", "PROXY_AUTHORIZATION"}:
+        return True
+    tokens = tuple(token for token in normalized.split("_") if token)
+    for stem in PAIR_CONTEXT_GENERIC_STEMS:
+        stem_length = len(stem)
+        for index in range(0, len(tokens) - stem_length + 1):
+            if tokens[index : index + stem_length] != stem:
+                continue
+            prefix = tokens[:index]
+            suffix = tokens[index + stem_length :]
+            if any(not segment or len(segment) > 32 for segment in prefix):
+                continue
+            if not suffix:
+                return True
+            if len(suffix) == 1 and (
+                suffix[0] in PAIR_CONTEXT_ENV_SUFFIXES
+                or (suffix[0].startswith("V") and suffix[0][1:].isdigit() and 1 <= len(suffix[0][1:]) <= 2)
+            ):
+                return True
+    return False
+
+
 def _strip_context_field_value(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"\"", "'"}:
@@ -922,7 +1064,7 @@ def _credential_context_findings(name: str, value: str) -> list[str]:
     normalized_name = re.sub(r"[\s_.-]+", "-", clean_name.strip().lower())
     if normalized_name in {"authorization", "proxy-authorization"}:
         combined = f"Authorization: {clean_value}"
-    elif CREDENTIAL_NAME_FULL_RE.fullmatch(clean_name.strip()) is not None:
+    elif _is_pair_context_credential_name(clean_name):
         combined = f"{clean_name}={clean_value}"
     else:
         return []
@@ -1010,7 +1152,7 @@ def _markdown_table_credential_matches(text: str) -> list[tuple[str, int, int]]:
             cell = None if oversized else line[cell_start:separator].strip()
             current = (cell, offset + cell_start, offset + separator, oversized)
             if previous is not None and previous[0]:
-                if current[3] and CREDENTIAL_NAME_FULL_RE.fullmatch(previous[0]) is not None:
+                if current[3] and _is_pair_context_credential_name(previous[0]):
                     matches.append(("secret_scan_structured_context_limit", previous[1], current[2]))
                 elif current[0]:
                     findings = _credential_context_findings(previous[0], current[0])
@@ -1094,20 +1236,263 @@ def _inline_credential_context_matches(text: str) -> list[tuple[str, int, int]]:
     return matches
 
 
+def _pair_label_before_comma(text: str, comma: int) -> tuple[str, int] | None:
+    """Return one bounded literal/bare label immediately before ``comma``."""
+
+    def credential_suffix(start: int, end: int) -> tuple[str, int] | None:
+        """Recognize the bounded label or a separator-delimited suffix within it."""
+
+        start = max(start, end - MAX_PAIR_CONTEXT_LABEL_CHARACTERS)
+        value = text[start:end]
+        separators = " ._-"
+        candidate_starts: list[int] = []
+        for index, character in enumerate(value):
+            if character in separators:
+                continue
+            if index == 0 or value[index - 1] in separators:
+                candidate_starts.append(index)
+        # A recognized credential stem may have at most one environment suffix;
+        # provider names are similarly bounded.  Inspect only those final token
+        # starts, shortest first, so an underscore-truncated prefix cannot be
+        # returned as part of the name and defeat the assignment word boundary.
+        for candidate_start in reversed(
+            candidate_starts[-PAIR_CONTEXT_CREDENTIAL_SUFFIX_MAX_TOKENS:]
+        ):
+            suffix = value[candidate_start:]
+            if _is_pair_context_credential_name(suffix):
+                return suffix, start + candidate_start
+        return None
+
+    end = comma
+    while end > 0 and text[end - 1] in " \t":
+        end -= 1
+    if end <= 0:
+        return None
+    if text[end - 1] in {"\"", "'", "`"}:
+        quote = text[end - 1]
+        value_end = end - 1
+        lower_bound = max(0, value_end - MAX_PAIR_CONTEXT_LABEL_CHARACTERS)
+        opening = value_end - 1
+        while opening >= lower_bound:
+            if text[opening] == quote:
+                slash_count = 0
+                cursor = opening - 1
+                while cursor >= lower_bound and text[cursor] == "\\":
+                    slash_count += 1
+                    cursor -= 1
+                if slash_count % 2 == 0:
+                    return credential_suffix(opening + 1, value_end)
+            opening -= 1
+        return credential_suffix(lower_bound, value_end)
+    start = end
+    lower_bound = max(0, end - MAX_PAIR_CONTEXT_LABEL_CHARACTERS)
+    while start > lower_bound and (text[start - 1].isalnum() or text[start - 1] in " ._-"):
+        start -= 1
+    stripped_start = start + len(text[start:end]) - len(text[start:end].lstrip())
+    stripped_end = end - (len(text[start:end]) - len(text[start:end].rstrip()))
+    return credential_suffix(stripped_start, stripped_end)
+
+
+def _pair_value_field_end(text: str, cursor: int, boundary: int) -> tuple[str, int] | None:
+    """Parse one bounded ``value:``-style field prefix without regular expressions."""
+
+    start = cursor
+    quote = text[cursor] if cursor < boundary and text[cursor] in {"\"", "'"} else ""
+    if quote:
+        cursor += 1
+    name_start = cursor
+    if cursor >= boundary or not text[cursor].isascii() or not text[cursor].isalpha():
+        return None
+    cursor += 1
+    while cursor < boundary and cursor - name_start <= 31:
+        character = text[cursor]
+        if not character.isascii() or not (character.isalnum() or character in " ._-"):
+            break
+        cursor += 1
+    if cursor - name_start > 32:
+        return None
+    name_end = cursor
+    if quote:
+        if cursor >= boundary or text[cursor] != quote:
+            return None
+        cursor += 1
+    while cursor < boundary and text[cursor] in " \t":
+        cursor += 1
+    if cursor >= boundary or text[cursor] not in ":=":
+        return None
+    cursor += 1
+    while cursor < boundary and text[cursor] in " \t":
+        cursor += 1
+    if cursor <= start:
+        return None
+    return _canonical_context_field_name(text[name_start:name_end]), cursor
+
+
+def _pair_wrapper_end(text: str, cursor: int, boundary: int) -> int | None:
+    """Return the end of a bounded bytes/bytearray wrapper prefix, if present."""
+
+    lowered = text[cursor : min(boundary, cursor + 16)].lower()
+    name = "bytearray" if lowered.startswith("bytearray") else "bytes" if lowered.startswith("bytes") else ""
+    if not name:
+        return None
+    end = cursor + len(name)
+    while end < boundary and text[end] in " \t":
+        end += 1
+    if end >= boundary or text[end] != "(":
+        return None
+    end += 1
+    while end < boundary and text[end] in " \t":
+        end += 1
+    return end
+
+
+def _pair_literal_concatenation_value(
+    text: str,
+    cursor: int,
+    boundary: int,
+    initial_value: str,
+    initial_kind: str,
+) -> tuple[str, int, str] | None:
+    """Evaluate one bounded chain of quoted literal fragments.
+
+    Returning ``None`` means the expression is not a closed literal-only
+    concatenation inside the existing pair-context budget.  Callers must treat
+    that state as unsafe rather than guessing what an identifier or call might
+    produce.
+    """
+
+    fragments = [initial_value]
+    total_characters = len(initial_value)
+    fragment_count = 1
+    while cursor < boundary and text[cursor] == "+":
+        cursor += 1
+        while cursor < boundary and text[cursor] in " \t\r\n":
+            cursor += 1
+        if cursor >= boundary:
+            return None
+        literal_prefix = ""
+        for candidate_prefix in ("br", "rb", "b", "r", "u"):
+            if text[cursor : cursor + len(candidate_prefix)].lower() == candidate_prefix:
+                literal_prefix = candidate_prefix
+                break
+        literal_start = cursor + len(literal_prefix)
+        delimiter = ""
+        for candidate_delimiter in ('"""', "'''", '"', "'", "`"):
+            if text.startswith(candidate_delimiter, literal_start):
+                delimiter = candidate_delimiter
+                break
+        if not delimiter:
+            return None
+        fragment_kind = "bytes" if "b" in literal_prefix.lower() else "text"
+        if fragment_kind != initial_kind:
+            return None
+        value_start = literal_start + len(delimiter)
+        value_end = value_start
+        escaped = False
+        while value_end < boundary:
+            character = text[value_end]
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif text.startswith(delimiter, value_end):
+                break
+            value_end += 1
+        if value_end >= boundary or not text.startswith(delimiter, value_end):
+            return None
+        fragment = text[value_start:value_end]
+        total_characters += len(fragment)
+        fragment_count += 1
+        if total_characters > 4096 or fragment_count > MAX_MARKUP_TOKENS:
+            return None
+        fragments.append(fragment)
+        cursor = value_end + len(delimiter)
+        continuation = cursor
+        while continuation < boundary and text[continuation] in " \t\r\n":
+            continuation += 1
+        if continuation < boundary and text[continuation] == "+":
+            cursor = continuation
+            continue
+        while cursor < boundary and text[cursor] in " \t":
+            cursor += 1
+        break
+    return "".join(fragments), cursor, initial_kind
+
+
+def _pair_concatenation_has_record_terminator(
+    text: str,
+    cursor: int,
+    boundary: int,
+    expected_closers: tuple[str, ...] = (),
+    *,
+    allow_line_terminator: bool = True,
+) -> str | None:
+    """Return a content-free finding when a literal expression is not closed.
+
+    ``expected_closers`` records containers opened after the pair separator.
+    They are consumed inside-out before the ordinary enclosing-record
+    terminator is accepted.  This keeps placeholder suppression behind the
+    complete bounded expression grammar: calls, indexing, boolean operators,
+    adjacent literals, comments, and other executable tails cannot be hidden
+    behind an otherwise safe first fragment.
+    """
+
+    for expected in reversed(expected_closers):
+        while cursor < boundary and text[cursor] in " \t":
+            cursor += 1
+        if cursor >= boundary:
+            return (
+                "secret_scan_structured_context_limit"
+                if boundary < len(text)
+                else "secret_scan_credential_expression_unsupported"
+            )
+        if text[cursor] != expected:
+            return "secret_scan_credential_expression_unsupported"
+        cursor += 1
+
+    while cursor < boundary and text[cursor] in " \t":
+        cursor += 1
+    if cursor >= len(text):
+        return None
+    if cursor >= boundary:
+        return (
+            "secret_scan_structured_context_limit"
+            if boundary < len(text)
+            else None
+        )
+    if text[cursor] in "\r\n":
+        return (
+            None
+            if allow_line_terminator
+            else "secret_scan_credential_expression_unsupported"
+        )
+    if text[cursor] in ",)]};":
+        return None
+    return "secret_scan_credential_expression_unsupported"
+
+
 def _credential_pair_context_matches(text: str) -> list[tuple[str, int, int]]:
-    """Find credential-label/string pairs even inside partial diagnostic syntax."""
+    """Find bounded credential-label/string pairs in deterministic linear work."""
 
     matches: list[tuple[str, int, int]] = []
     examined = 0
-    for label_match in PAIR_CONTEXT_LABEL_RE.finditer(text):
+    search = 0
+    while True:
+        separator = text.find(",", search)
+        if separator < 0:
+            break
+        search = separator + 1
         examined += 1
-        if examined > MAX_SECRET_MATCH_LOCATIONS:
-            return matches + [("secret_match_limit_exceeded", 0, 0)]
-        if label_match.start() > 0 and (text[label_match.start() - 1].isalnum() or text[label_match.start() - 1] == "_"):
+        if examined > MAX_MARKUP_TOKENS:
+            return matches + [("secret_scan_structured_context_limit", separator, separator)]
+        label = _pair_label_before_comma(text, separator)
+        if label is None:
             continue
-        if label_match.end() < len(text) and (text[label_match.end()].isalnum() or text[label_match.end()] == "_"):
-            continue
-        prefix = text[max(0, label_match.start() - 20) : label_match.start()].lower()
+        label_value, label_start = label
+        label_is_literal = (
+            label_start > 0 and text[label_start - 1] in {"\"", "'", "`"}
+        )
+        prefix = text[max(0, label_start - 20) : label_start].lower()
         if (
             prefix.endswith("<redacted:")
             or prefix.endswith("${")
@@ -1115,29 +1500,40 @@ def _credential_pair_context_matches(text: str) -> list[tuple[str, int, int]]:
             or prefix.endswith("secret_pattern=")
         ):
             continue
-        separator = label_match.end()
-        while separator < len(text) and text[separator] in " \t\"'":
-            separator += 1
-        if separator >= len(text) or text[separator] != ",":
-            continue
         cursor = separator + 1
         boundary = min(len(text), cursor + 4096)
-        while cursor < boundary and text[cursor] in " \t\r\n[](){}":
+        expected_closers: list[str] = []
+        opening_to_closing = {"(": ")", "[": "]", "{": "}"}
+        while True:
+            while cursor < boundary and text[cursor] in " \t\r\n":
+                cursor += 1
+            if cursor >= boundary or text[cursor] not in opening_to_closing:
+                break
+            if len(expected_closers) >= 64:
+                matches.append(("secret_scan_structured_context_limit", label_start, cursor))
+                break
+            expected_closers.append(opening_to_closing[text[cursor]])
             cursor += 1
+        if matches and _is_scan_limit_finding(matches[-1][0]):
+            return matches
         if cursor >= len(text):
             continue
         if cursor >= boundary:
-            matches.append(("secret_scan_structured_context_limit", label_match.start(), boundary))
+            matches.append(("secret_scan_structured_context_limit", label_start, boundary))
             continue
-        possible_field = re.match(
-            r"[\"']?(?P<field>[A-Za-z][A-Za-z0-9 ._-]{0,31})[\"']?[ \t]*[:=][ \t]*",
-            text[cursor:boundary],
-        )
+        possible_field = _pair_value_field_end(text, cursor, boundary)
         if possible_field is not None:
-            field = _canonical_context_field_name(str(possible_field.group("field")))
+            field, cursor = possible_field
             if field not in {"value", "credential_value", "secret_value"}:
+                if expected_closers or label_is_literal:
+                    matches.append(
+                        (
+                            "secret_scan_credential_expression_unsupported",
+                            label_start,
+                            min(boundary, max(cursor, label_start + 1)),
+                        )
+                    )
                 continue
-            cursor += possible_field.end()
             if cursor >= len(text):
                 continue
             while cursor < boundary and text[cursor] in " \t\r\n":
@@ -1145,20 +1541,46 @@ def _credential_pair_context_matches(text: str) -> list[tuple[str, int, int]]:
             if cursor >= len(text):
                 continue
             if cursor >= boundary:
-                matches.append(("secret_scan_structured_context_limit", label_match.start(), boundary))
+                matches.append(("secret_scan_structured_context_limit", label_start, boundary))
                 continue
-        wrapper_match = re.match(r"(?i:bytearray|bytes)[ \t]*\([ \t]*", text[cursor:boundary])
-        wrapper_opened = wrapper_match is not None
-        if wrapper_match is not None:
-            cursor += wrapper_match.end()
-        prefix_match = re.match(r"(?i:br|rb|b|r|u)?", text[cursor:boundary])
-        literal_start = cursor + (prefix_match.end() if prefix_match is not None else 0)
+        wrapper_end = _pair_wrapper_end(text, cursor, boundary)
+        wrapper_opened = wrapper_end is not None
+        if wrapper_end is not None:
+            cursor = wrapper_end
+            expected_closers.append(")")
+        literal_prefix = ""
+        for candidate_prefix in ("br", "rb", "b", "r", "u"):
+            if text[cursor : cursor + len(candidate_prefix)].lower() == candidate_prefix:
+                literal_prefix = candidate_prefix
+                break
+        literal_start = cursor + len(literal_prefix)
         delimiter = ""
         for candidate_delimiter in ('"""', "'''", "\"", "'", "`"):
             if text.startswith(candidate_delimiter, literal_start):
                 delimiter = candidate_delimiter
                 break
         if not delimiter:
+            lowered_start = text[cursor : min(boundary, cursor + 20)].lower()
+            unsupported_expression = (
+                bool(expected_closers)
+                or possible_field is not None
+                or (
+                    label_start > 0
+                    and text[label_start - 1] in {"\"", "'", "`"}
+                    and (
+                        lowered_start.startswith(("f\"", "f'", "fr\"", "fr'", "rf\"", "rf'"))
+                        or lowered_start.startswith(("str(", "memoryview("))
+                    )
+                )
+            )
+            if unsupported_expression:
+                matches.append(
+                    (
+                        "secret_scan_credential_expression_unsupported",
+                        label_start,
+                        min(boundary, max(cursor + 1, label_start)),
+                    )
+                )
             continue
         value_start = literal_start + len(delimiter)
         value_end = value_start
@@ -1173,25 +1595,61 @@ def _credential_pair_context_matches(text: str) -> list[tuple[str, int, int]]:
                 break
             value_end += 1
         if value_end >= boundary or value_end >= len(text):
-            matches.append(("secret_scan_structured_context_limit", label_match.start(), boundary))
+            matches.append(("secret_scan_structured_context_limit", label_start, boundary))
             continue
         value = text[value_start:value_end]
         tail = value_end + len(delimiter)
-        while tail < len(text) and text[tail] in " \t":
+        while tail < boundary and text[tail] in " \t":
             tail += 1
-        if wrapper_opened:
-            if tail >= len(text) or text[tail] != ")":
-                matches.append(("secret_scan_structured_context_limit", label_match.start(), min(boundary, tail)))
-                continue
-            tail += 1
-            while tail < len(text) and text[tail] in " \t":
-                tail += 1
-        if tail < len(text) and text[tail] == "+":
+        concat_cursor = tail
+        while concat_cursor < boundary and text[concat_cursor] in " \t\r\n":
+            concat_cursor += 1
+        if concat_cursor >= boundary and boundary < len(text):
+            matches.append(("secret_scan_structured_context_limit", label_start, boundary))
             continue
-        if CREDENTIAL_NAME_FULL_RE.fullmatch(value) is not None:
+        if concat_cursor < boundary and text[concat_cursor] == "+":
+            concatenated = _pair_literal_concatenation_value(
+                text,
+                concat_cursor,
+                boundary,
+                value,
+                "bytes" if wrapper_opened or "b" in literal_prefix.lower() else "text",
+            )
+            if concatenated is None:
+                findings = ["secret_scan_credential_expression_unsupported"]
+            elif tail_finding := _pair_concatenation_has_record_terminator(
+                text,
+                concatenated[1],
+                boundary,
+                tuple(expected_closers),
+                allow_line_terminator=not label_is_literal,
+            ):
+                findings = [tail_finding]
+            elif _is_pair_context_credential_name(concatenated[0]):
+                findings = []
+            else:
+                findings = _credential_context_findings(
+                    label_value,
+                    concatenated[0],
+                )
+            matches.extend(
+                (finding, label_start, value_end + 1) for finding in findings
+            )
             continue
-        findings = _credential_context_findings(label_match.group(0), value)
-        matches.extend((finding, label_match.start(), value_end + 1) for finding in findings)
+        tail_finding = _pair_concatenation_has_record_terminator(
+            text,
+            tail,
+            boundary,
+            tuple(expected_closers),
+            allow_line_terminator=not label_is_literal,
+        )
+        if tail_finding is not None:
+            matches.append((tail_finding, label_start, value_end + 1))
+            continue
+        if _is_pair_context_credential_name(value):
+            continue
+        findings = _credential_context_findings(label_value, value)
+        matches.extend((finding, label_start, value_end + 1) for finding in findings)
         if len(matches) > MAX_SECRET_MATCH_LOCATIONS:
             break
     return matches
@@ -1362,7 +1820,27 @@ def _json_credential_findings(text: str) -> list[str]:
     return list(dict.fromkeys(findings))
 
 
+def _pair_separator_budget_exceeded(text: str) -> bool:
+    """Detect the 4,097th pair separator before expensive whole-text regexes.
+
+    The pair scanner already treats this cardinality as a fail-closed
+    structured-context limit.  Performing the same bounded linear probe first
+    prevents an adversarial comma-only payload from paying for every secret
+    regex before reaching that deterministic result.
+    """
+
+    search = 0
+    for _ in range(MAX_MARKUP_TOKENS + 1):
+        separator = text.find(",", search)
+        if separator < 0:
+            return False
+        search = separator + 1
+    return True
+
+
 def _raw_secret_findings(text: str) -> list[str]:
+    if _pair_separator_budget_exceeded(text):
+        return ["secret_scan_structured_context_limit"]
     findings: list[str] = []
     for scanner in (
         _named_credential_block_matches,
@@ -1395,6 +1873,7 @@ def _is_scan_limit_finding(name: str) -> bool:
         "secret_scan_input_too_large",
         "secret_scan_structured_context_input_limit",
         "secret_scan_structured_context_limit",
+        "secret_scan_credential_expression_unsupported",
     } or name.startswith("secret_scan_semantic_")
 
 
@@ -1696,7 +2175,7 @@ def _package_credential_binding_findings(name: str, value: str | bytes) -> list[
             decoded = value.decode("utf-8")
         except UnicodeDecodeError:
             clean_name = name.strip()
-            if CREDENTIAL_NAME_FULL_RE.fullmatch(clean_name) is None or not value:
+            if not _is_pair_context_credential_name(clean_name) or not value:
                 return []
             canonical_name = _canonical_credential_name(clean_name)
             if canonical_name == "AWS_SECRET_ACCESS_KEY":
@@ -1909,13 +2388,6 @@ def _package_json_match_locations(text: str) -> list[tuple[str, int]]:
         value = json.loads(text, object_pairs_hook=_reject_duplicate_json_keys)
     except (MemoryError, RecursionError, TypeError, ValueError, json.JSONDecodeError):
         return _bounded_package_locations([*locations, ("package_json_parse_failed", 0)])
-    has_context_hint = bool(
-        CREDENTIAL_ASSIGNMENT_RE.search(text)
-        or PAIR_CONTEXT_LABEL_RE.search(text)
-        or "\\u" in text
-    )
-    if not has_context_hint:
-        return _bounded_package_locations(locations)
     locations.extend((finding, 0) for finding in _structured_credential_findings(value))
     stack: list[object] = [value]
     visited = 0
@@ -1985,6 +2457,156 @@ def _package_assignment_text_match_locations(text: str) -> list[tuple[str, int]]
     return _package_direct_match_locations(text)
 
 
+def _package_structural_context_match_locations(text: str) -> list[tuple[str, int]]:
+    """Scan decoded document records without applying offset-changing projections.
+
+    Package documents can carry credentials as label/value blocks, Markdown
+    tables, diagnostic tuples, or same-line name/value records. Reuse the
+    bounded structural parsers from the persistent-text policy, but scan only
+    the canonical UTF-8 text so returned offsets remain tied to package bytes
+    for the ASCII credential labels those parsers accept.
+    """
+
+    if len(text) > MAX_SECRET_SCAN_CHARACTERS:
+        return [("secret_scan_input_too_large", 0)]
+    if _oversized_structured_context_present(text):
+        return [("secret_scan_structured_context_input_limit", 0)]
+    locations: list[tuple[str, int]] = []
+    for scanner in (
+        _named_credential_block_matches,
+        _markdown_table_credential_matches,
+        _inline_credential_context_matches,
+        _credential_pair_context_matches,
+    ):
+        scanned = [(name, start) for name, start, _end in scanner(text)]
+        locations.extend(scanned)
+        if any(_is_scan_limit_finding(name) for name, _offset in scanned):
+            break
+        if len(locations) > MAX_SECRET_MATCH_LOCATIONS:
+            break
+    return _bounded_package_locations(locations)
+
+
+def _package_markdown_semantic_match_locations(text: str) -> list[tuple[str, int]]:
+    """Fail closed when renderer-visible Markdown reveals a credential pair.
+
+    Renderer projections can contract entities, links, and markup, so their
+    character offsets are not source byte offsets.  A finding is therefore
+    anchored conservatively at byte zero instead of publishing a misleading
+    or content-bearing offset.  The finding label remains the canonical secret
+    rule and is sufficient for package admission to reject the file.
+    """
+
+    try:
+        for candidate in _semantic_secret_scan_candidates(text):
+            scanned = [
+                *_package_direct_match_locations(candidate),
+                *_package_structural_context_match_locations(candidate),
+            ]
+            if scanned:
+                return _bounded_package_locations(
+                    [(name, 0) for name, _offset in scanned]
+                )
+    except ValueError as exc:
+        label = str(exc)
+        if not label.startswith("secret_scan_semantic_"):
+            label = "secret_scan_semantic_expansion_limit"
+        return [(label, 0)]
+    return []
+
+
+def _package_binary_structural_projection_match_locations(
+    text: str,
+) -> list[tuple[str, int]]:
+    """Scan bounded neighborhoods around credential-label cues in one projection."""
+
+    locations: list[tuple[str, int]] = []
+    covered_until = 0
+    scanned_characters = 0
+    cue_count = 0
+    for cue in PACKAGE_STRUCTURAL_CREDENTIAL_CUE_RE.finditer(text):
+        cue_count += 1
+        if cue_count > MAX_MARKUP_TOKENS:
+            return [("secret_scan_structured_context_limit", cue.start())]
+        if cue.end() + PACKAGE_STRUCTURAL_CUE_SUFFIX_CHARACTERS <= covered_until:
+            continue
+        window_start = max(0, cue.start() - PACKAGE_STRUCTURAL_CUE_PREFIX_CHARACTERS)
+        window_end = min(
+            len(text),
+            cue.end() + PACKAGE_STRUCTURAL_CUE_SUFFIX_CHARACTERS,
+        )
+        scanned_characters += window_end - window_start
+        if scanned_characters > MAX_SECRET_SCAN_CHARACTERS:
+            return [("secret_scan_structured_context_limit", cue.start())]
+        projected_window = text[window_start:window_end]
+
+        def scan_projection(
+            scanner: Callable[[str], list[tuple[str, int, int]]],
+            candidate: str,
+            base: int,
+        ) -> bool:
+            scanned = scanner(candidate)
+            locations.extend(
+                (name, base + start) for name, start, _end in scanned
+            )
+            if any(_is_scan_limit_finding(name) for name, _start, _end in scanned):
+                return True
+            if len(locations) > MAX_SECRET_MATCH_LOCATIONS:
+                return True
+            return False
+
+        cue_relative_start = cue.start() - window_start
+        if ":" in projected_window or "=" in projected_window:
+            if scan_projection(
+                _inline_credential_context_matches,
+                projected_window,
+                window_start,
+            ):
+                return _bounded_package_locations(locations)
+            label_anchor: int | None = None
+            for field_match in INLINE_CONTEXT_FIELD_PREFIX_RE.finditer(
+                projected_window,
+                max(0, cue_relative_start - PACKAGE_STRUCTURAL_CUE_PREFIX_CHARACTERS),
+                min(len(projected_window), cue_relative_start + 1),
+            ):
+                field = _canonical_context_field_name(str(field_match.group("field")))
+                if field in {
+                    "name",
+                    "key",
+                    "credential",
+                    "credential_name",
+                    "secret_name",
+                } and field_match.end() <= cue_relative_start:
+                    label_anchor = field_match.start()
+            if label_anchor is not None and scan_projection(
+                _named_credential_block_matches,
+                projected_window[label_anchor:],
+                window_start + label_anchor,
+            ):
+                return _bounded_package_locations(locations)
+        if "|" in projected_window:
+            line_start = projected_window.rfind("\n", 0, cue_relative_start) + 1
+            table_anchor = projected_window.rfind(
+                "|",
+                line_start,
+                cue_relative_start + 1,
+            )
+            if table_anchor >= 0 and scan_projection(
+                _markdown_table_credential_matches,
+                projected_window[table_anchor:],
+                window_start + table_anchor,
+            ):
+                return _bounded_package_locations(locations)
+        if "," in projected_window and scan_projection(
+            _credential_pair_context_matches,
+            projected_window,
+            window_start,
+        ):
+            return _bounded_package_locations(locations)
+        covered_until = max(covered_until, window_end)
+    return _bounded_package_locations(locations)
+
+
 def _package_binary_match_locations(data: bytes) -> list[tuple[str, int]]:
     """Scan arbitrary bytes in bounded overlapping, offset-preserving windows."""
 
@@ -1995,12 +2617,45 @@ def _package_binary_match_locations(data: bytes) -> list[tuple[str, int]]:
         window_start = max(0, core_start - PACKAGE_BINARY_SCAN_OVERLAP_BYTES)
         window_end = min(len(data), core_end + PACKAGE_BINARY_SCAN_OVERLAP_BYTES)
         window = data[window_start:window_end]
-        def projections() -> Iterator[tuple[str, int, int]]:
-            yield (
-                window.translate(PACKAGE_BINARY_PROJECTION_TABLE).decode("ascii"),
-                0,
-                1,
+        comma_count = window.count(b",")
+        text_like_separator_density = bool(window) and (
+            comma_count * PACKAGE_BINARY_SEPARATOR_DENSITY_DENOMINATOR >= len(window)
+        )
+        try:
+            window.decode("utf-8")
+        except UnicodeDecodeError:
+            text_like_utf8 = False
+        else:
+            text_like_utf8 = True
+        if comma_count > MAX_MARKUP_TOKENS and (
+            text_like_utf8 or text_like_separator_density
+        ):
+            return [("secret_scan_structured_context_limit", core_start)]
+        # Every supported direct token, credential label, URI scheme, key
+        # header, and wide-character projection contains an ASCII letter byte.
+        # Keep this after the separator-density fail-closed gate so an opaque
+        # adversarial window cannot bypass the structured-context budget.
+        if PACKAGE_BINARY_ASCII_LETTER_RE.search(window) is None:
+            continue
+
+        def projections() -> Iterator[tuple[str, int, int, bool]]:
+            raw_projection = window.translate(PACKAGE_BINARY_PROJECTION_TABLE)
+            raw_text = raw_projection.decode("ascii")
+            raw_has_structural_cue = (
+                PACKAGE_STRUCTURAL_CREDENTIAL_CUE_RE.search(raw_text) is not None
             )
+            yield raw_text, 0, 1, raw_has_structural_cue
+            # The alternate stride-1 projection exists only to retain the
+            # presence of non-ASCII values beside an ASCII credential label.
+            # Without such a label it cannot create a new valid direct token
+            # or structural credential pair, so avoid a second whole-window
+            # scan of opaque high-byte binary data.
+            if raw_has_structural_cue:
+                non_ascii_value_projection = window.translate(
+                    PACKAGE_BINARY_WIDE_PROJECTION_TABLE
+                )
+                if non_ascii_value_projection != raw_projection:
+                    yield non_ascii_value_projection.decode("ascii"), 0, 1, True
             le_pair_starts = {
                 match.start() % 2 for match in PACKAGE_UTF16_LE_ASCII_RUN_RE.finditer(window)
             }
@@ -2021,12 +2676,18 @@ def _package_binary_match_locations(data: bytes) -> list[tuple[str, int]]:
                     if pair_start not in plausible_starts:
                         continue
                     projected = bytes(
-                        PACKAGE_BINARY_PROJECTION_TABLE[character]
+                        PACKAGE_BINARY_WIDE_PROJECTION_TABLE[character]
                         if guard == 0
-                        else 10
+                        else PACKAGE_BINARY_NON_ASCII_UNIT_SENTINEL
                         for character, guard in zip(characters, zero_guards)
                     ).decode("ascii")
-                    yield projected, pair_start, 2
+                    yield (
+                        projected,
+                        pair_start,
+                        2,
+                        PACKAGE_STRUCTURAL_CREDENTIAL_CUE_RE.search(projected)
+                        is not None,
+                    )
             le_quad_starts = {
                 match.start() % 4 for match in PACKAGE_UTF32_LE_ASCII_RUN_RE.finditer(window)
             }
@@ -2049,15 +2710,27 @@ def _package_binary_match_locations(data: bytes) -> list[tuple[str, int]]:
                     if quad_start not in plausible_starts:
                         continue
                     projected = bytes(
-                        PACKAGE_BINARY_PROJECTION_TABLE[character]
+                        PACKAGE_BINARY_WIDE_PROJECTION_TABLE[character]
                         if all(guard == 0 for guard in guards)
-                        else 10
+                        else PACKAGE_BINARY_NON_ASCII_UNIT_SENTINEL
                         for character, guards in zip(characters, zip(*zero_guards))
                     ).decode("ascii")
-                    yield projected, quad_start, 4
+                    yield (
+                        projected,
+                        quad_start,
+                        4,
+                        PACKAGE_STRUCTURAL_CREDENTIAL_CUE_RE.search(projected)
+                        is not None,
+                    )
 
-        for projected, projection_start, stride in projections():
-            for name, relative_offset in _package_direct_match_locations(projected):
+        for projected, projection_start, stride, has_structural_cue in projections():
+            projected_locations = _package_direct_match_locations(projected)
+            if has_structural_cue:
+                projected_locations = [
+                    *projected_locations,
+                    *_package_binary_structural_projection_match_locations(projected),
+                ]
+            for name, relative_offset in projected_locations:
                 absolute_offset = window_start + projection_start + stride * relative_offset
                 if not core_start <= absolute_offset < core_end:
                     continue
@@ -2080,17 +2753,28 @@ def _package_secret_scan_policy_key() -> tuple[object, ...]:
     return (
         MAX_SECRET_SCAN_CHARACTERS,
         MAX_SECRET_MATCH_LOCATIONS,
+        MAX_MARKUP_TOKENS,
+        MAX_PAIR_CONTEXT_LABEL_CHARACTERS,
         MAX_STRUCTURED_CONTEXT_NODES,
         PACKAGE_BINARY_SCAN_WINDOW_BYTES,
         PACKAGE_BINARY_SCAN_OVERLAP_BYTES,
+        PACKAGE_BINARY_NON_ASCII_UNIT_SENTINEL,
+        PACKAGE_BINARY_SEPARATOR_DENSITY_DENOMINATOR,
+        PACKAGE_BINARY_WIDE_PROJECTION_TABLE,
+        PACKAGE_BINARY_ASCII_LETTER_RE.pattern,
+        PACKAGE_STRUCTURAL_CUE_PREFIX_CHARACTERS,
+        PACKAGE_STRUCTURAL_CUE_SUFFIX_CHARACTERS,
         PACKAGE_UTF16_MIN_ASCII_UNITS,
         PACKAGE_UTF32_MIN_ASCII_UNITS,
         PACKAGE_PYTHON_CONSTANT_MAX_CHARACTERS,
         PACKAGE_PYTHON_CONSTANT_MAX_DEPTH,
         PACKAGE_PYTHON_CONSTANT_MAX_PARTS,
         PACKAGE_PYTHON_TOKEN_MAX_COUNT,
+        tuple(sorted(PACKAGE_STRUCTURAL_CONTEXT_TEXT_SUFFIXES)),
+        tuple(sorted(PACKAGE_RENDERED_TEXT_SUFFIXES)),
         id(SECRET_PATTERNS),
         id(CREDENTIAL_ASSIGNMENT_RE),
+        id(PACKAGE_STRUCTURAL_CREDENTIAL_CUE_RE),
     )
 
 
@@ -2136,7 +2820,17 @@ def package_secret_match_locations(data: bytes, suffix: str) -> list[tuple[str, 
                 }
             )
             scanner = scanners.get(normalized_suffix, _package_direct_match_locations)
-            locations = _bounded_package_locations(scanner(text))
+            locations = scanner(text)
+            if normalized_suffix in PACKAGE_STRUCTURAL_CONTEXT_TEXT_SUFFIXES and not any(
+                _is_scan_limit_finding(name) for name, _offset in locations
+            ):
+                locations = [
+                    *locations,
+                    *_package_structural_context_match_locations(text),
+                ]
+            if normalized_suffix in PACKAGE_RENDERED_TEXT_SUFFIXES and not locations:
+                locations = _package_markdown_semantic_match_locations(text)
+            locations = _bounded_package_locations(locations)
     else:
         locations = _package_binary_match_locations(data)
     _PACKAGE_SECRET_SCAN_CACHE[cache_key] = tuple(locations)
@@ -2513,17 +3207,40 @@ def implementation_contract_paths(contract: dict[str, object]) -> list[str]:
     return normalized
 
 
-def implementation_contract_source_binding(root: Path, source_subplan_path: str) -> dict[str, object]:
+def implementation_contract_binding_from_bytes(
+    source_subplan_path: str,
+    encoded: bytes,
+) -> dict[str, object]:
+    """Parse and bind one implementation contract from a single byte read.
+
+    Repository callers must obtain ``encoded`` through ``RepositoryIO``.  The
+    parser deliberately has no filesystem capability so the parsed contract
+    and source digest cannot be produced from different file identities.
+    """
+
     errors: list[str] = []
     if not is_safe_repo_path(source_subplan_path):
         return {"errors": [f"unsafe_source_subplan_path={source_subplan_path or 'missing'}"]}
-    path = (root / source_subplan_path).resolve()
-    if not path_is_inside(root, path):
-        return {"errors": [f"unsafe_source_subplan_path={source_subplan_path}"]}
-    if not path.is_file():
-        return {"errors": [f"missing_source_subplan={source_subplan_path}"]}
-
-    text = path.read_text(encoding="utf-8", errors="replace")
+    if not isinstance(encoded, bytes):
+        raise TypeError("implementation_contract_source_bytes_required")
+    try:
+        text = encoded.decode("utf-8")
+    except UnicodeDecodeError:
+        return {
+            "errors": [f"non_utf8_source_subplan={source_subplan_path}"],
+            "source_subplan_path": source_subplan_path,
+            "source_subplan_sha256": sha256_bytes(encoded),
+            "implementation_contract": {},
+            "implementation_contract_digest": None,
+            "validation_command_ids": [],
+            "parent_acceptance_signal_ids": [],
+            "security_review_required": False,
+            "risk_class": "",
+            "risk_domains": [],
+            "dependencies": {},
+            "outputs": [],
+            "implementation_paths": [],
+        }
     section_matches = list(IMPLEMENTATION_CONTRACT_SECTION_RE.finditer(text))
     if len(section_matches) != 1:
         errors.append(f"implementation_contract_section_count={source_subplan_path}:{len(section_matches)}")
@@ -2547,7 +3264,7 @@ def implementation_contract_source_binding(root: Path, source_subplan_path: str)
     return {
         "errors": errors,
         "source_subplan_path": source_subplan_path,
-        "source_subplan_sha256": sha256_bytes(path.read_bytes()),
+        "source_subplan_sha256": sha256_bytes(encoded),
         "implementation_contract": contract,
         "implementation_contract_digest": digest,
         "validation_command_ids": implementation_contract_validation_command_ids(contract),
@@ -2559,6 +3276,15 @@ def implementation_contract_source_binding(root: Path, source_subplan_path: str)
         "outputs": _list_of_strings(contract.get("outputs")),
         "implementation_paths": implementation_contract_paths(contract),
     }
+
+
+def implementation_contract_source_binding(root: Path, source_subplan_path: str) -> dict[str, object]:
+    """Legacy path API retained only as an explicit fail-closed migration gate."""
+
+    _ = root
+    if not is_safe_repo_path(source_subplan_path):
+        return {"errors": [f"unsafe_source_subplan_path={source_subplan_path or 'missing'}"]}
+    return {"errors": [f"repository_io_required_for_source_subplan={source_subplan_path}"]}
 
 
 def _strip_value(value: str) -> str:

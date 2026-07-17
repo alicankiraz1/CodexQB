@@ -14,6 +14,8 @@ import unittest
 import zipfile
 from pathlib import Path
 
+from tests.controller_test_support import real_trust_store_snapshot
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = REPO_ROOT / "plugins/codexqb/skills/codexqb"
@@ -138,7 +140,7 @@ class SkillContentTests(unittest.TestCase):
                 self.assertTrue(errors)
 
         validate_script = (REPO_ROOT / "scripts/validate.sh").read_text(encoding="utf-8")
-        self.assertIn("python3 scripts/validate_openai_yaml.py", validate_script)
+        self.assertIn("scripts/check_repository_io_policy.py", validate_script)
 
     def test_language_contract_is_documented(self) -> None:
         required_phrases = [
@@ -227,9 +229,25 @@ class SkillContentTests(unittest.TestCase):
         for path in checked_files:
             text = path.read_text(encoding="utf-8")
             self.assertNotIn("~/.codex/skills/codexqb/scripts/validate_planner_docs.py", text, path.name)
-            self.assertIn("bundled validator", text, path.name)
-            self.assertIn("plugins/codexqb/skills/codexqb/scripts/validate_planner_docs.py", text, path.name)
-            self.assertIn("equivalent all-file validation", text, path.name)
+            self.assertIn("bundled", text, path.name)
+            self.assertIn(
+                '"<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py"',
+                text,
+                path.name,
+            )
+            self.assertIn("--controller planner-validator", text, path.name)
+            self.assertNotIn(
+                '"<CODEXQB_SKILL_ROOT>/scripts/validate_planner_docs.py"',
+                text,
+                path.name,
+            )
+            self.assertNotIn(
+                "plugins/codexqb/skills/codexqb/scripts/validate_planner_docs.py",
+                text,
+                path.name,
+            )
+            self.assertIn("`BLOCKED`", text, path.name)
+            self.assertNotIn("equivalent all-file validation", text, path.name)
 
     def test_fourth_planner_external_skills_are_optional(self) -> None:
         fourth = (SKILL_ROOT / "references/handoffs/run-step4.md").read_text(encoding="utf-8")
@@ -252,7 +270,7 @@ class SkillContentTests(unittest.TestCase):
             "For each implementation slice:",
             "Name the active phase/sub-plan",
             "Read AGENTS.md",
-            "Run git status",
+            "Revalidate the Apply controller's workspace proof and baseline",
             "Inspect relevant files before editing",
             "focused failing test",
             "smallest change",
@@ -299,6 +317,10 @@ class SkillContentTests(unittest.TestCase):
         apply_ref = (SKILL_ROOT / "references/apply-orchestrator.md").read_text(encoding="utf-8")
         apply_schema = json.loads((SKILL_ROOT / "references/apply-run-schema.json").read_text(encoding="utf-8"))
         validate_script = (REPO_ROOT / "scripts/validate.sh").read_text(encoding="utf-8")
+        makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+        repository_validation = (
+            SKILL_ROOT / "scripts/repository_validation.py"
+        ).read_text(encoding="utf-8")
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         usage = (REPO_ROOT / "docs/USAGE.md").read_text(encoding="utf-8")
         maintaining = (REPO_ROOT / "docs/MAINTAINING.md").read_text(encoding="utf-8")
@@ -470,10 +492,15 @@ class SkillContentTests(unittest.TestCase):
         self.assertEqual(schema_defs["Result"]["properties"]["budget_contract"]["$ref"], "#/$defs/BudgetContract")
         self.assertEqual(schema_defs["Result"]["properties"]["token_usage"]["$ref"], "#/$defs/TokenUsage")
         self.assertIn("references/apply-run-schema.json", skill)
-        self.assertIn("plugins/codexqb/skills/codexqb/references/apply-run-schema.json", validate_script)
-        self.assertIn("requirements-ci.txt", validate_script)
-        self.assertIn("scripts/validate_apply_schema.py", validate_script)
-        self.assertIn("tests/test_apply_schema.py", validate_script)
+        self.assertIn("repository_validation.py", validate_script)
+        self.assertIn("--contract full", validate_script)
+        self.assertIn(
+            "plugins/codexqb/skills/codexqb/references/apply-run-schema.json",
+            repository_validation,
+        )
+        self.assertIn("check-schema:", makefile)
+        self.assertIn("scripts/validate_apply_schema.py", makefile)
+        self.assertIn("tests.test_apply_schema", makefile)
         self.assertIn("references/apply-run-schema.json", maintaining)
         role_files = [
             "controller.md",
@@ -490,20 +517,26 @@ class SkillContentTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             self.assertIn("model_profile", text, rel)
             self.assertIn(rel, skill)
-            self.assertIn(f"plugins/codexqb/skills/codexqb/{rel}", validate_script)
+            self.assertIn(
+                f"plugins/codexqb/skills/codexqb/{rel}",
+                repository_validation,
+            )
         for phrase in [
             "Events.jsonl",
             "Writer-Lock.json",
-            "apply_run.py prepare",
-            "apply_run.py dispatch",
-            "apply_run.py record-agent",
+            '"<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py"',
+            "--controller apply -- request-stdin",
+            '"schema":"codexqb.controller-argv/v1"',
+            "launcher-backed Apply `prepare` operation",
+            "Use `dispatch`",
+            "use `record-agent`",
             "normalize-writer",
             "normalize-review",
             "capture-evidence",
             "run-validation",
             "publish-review",
-            "apply_run.py transition",
-            "apply_run.py recover-lock",
+            "Use `transition`",
+            "Use `recover-lock`",
             "`finalize` remains fail-closed",
             "strict Step 4 validation",
             "validator output hash",
@@ -524,17 +557,17 @@ class SkillContentTests(unittest.TestCase):
         ]:
             self.assertIn(phrase, apply_ref)
         for phrase in [
-            "prepare --root",
-            "dispatch --run-dir",
-            "record-agent --run-dir",
+            "--controller apply -- request-stdin",
+            "codexqb.controller-argv/v1",
+            "prepare",
+            "dispatch",
+            "record",
             "normalize-writer",
             "normalize-review",
             "capture-evidence",
             "run-validation",
             "publish-review",
-            "transition --run-dir",
-            "recover-lock --run-dir",
-            "finalize --run-dir",
+            "finalize",
             "Events.jsonl",
             "strict Step 4 validation",
             "apply-run-schema.json",
@@ -544,6 +577,7 @@ class SkillContentTests(unittest.TestCase):
         ]:
             self.assertIn(phrase, readme)
             self.assertIn(phrase, usage)
+        self.assertIn("recover-lock", usage)
         for phrase in [
             "missing dispatch packets",
             "missing spawned/completed agent lifecycle records",
@@ -570,45 +604,50 @@ class SkillContentTests(unittest.TestCase):
 
     def test_validate_script_covers_archive_and_secret_hygiene(self) -> None:
         validate_script = (REPO_ROOT / "scripts/validate.sh").read_text(encoding="utf-8")
+        repository_validation = (
+            SKILL_ROOT / "scripts/repository_validation.py"
+        ).read_text(encoding="utf-8")
         for phrase in [
-            "tracked_secret_hygiene_failed",
-            "package_secret_hygiene_failed",
-            "package_secret_hygiene_mode=filesystem",
-            "openrouter_api_key",
+            "scripts/check_repository_io_policy.py",
+            "repository_validation.py",
+            "--workspace-mode git",
+            "scripts/export_sanitized.py",
+            "scripts/verify_package_manifest.py",
+            "scripts/extract_verified_package.py",
+            "package_secret_match_locations",
             "package_secret_path_match_locations",
             "package_path_",
-            "CODEXQB_TRUSTED_GIT",
-            "[GIT, \"archive\"",
-            "archive_hygiene_failed",
-            "package_hygiene_failed",
-            "package_hygiene_mode=filesystem",
             "CODEXQB_VALIDATE_SKIP_UNITTESTS",
             "__MACOSX",
             ".local",
-            "safety_contracts.py",
-            "goal-compiler.md",
-            "apply-orchestrator.md",
+            "from safety_contracts",
             "sanitized_zip_hygiene=passed",
             "sanitized_zip_hygiene_failed",
             "PACKAGE-MANIFEST.json",
-            "CODEXQB_VALIDATE_SKIP_BEHAVIOR_SMOKE",
             "evals/run_apply_behavior_smoke.py",
             "evals/run_downstream_goal_apply_dry_run.py",
             "downstream_goal_apply_dry_run=passed",
             "evals/run_goal_apply_metric_checks.py",
             "goal_apply_metric_checks=passed",
             "apply_behavior_smoke=passed",
-            "docs/FEEDBACK-CLOSURE-AUDIT.md",
-            "docs/release-audits/0.3.0-feedback-closure.md",
         ]:
             self.assertIn(phrase, validate_script)
-        for phrase in (
-            "secret_hygiene_finding=index-",
-            "archive_hygiene_finding=index-",
-            "zip_hygiene_finding=index-",
-            "path_sha256:",
-        ):
+        for phrase in ("zip_hygiene_finding=index-", "path_sha256:"):
             self.assertIn(phrase, validate_script)
+        self.assertIn(
+            'expected_manifest.encode("utf-8")',
+            validate_script,
+        )
+        self.assertIn('findings.append(("blocked_path", path_sha256, 0))', validate_script)
+        self.assertNotIn('findings.append(("missing_package_manifest", "0" * 64, 0))', validate_script)
+        self.assertNotIn("blocked_package_path", validate_script)
+        self.assertLess(
+            validate_script.index("package_secret_path_match_locations(name)"),
+            validate_script.index("if bad.search(name):"),
+        )
+        self.assertEqual(validate_script.count("scripts/run_test_suite.py behavior"), 1)
+        self.assertIn("repository_validation_finding=index-", repository_validation)
+        self.assertIn("path_sha256:", repository_validation)
         self.assertNotIn('findings.append(f"{path}:', validate_script)
         self.assertNotIn('print(f"blocked_path={offender}")', validate_script)
         self.assertNotIn('print(f"secret_like_content={offender}")', validate_script)
@@ -724,11 +763,17 @@ class SkillContentTests(unittest.TestCase):
         artifact_io = SKILL_ROOT / "scripts/artifact_io.py"
         self.assertTrue(artifact_io.is_file())
         validator = (REPO_ROOT / "scripts/validate.sh").read_text(encoding="utf-8")
-        self.assertIn("plugins/codexqb/skills/codexqb/scripts/artifact_io.py", validator)
+        self.assertIn("scripts/check_repository_io_policy.py", validator)
+        self.assertIn("scripts/repository_validation.py", validator)
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("scripts/artifact_io.py", skill)
+        controller_store = SKILL_ROOT / "scripts/controller_store.py"
+        self.assertTrue(controller_store.is_file())
+        self.assertIn("artifact_io", controller_store.read_text(encoding="utf-8"))
         for path in [SKILL_ROOT / "scripts/goal_run.py", SKILL_ROOT / "scripts/apply_run.py"]:
-            self.assertIn("artifact_io", path.read_text(encoding="utf-8"), path.as_posix())
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("controller_store", text, path.as_posix())
+            self.assertNotIn("from artifact_io import", text, path.as_posix())
 
         goal_contract = (SKILL_ROOT / "references/goal-compiler.md").read_text(encoding="utf-8")
         apply_contract = (SKILL_ROOT / "references/apply-orchestrator.md").read_text(encoding="utf-8")
@@ -742,7 +787,8 @@ class SkillContentTests(unittest.TestCase):
                 apply_contract,
             ]
         )
-        self.assertIn("direct, non-symlink child of `Planner-docs/Goal-Runs/`", public_contract)
+        self.assertIn("external controller-state `goal-runs/", public_contract)
+        self.assertIn("Legacy in-repository", public_contract)
         self.assertIn("registered and HMAC-verified direct", public_contract)
         for phrase in [
             "`O_EXCL | O_NOFOLLOW`",
@@ -808,14 +854,38 @@ class SkillContentTests(unittest.TestCase):
         self.assertNotIn("secure coding and secure-by-design expectations where relevant", out_of_scope)
         self.assertNotIn("ontology, lifecycle, or invariant consistency where relevant", out_of_scope)
 
-    def test_autopsy_sensitive_discovery_is_file_name_only(self) -> None:
+    def test_autopsy_sensitive_discovery_uses_named_redacted_repository_profile(self) -> None:
         autopsy = (SKILL_ROOT / "references/Autopsy-Planner.md").read_text(encoding="utf-8")
-        normal_scan = next(line for line in autopsy.splitlines() if line.strip().startswith("- rg \"TODO|FIXME"))
-        sensitive_scan = next(line for line in autopsy.splitlines() if "secret|token|credential" in line and "rg -l" in line)
+        self.assertIn(
+            '"<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py"',
+            autopsy,
+        )
+        self.assertIn("--controller repository-io -- request-stdin", autopsy)
+        self.assertIn(
+            '"argv": ["--root", ".", "inspect", "--profile", "autopsy"]',
+            autopsy,
+        )
+        self.assertIn(
+            '"argv": ["--root", ".", "search", "--profile", "autopsy"]',
+            autopsy,
+        )
+        self.assertNotIn('"<CODEXQB_SKILL_ROOT>/scripts/repository_io.py"', autopsy)
+        self.assertIn("safe metadata, never matching lines", autopsy)
+        self.assertNotRegex(autopsy, r"(?m)^\s*(?:rg|grep|cat)\b")
 
-        self.assertNotIn("secret|token|credential", normal_scan)
-        self.assertIn("rg -l", sensitive_scan)
-        self.assertIn("file-name-only", autopsy)
+    def test_step1_publish_uses_the_bundled_repository_io_entrypoint(self) -> None:
+        first = (SKILL_ROOT / "references/First-Planner.md").read_text(encoding="utf-8")
+        self.assertIn(
+            'python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/'
+            'skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" '
+            '--controller repository-io -- request-stdin',
+            first,
+        )
+        self.assertIn(
+            '"argv":["--root",".","write-planner","--stage","step1"',
+            first,
+        )
+        self.assertNotIn('"<CODEXQB_SKILL_ROOT>/scripts/repository_io.py"', first)
 
     def test_project_comprehension_reference_and_prompts_are_wired(self) -> None:
         ref = SKILL_ROOT / "references/project-comprehension-methods.md"
@@ -941,6 +1011,26 @@ class SkillContentTests(unittest.TestCase):
             4,
         )
         self.assertEqual(workflow.count("fetch-depth: 0"), 4)
+        self.assertEqual(workflow.count("persist-credentials: false"), 4)
+        self.assertEqual(workflow.count("name: Harden ephemeral Linux runner home chain"), 4)
+        self.assertEqual(
+            workflow.count(
+                'sudo setfacl --remove-all --remove-default -- "${account_home_chain[@]}"'
+            ),
+            4,
+        )
+        self.assertEqual(
+            workflow.count('sudo chmod go-w -- "${account_home_chain[@]}"'),
+            4,
+        )
+        self.assertEqual(
+            workflow.count('install -d -m 0700 -- "$private_tmp"'),
+            4,
+        )
+        self.assertEqual(
+            workflow.count("printf 'TMPDIR=%s\\n' \"$private_tmp\" >> \"$GITHUB_ENV\""),
+            4,
+        )
         self.assertIn("name: required / CodexQB", workflow)
         self.assertIn("needs: [portability, behavior, package]", workflow)
         self.assertIn("package-ecosystem: github-actions", dependabot)
@@ -970,8 +1060,19 @@ class SkillContentTests(unittest.TestCase):
         self.assertIn("run: make check-package", workflow)
         self.assertIn("make check-public-privacy", workflow)
         self.assertIn("Validate an extracted Gitless source package", workflow)
-        self.assertIn("CODEXQB_VALIDATE_SKIP_UNITTESTS=1", workflow)
-        self.assertIn("CODEXQB_VALIDATE_SKIP_BEHAVIOR_SMOKE=1", workflow)
+        self.assertIn("scripts/run_extracted_validation.py", workflow)
+        workflow_target_validate = workflow.index(
+            "scripts/run_extracted_validation.py"
+        )
+        self.assertLess(
+            workflow.index('--root "$tmpdir/source/CodexQB"'),
+            workflow_target_validate,
+        )
+        self.assertIn('--zip "$tmpdir/CodexQB-source-worktree.zip"', workflow)
+        self.assertIn('--expected-head "$GITHUB_SHA"', workflow)
+        self.assertIn('--profile static', workflow)
+        self.assertIn("--skip-unit-tests", workflow)
+        self.assertIn("--skip-behavior-smoke", workflow)
         self.assertIn("--artifact-type plugin", workflow)
         self.assertIn("--artifact-type source", workflow)
         self.assertIn("--provenance-mode worktree", workflow)
@@ -1004,6 +1105,15 @@ class SkillContentTests(unittest.TestCase):
             self.assertIn(target, makefile)
         self.assertIn("check-public-privacy", makefile)
         self.assertIn("--scope all --require-empty-baseline", makefile)
+        self.assertIn("scripts/run_extracted_validation.py", makefile)
+        make_target_validate = makefile.index("scripts/run_extracted_validation.py")
+        self.assertLess(
+            makefile.index('--root "$$tmpdir/source/CodexQB"'),
+            make_target_validate,
+        )
+        self.assertIn('--zip "$$tmpdir/CodexQB-source-release.zip"', makefile)
+        self.assertIn('--expected-head "$$(git rev-parse --verify HEAD)"', makefile)
+        self.assertIn('--profile static', makefile)
         self.assertIn("check: check-static check-unit check-platform check-behavior check-package", makefile)
         check_fast = makefile.split("check-fast:", 1)[1].split("\n\n", 1)[0]
         self.assertIn("scripts/run_test_suite.py fast", check_fast)
@@ -1025,14 +1135,9 @@ class SkillContentTests(unittest.TestCase):
         self.assertIn("codexqb-plugin-worktree.zip", validate_script)
         self.assertIn("CodexQB-source-worktree.zip", validate_script)
         self.assertIn("export PYTHONDONTWRITEBYTECODE=1", validate_script)
-        self.assertIn(
-            'scripts/verify_package_manifest.py --root .',
-            validate_script,
-        )
-        self.assertLess(
-            validate_script.index('scripts/verify_package_manifest.py --root .'),
-            validate_script.index('TRUSTED_GIT=""'),
-        )
+        self.assertIn("repository_validation.py", validate_script)
+        self.assertIn("--workspace-mode git", validate_script)
+        self.assertNotIn("CODEXQB_EXTERNAL_PACKAGE", validate_script)
         self.assertIn(
             'scripts/verify_package_manifest.py --zip "$PLUGIN_PACKAGE"',
             validate_script,
@@ -1129,8 +1234,14 @@ class SkillContentTests(unittest.TestCase):
             self.assertTrue((fixture_root / fixture / "expected.json").is_file(), fixture)
 
         validate_script = (REPO_ROOT / "scripts/validate.sh").read_text(encoding="utf-8")
-        self.assertIn("python3 evals/run_fixture_corpus_checks.py", validate_script)
-        self.assertIn("python3 evals/run_downstream_goal_apply_dry_run.py", validate_script)
+        self.assertIn(
+            "python3 -I -S -B evals/run_fixture_corpus_checks.py",
+            validate_script,
+        )
+        self.assertIn(
+            "python3 -I -S -B evals/run_downstream_goal_apply_dry_run.py",
+            validate_script,
+        )
         self.assertIn('--provenance-mode "$PACKAGE_PROVENANCE_MODE"', validate_script)
 
     def test_probe_policy_and_schema_versions_are_documented(self) -> None:
@@ -1174,10 +1285,50 @@ class SkillContentTests(unittest.TestCase):
 
     def test_validate_script_runs_without_git_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
+            # The external controller intentionally refuses a dirty selected
+            # checkout. Build a clean, private checkout from the exact tracked
+            # worktree bytes under test, then prove that its extracted target
+            # needs no Git metadata and executes no target-owned controller.
+            trusted_checkout = Path(temp_dir) / "trusted-checkout"
+            shutil.copytree(
+                REPO_ROOT,
+                trusted_checkout,
+                ignore=shutil.ignore_patterns(
+                    ".git",
+                    "__pycache__",
+                    "*.pyc",
+                    "*.pyo",
+                    "artifacts",
+                    "build",
+                    "dist",
+                ),
+            )
+            subprocess.run(["git", "init", "-q"], cwd=trusted_checkout, check=True)
+            subprocess.run(["git", "add", "."], cwd=trusted_checkout, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=CodexQB Test",
+                    "-c",
+                    "user.email=codexqb@example.invalid",
+                    "commit",
+                    "-qm",
+                    "gitless extracted validation fixture",
+                ],
+                cwd=trusted_checkout,
+                check=True,
+            )
+            expected_head = subprocess.check_output(
+                ["git", "rev-parse", "--verify", "HEAD"],
+                cwd=trusted_checkout,
+                text=True,
+            ).strip()
             archive_path = Path(temp_dir) / "CodexQB-source-package.zip"
             export_result = subprocess.run(
                 [
                     "python3",
+                    "-B",
                     "scripts/export_sanitized.py",
                     "--root",
                     ".",
@@ -1185,7 +1336,7 @@ class SkillContentTests(unittest.TestCase):
                     str(archive_path),
                     "--source-package",
                 ],
-                cwd=REPO_ROOT,
+                cwd=trusted_checkout,
                 text=True,
                 capture_output=True,
                 timeout=30,
@@ -1203,60 +1354,23 @@ class SkillContentTests(unittest.TestCase):
             env = os.environ.copy()
             env["CODEXQB_VALIDATE_SKIP_UNITTESTS"] = "1"
             env["CODEXQB_VALIDATE_SKIP_BEHAVIOR_SMOKE"] = "1"
-            result = subprocess.run(
-                ["bash", "scripts/validate.sh"],
-                cwd=package_root,
-                env=env,
-                text=True,
-                capture_output=True,
-                # The filesystem package scan is intentionally byte-safe and can
-                # cross the old 30-second test harness limit on hosted Linux.
-                # Keep this harness ceiling above the scanner's own fail-closed
-                # budgets so a healthy scan is not reported as a CI failure.
-                timeout=120,
-                check=False,
-            )
 
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("package_secret_hygiene_mode=filesystem", result.stdout)
-            self.assertIn("package_hygiene_mode=filesystem", result.stdout)
-            self.assertIn("unit_tests_skipped=1", result.stdout)
-            self.assertIn("behavior_smokes_skipped=1", result.stdout)
-            self.assertNotIn("apply_behavior_smoke=passed", result.stdout)
-
-            fixture = "sk-" + "V" * 40
-            secret_path = package_root / f"{fixture}.txt"
-            secret_path.write_text("safe file body\n", encoding="utf-8")
-            (package_root / "PACKAGE-MANIFEST.json").unlink()
-            subprocess.run(
-                ["git", "init", "-q"],
-                cwd=package_root,
-                capture_output=True,
-                check=True,
+            # The extracted shell may report that authentication is missing,
+            # but it must not execute even its own Python verifier first.
+            verifier = package_root / "scripts/verify_package_manifest.py"
+            original_verifier = verifier.read_bytes()
+            marker = Path(temp_dir) / "target-verifier-executed"
+            verifier.write_text(
+                verifier.read_text(encoding="utf-8").replace(
+                    "from __future__ import annotations\n",
+                    "from __future__ import annotations\n"
+                    "from pathlib import Path as _CodexQBMarkerPath\n"
+                    f"_CodexQBMarkerPath({str(marker)!r}).write_text('executed')\n",
+                    1,
+                ),
+                encoding="utf-8",
             )
-            subprocess.run(
-                ["git", "add", "."],
-                cwd=package_root,
-                capture_output=True,
-                check=True,
-            )
-            path_result = subprocess.run(
-                ["bash", "scripts/validate.sh", "static"],
-                cwd=package_root,
-                env=env,
-                text=True,
-                capture_output=True,
-                timeout=120,
-                check=False,
-            )
-            self.assertNotEqual(path_result.returncode, 0)
-            self.assertIn("tracked_secret_hygiene_failed", path_result.stdout)
-            self.assertIn("package_path_openai_api_key", path_result.stdout)
-            self.assertNotIn(fixture, path_result.stdout + path_result.stderr)
-            shutil.rmtree(package_root / ".git")
-            secret_path.unlink()
-
-            missing_manifest = subprocess.run(
+            unauthenticated = subprocess.run(
                 ["bash", "scripts/validate.sh"],
                 cwd=package_root,
                 env=env,
@@ -1265,11 +1379,225 @@ class SkillContentTests(unittest.TestCase):
                 timeout=10,
                 check=False,
             )
-            self.assertNotEqual(missing_manifest.returncode, 0)
-            self.assertIn(
-                "package_manifest_missing_for_gitless_tree",
-                missing_manifest.stdout,
+            self.assertNotEqual(unauthenticated.returncode, 0)
+            self.assertFalse((package_root / "scripts/validate.sh").exists())
+            self.assertFalse(
+                (package_root / "scripts/run_extracted_validation.py").exists()
             )
+            self.assertFalse(marker.exists())
+
+            # A trusted-checkout verifier rejects the mutated target before
+            # target-owned validate/verifier code is admitted for execution.
+            rejected = subprocess.run(
+                [
+                    "python3",
+                    "-I",
+                    "-S",
+                    "-B",
+                    str(trusted_checkout / "scripts/verify_package_manifest.py"),
+                    "--root",
+                    str(package_root),
+                    "--strict-artifact",
+                    "--expected-artifact-type",
+                    "source",
+                ],
+                cwd=trusted_checkout,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertFalse(marker.exists())
+
+            verifier.write_bytes(original_verifier)
+            verifier.chmod(0o644)
+            external_manifest = subprocess.run(
+                [
+                    "python3",
+                    "-I",
+                    "-S",
+                    "-B",
+                    str(trusted_checkout / "scripts/verify_package_manifest.py"),
+                    "--root",
+                    str(package_root),
+                    "--strict-artifact",
+                    "--expected-artifact-type",
+                    "source",
+                ],
+                cwd=trusted_checkout,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(
+                external_manifest.returncode,
+                0,
+                external_manifest.stdout + external_manifest.stderr,
+            )
+            result = subprocess.run(
+                [
+                    "python3",
+                    "-I",
+                    "-S",
+                    "-B",
+                    str(trusted_checkout / "scripts/run_extracted_validation.py"),
+                    "--expected-head",
+                    expected_head,
+                    "--zip",
+                    str(archive_path),
+                    "--root",
+                    str(package_root),
+                    "--profile",
+                    "static",
+                    "--skip-unit-tests",
+                    "--skip-behavior-smoke",
+                ],
+                cwd=trusted_checkout,
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                result.stdout + result.stderr,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("extracted_package_admission=passed", result.stdout)
+            self.assertRegex(result.stdout, r"(?m)^pair_digest=[0-9a-f]{64}$")
+            self.assertIn("external_pair_diagnostic_schema_version=1", result.stdout)
+            self.assertIn("target_code_executed=false", result.stdout)
+            self.assertIn("host_attested=false", result.stdout)
+            self.assertIn("verified=false", result.stdout)
+            self.assertIn("finalization_allowed=false", result.stdout)
+            self.assertNotIn("apply_behavior_smoke=passed", result.stdout)
+
+            (package_root / "PACKAGE-MANIFEST.json").unlink()
+            missing_manifest = subprocess.run(
+                [
+                    "python3",
+                    "-I",
+                    "-S",
+                    "-B",
+                    str(trusted_checkout / "scripts/run_extracted_validation.py"),
+                    "--expected-head",
+                    expected_head,
+                    "--zip",
+                    str(archive_path),
+                    "--root",
+                    str(package_root),
+                    "--profile",
+                    "static",
+                ],
+                cwd=trusted_checkout,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(missing_manifest.returncode, 0)
+            self.assertIn("extracted_package_admission=failed", missing_manifest.stdout)
+
+    def test_validate_guard_detects_static_checker_mutation_before_recapture(self) -> None:
+        validate_text = (REPO_ROOT / "scripts/validate.sh").read_text(encoding="utf-8")
+        capture = (
+            'python3 -I -S -B "$TRUST_GUARD_HELD" capture '
+            '--output "$TRUST_GUARD_BASELINE"'
+        )
+        checker = (
+            "python3 -I -S -B scripts/check_repository_io_policy.py "
+            "--root . --layout repository-plugin"
+        )
+        self.assertLess(validate_text.index("trap cleanup_validate EXIT"), validate_text.index(capture))
+        self.assertLess(validate_text.index(capture), validate_text.index(checker))
+
+        real_before = real_trust_store_snapshot()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            repo = base / "repo"
+            shutil.copytree(
+                REPO_ROOT,
+                repo,
+                ignore=shutil.ignore_patterns(
+                    ".git",
+                    "__pycache__",
+                    "*.pyc",
+                    "*.pyo",
+                    "artifacts",
+                    "build",
+                    "dist",
+                ),
+            )
+            fake_trust = base / "private-test-trust"
+            fake_trust.mkdir(mode=0o700)
+            (fake_trust / "state").write_bytes(b"before")
+
+            # Test-only held provider: production keeps using passwd-home and
+            # does not accept this environment variable or any root override.
+            (repo / "tests/controller_test_support.py").write_text(
+                """from __future__ import annotations
+import argparse
+import hashlib
+import os
+from pathlib import Path
+
+def snapshot() -> str:
+    root = Path(os.environ["CODEXQB_SYNTHETIC_GUARD_ROOT"])
+    digest = hashlib.sha256()
+    for path in sorted(root.iterdir(), key=lambda item: item.name):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+parser = argparse.ArgumentParser()
+parser.add_argument("command", choices=("capture", "verify"))
+parser.add_argument("--output")
+parser.add_argument("--baseline")
+args = parser.parse_args()
+if args.command == "capture":
+    Path(args.output).write_text(snapshot(), encoding="ascii")
+    print("real_controller_trust_guard=captured")
+else:
+    if Path(args.baseline).read_text(encoding="ascii") != snapshot():
+        print("synthetic_guard_detected_change", file=__import__("sys").stderr)
+        raise SystemExit(2)
+    print("real_controller_trust_guard=unchanged")
+""",
+                encoding="utf-8",
+            )
+            (repo / "scripts/check_repository_io_policy.py").write_text(
+                """from pathlib import Path
+import os
+
+root = Path(os.environ["CODEXQB_SYNTHETIC_GUARD_ROOT"])
+(root / "checker-mutation").write_bytes(b"mutated")
+print("synthetic_checker_mutated_private_test_trust")
+raise SystemExit(23)
+""",
+                encoding="utf-8",
+            )
+            environment = dict(os.environ)
+            environment["CODEXQB_SYNTHETIC_GUARD_ROOT"] = str(fake_trust)
+            completed = subprocess.run(
+                ["bash", "scripts/validate.sh", "static"],
+                cwd=repo,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("real_controller_trust_guard=captured", completed.stdout)
+            self.assertIn("synthetic_checker_mutated_private_test_trust", completed.stdout)
+            self.assertIn("synthetic_guard_detected_change", completed.stderr)
+            self.assertIn("real_controller_trust_guard=changed", completed.stderr)
+
+        self.assertEqual(real_trust_store_snapshot(), real_before)
 
     def test_archive_hygiene_pattern_matches_forbidden_paths(self) -> None:
         pattern = re.compile(
@@ -1417,7 +1745,8 @@ class SkillContentTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             self.assertNotIn('rg -n "sk-', text, path.name)
         workflow_quality = (SKILL_ROOT / "references/workflow-quality.md").read_text(encoding="utf-8")
-        self.assertIn("file-name-only", workflow_quality)
+        self.assertIn("named\n  repository I/O search profiles", workflow_quality)
+        self.assertIn("Do not print secret values", workflow_quality)
 
     def test_fourth_planner_mentions_subagent_roles_and_ledger(self) -> None:
         fourth = (SKILL_ROOT / "references/Fourth-Planner.md").read_text(encoding="utf-8")

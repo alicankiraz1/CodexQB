@@ -8,11 +8,81 @@ and are not part of the public diagnostic contract.
 
 from __future__ import annotations
 
+import sys
+
+if __name__ == "__main__" and not (
+    sys.flags.isolated
+    and sys.flags.no_site
+    and sys.flags.dont_write_bytecode
+    and sys.flags.optimize == 0
+):
+    sys.stderr.write(
+        "codexqb_controller=unsupported "
+        "reason=requires_python_-I_-S_-B_first_process\n"
+    )
+    raise SystemExit(2)
+
+from types import ModuleType
+
+
+def _launcher_admission_is_valid(expected_basename: str) -> bool:
+    context = sys.modules.get("_codexqb_held_runtime_context_v1")
+    if not isinstance(context, ModuleType):
+        return False
+    try:
+        state = ModuleType.__getattribute__(context, "__dict__")
+    except (AttributeError, TypeError):
+        return False
+    runtime_sources = state.get("runtime_sources")
+    if (
+        type(expected_basename) is not str
+        or not expected_basename
+        or type(state.get("__name__")) is not str
+        or state.get("__name__") != "_codexqb_held_runtime_context_v1"
+        or type(state.get("schema_version")) is not int
+        or state.get("schema_version") != 1
+        or type(state.get("assurance")) is not str
+        or state.get("assurance")
+        != "controller_observed_loader_path_unattested"
+        or state.get("host_attested") is not False
+        or state.get("verified") is not False
+        or state.get("finalization_authority") is not False
+        or "runtime_sha256" in state
+        or "goal_sha256" in state
+        or type(runtime_sources) is not tuple
+        or not runtime_sources
+    ):
+        return False
+    source_names: list[str] = []
+    for item in runtime_sources:
+        if type(item) is not tuple or len(item) != 2:
+            return False
+        source_name, source = item
+        if (
+            type(source_name) is not str
+            or not source_name
+            or type(source) is not bytes
+            or not source
+        ):
+            return False
+        source_names.append(source_name)
+    return bool(
+        tuple(source_names) == tuple(sorted(source_names))
+        and len(source_names) == len(set(source_names))
+        and expected_basename in source_names
+    )
+
+if __name__ == "__main__" and not _launcher_admission_is_valid("doctor.py"):
+    sys.stderr.write(
+        "codexqb_controller=unsupported reason=launcher_admission_required\n"
+    )
+    raise SystemExit(2)
+
+
 import importlib
 import json
 import os
 import re
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence, TextIO

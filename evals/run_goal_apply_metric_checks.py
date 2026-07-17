@@ -7,6 +7,7 @@ Codex, spawn subagents, or claim exact model token billing.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import subprocess
@@ -16,18 +17,36 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-GOAL_RUN = REPO_ROOT / "plugins/codexqb/skills/codexqb/scripts/goal_run.py"
-APPLY_RUN = REPO_ROOT / "plugins/codexqb/skills/codexqb/scripts/apply_run.py"
 STEP4_HANDOFF = REPO_ROOT / "plugins/codexqb/skills/codexqb/references/handoffs/run-step4.md"
 
 if REPO_ROOT.as_posix() not in sys.path:
     sys.path.insert(0, REPO_ROOT.as_posix())
 
+from tests.controller_test_support import (  # noqa: E402
+    assert_real_trust_store_unchanged,
+    controller_cli_command,
+    temporary_controller_home,
+)
 from tests.test_validate_planner_docs import write_audit, write_valid_step2_fixture  # noqa: E402
 
 
+_CONTROLLER_TEST_HOME: Path | None = None
+_SAFE_FAILURE_CODES = frozenset(
+    {
+        "apply_command_repository_root_mismatch",
+        "command_failed",
+        "controller_test_home_not_initialized",
+        "unhandled_exception",
+    }
+)
+
+
 def fail(message: str) -> None:
-    print(f"goal_apply_metric_checks_failed={message}")
+    candidate = message.partition("=")[0]
+    code = candidate if candidate in _SAFE_FAILURE_CODES else "unspecified"
+    detail_sha256 = hashlib.sha256(message.encode("utf-8", errors="replace")).hexdigest()
+    print(f"goal_apply_metric_checks_failed_code={code.lower()}")
+    print(f"goal_apply_metric_checks_failed_detail_sha256={detail_sha256}")
     raise SystemExit(1)
 
 
@@ -69,16 +88,35 @@ def parse_key(output: str, key: str) -> str:
     raise AssertionError("unreachable")
 
 
+def apply_controller_command(root: Path, args: list[str]) -> list[str]:
+    if _CONTROLLER_TEST_HOME is None:
+        fail("controller_test_home_not_initialized")
+    rooted = list(args)
+    root_positions = [index for index, value in enumerate(rooted) if value == "--root"]
+    if not root_positions:
+        rooted.extend(["--root", root.as_posix()])
+    elif (
+        len(root_positions) != 1
+        or root_positions[0] + 1 >= len(rooted)
+        or Path(rooted[root_positions[0] + 1]).resolve() != root.resolve()
+    ):
+        fail("apply_command_repository_root_mismatch")
+    return controller_cli_command("apply", _CONTROLLER_TEST_HOME, rooted)
+
+
 def write_fixture(root: Path) -> None:
     docs = write_valid_step2_fixture(root)
     write_audit(docs, "PASS")
 
 
 def compile_goal_prompt(root: Path, mode: str, suffix: str) -> str:
+    if _CONTROLLER_TEST_HOME is None:
+        fail("controller_test_home_not_initialized")
     output = run_command(
-        [
-            sys.executable,
-            GOAL_RUN.as_posix(),
+        controller_cli_command(
+            "goal",
+            _CONTROLLER_TEST_HOME,
+            [
             "prepare",
             "--root",
             root.as_posix(),
@@ -88,7 +126,8 @@ def compile_goal_prompt(root: Path, mode: str, suffix: str) -> str:
             mode,
             "--run-id-suffix",
             suffix,
-        ],
+            ],
+        ),
         cwd=root,
     )
     out_dir = Path(parse_key(output, "output_dir"))
@@ -105,9 +144,9 @@ def compile_goal_prompt(root: Path, mode: str, suffix: str) -> str:
 
 def prepare_apply_run(root: Path, mode: str, suffix: str) -> Path:
     output = run_command(
-        [
-            sys.executable,
-            APPLY_RUN.as_posix(),
+        apply_controller_command(
+            root,
+            [
             "prepare",
             "--root",
             root.as_posix(),
@@ -116,7 +155,8 @@ def prepare_apply_run(root: Path, mode: str, suffix: str) -> Path:
             "--run-id-suffix",
             suffix,
             "--allow-non-git-unsafe",
-        ],
+            ],
+        ),
         cwd=root,
     )
     return Path(parse_key(output, "run_dir"))
@@ -136,9 +176,9 @@ def first_task(run_dir: Path) -> tuple[str, Path]:
 
 def subagent_dispatch_message(root: Path, run_dir: Path, task_id: str) -> str:
     output = run_command(
-        [
-            sys.executable,
-            APPLY_RUN.as_posix(),
+        apply_controller_command(
+            root,
+            [
             "dispatch",
             "--run-dir",
             run_dir.as_posix(),
@@ -150,7 +190,8 @@ def subagent_dispatch_message(root: Path, run_dir: Path, task_id: str) -> str:
             "metric-controller",
             "--evidence",
             "metric collection generated dispatch packet",
-        ],
+            ],
+        ),
         cwd=root,
     )
     packet_path = Path(parse_key(output, "packet_path"))
@@ -166,8 +207,14 @@ def subagent_dispatch_message(root: Path, run_dir: Path, task_id: str) -> str:
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory() as temp_dir:
+    global _CONTROLLER_TEST_HOME
+    with (
+        assert_real_trust_store_unchanged(),
+        tempfile.TemporaryDirectory() as temp_dir,
+        temporary_controller_home() as controller_home,
+    ):
         root = Path(temp_dir)
+        _CONTROLLER_TEST_HOME = Path(controller_home)
         write_fixture(root)
 
         static_handoff = STEP4_HANDOFF.read_text(encoding="utf-8")
@@ -204,4 +251,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:
+        fail(f"unhandled_exception={type(exc).__name__}:{exc}")

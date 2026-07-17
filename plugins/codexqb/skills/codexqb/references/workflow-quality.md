@@ -61,15 +61,15 @@ Prefer the bundled validator over ad hoc validation snippets. When manually
 validating from a CodexQB repository checkout, use:
 
 ```bash
-python3 plugins/codexqb/skills/codexqb/scripts/validate_planner_docs.py --root . --mode step2 --strict
-python3 plugins/codexqb/skills/codexqb/scripts/validate_planner_docs.py --root . --mode step3 --strict
-python3 plugins/codexqb/skills/codexqb/scripts/validate_planner_docs.py --root . --mode step4 --strict
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller planner-validator -- --root . --mode step2 --strict
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller planner-validator -- --root . --mode step3 --strict
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller planner-validator -- --root . --mode step4 --strict
 ```
 
-If an installed plugin exposes a different active skill script path, use that
-bundled validator path instead. If no script path is accessible, perform
-equivalent all-file validation and state that validator execution was
-unavailable.
+Resolve `<CODEXQB_SKILL_ROOT>` only through the active-skill contract in
+`SKILL.md`. If that loader-supplied, controller-bound absolute root or the bundled validator is
+unavailable, stop as `BLOCKED`; do not search the target repository or perform
+manual/raw all-file validation.
 
 The validator is read-only. It checks required sections, phase folders,
 filename conventions, planning scope manifests, active/deferred phase
@@ -95,19 +95,33 @@ missing or unindexed files, and length-bounded secret patterns.
 
 ## Handle Untracked Planner Docs Correctly
 
-`Planner-docs/` is often untracked during first use. `git diff -- Planner-docs`
-does not show new untracked files.
+`Planner-docs/` is often untracked during first use, so controller-captured Git
+metadata alone does not prove the complete Planner-docs inventory.
 
-Use these checks together:
+Use the concrete launcher-backed `repository-io` inspect command and fixed
+profile named by the active planner for complete Planner-docs inventory and
+repository/worktree/VCS metadata evidence.
+
+When comparing generated files, run only this fixed command:
 
 ```bash
-find Planner-docs -maxdepth 4 -type f | sort
-git status --short -- Planner-docs
-git diff -- Planner-docs
+python3 -I -S -B "<CODEXQB_SKILL_ROOT>/scripts/skill_launcher.py" --active-skill-md "<CODEXQB_SKILL_ROOT>/SKILL.md" --controller repository-io -- request-stdin
 ```
 
-When comparing an untracked generated file to another file, use
-`git diff --no-index` only as a read-only comparison helper.
+Send this non-executable request object through the host process stdin channel,
+once for each exact path:
+
+```json
+{
+  "schema": "codexqb.controller-argv/v1",
+  "argv": ["--root", ".", "read-model", "--path", "<repository-relative-path>"]
+}
+```
+
+Compare the receipt-bound hashes and safe model projections. Avoid raw Git or
+filesystem comparison helpers. Never transport this JSON with echo, printf, a
+pipe, redirection, a heredoc, command substitution, environment variables,
+shell interpolation, or a temporary/repository file.
 
 ## Secret Scan Discipline
 
@@ -115,7 +129,9 @@ When comparing an untracked generated file to another file, use
   filenames like `task-spec.yaml`.
 - Use length-bounded token patterns such as `sk-[A-Za-z0-9_-]{20,}`.
 - Do not print secret values if a secret-like pattern is detected.
-- Do not run grep/ripgrep commands that print matched secret-bearing lines. Prefer the bundled validator; if a fallback scan is unavoidable, use file-name-only output such as `rg -l`.
+- Do not run arbitrary repository-content search commands. Use the named
+  repository I/O search profiles and bundled validator; if either is
+  unavailable, stop as `BLOCKED` instead of using a raw fallback.
 
 ## Required Step Handoffs
 
