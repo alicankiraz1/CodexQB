@@ -9,24 +9,112 @@ exports.
 
 from __future__ import annotations
 
+import ast
+from array import array
+from collections import OrderedDict
 import fnmatch
 import hashlib
 import html
+import io
 import json
 import re
 import shlex
+import tokenize
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 
 MAX_SECRET_SCAN_CHARACTERS = 16 * 1024 * 1024
 MAX_SECRET_MATCH_LOCATIONS = 256
+PACKAGE_BINARY_SCAN_WINDOW_BYTES = 8 * 1024 * 1024
+PACKAGE_BINARY_SCAN_OVERLAP_BYTES = 264 * 1024
+PACKAGE_UTF16_MIN_ASCII_UNITS = 8
+PACKAGE_UTF32_MIN_ASCII_UNITS = 8
+PACKAGE_SECRET_SCAN_CACHE_MAX_ENTRIES = 4096
+PACKAGE_PYTHON_CONSTANT_MAX_CHARACTERS = 4096
+PACKAGE_PYTHON_CONSTANT_MAX_DEPTH = 64
+PACKAGE_PYTHON_CONSTANT_MAX_PARTS = 4096
+PACKAGE_PYTHON_TOKEN_MAX_COUNT = 1_000_000
 MAX_SAFE_LOG_CHARACTERS = 4096
 MAX_MARKUP_TOKENS = 4096
 MAX_STRUCTURED_CONTEXT_NODES = 65_536
 MAX_STRUCTURED_CONTEXT_INPUT_CHARACTERS = 1024 * 1024
 SECRET_REDACTION_MARKER = "<redacted>"
+PACKAGE_KNOWN_TEXT_SUFFIXES = frozenset(
+    {
+        ".cfg",
+        ".conf",
+        ".css",
+        ".csv",
+        ".html",
+        ".ini",
+        ".js",
+        ".json",
+        ".jsx",
+        ".lock",
+        ".md",
+        ".py",
+        ".rst",
+        ".sh",
+        ".sql",
+        ".toml",
+        ".ts",
+        ".tsv",
+        ".tsx",
+        ".txt",
+        ".xml",
+        ".yaml",
+        ".yml",
+    }
+)
+PACKAGE_CONFIG_TEXT_SUFFIXES = frozenset({".cfg", ".conf", ".ini", ".toml", ".yaml", ".yml"})
+PACKAGE_SCRIPT_TEXT_SUFFIXES = frozenset({".js", ".jsx", ".ts", ".tsx"})
+PACKAGE_BINARY_PROJECTION_TABLE = bytes(
+    value if value in {9, 10, 13} or 0x20 <= value <= 0x7E else 10
+    for value in range(256)
+)
+PACKAGE_UTF16_LE_ASCII_RUN_RE = re.compile(
+    rb"(?:[\x09\x0a\x0d\x20-\x7e]\x00){%d}" % PACKAGE_UTF16_MIN_ASCII_UNITS
+)
+PACKAGE_UTF16_BE_ASCII_RUN_RE = re.compile(
+    rb"(?:\x00[\x09\x0a\x0d\x20-\x7e]){%d}" % PACKAGE_UTF16_MIN_ASCII_UNITS
+)
+PACKAGE_UTF32_LE_ASCII_RUN_RE = re.compile(
+    rb"(?:[\x09\x0a\x0d\x20-\x7e]\x00\x00\x00){%d}"
+    % PACKAGE_UTF32_MIN_ASCII_UNITS
+)
+PACKAGE_UTF32_BE_ASCII_RUN_RE = re.compile(
+    rb"(?:\x00\x00\x00[\x09\x0a\x0d\x20-\x7e]){%d}"
+    % PACKAGE_UTF32_MIN_ASCII_UNITS
+)
+PACKAGE_SEMANTIC_SECRET_MARKERS = (
+    "sk-",
+    "gh",
+    "github_pat_",
+    "hf_",
+    "gl",
+    "sk_",
+    "rk_",
+    "whsec_",
+    "aiza",
+    "gocspx-",
+    "ya29.",
+    "akia",
+    "asia",
+    "xox",
+    "xapp-",
+    "hooks.slack.com",
+    "eyj",
+    "authorization",
+    "private key",
+    "pgp private",
+    "://",
+)
+_PACKAGE_SECRET_SCAN_CACHE: OrderedDict[
+    tuple[bytes, int, str, tuple[object, ...]],
+    tuple[tuple[str, int], ...],
+] = OrderedDict()
 _PRIVATE_KEY_KIND_EXPRESSION = r"(?:RSA |OPENSSH |DSA |EC |ENCRYPTED )?PRIVATE KEY|PGP PRIVATE KEY BLOCK"
 
 SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -93,6 +181,19 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             re.IGNORECASE,
         ),
     ),
+)
+PACKAGE_SECRET_PATH_RULE_NAMES = frozenset(
+    {
+        *(name for name, _pattern in SECRET_PATTERNS),
+        "aws_secret_access_key",
+        "aws_session_token",
+        "generic_credential_assignment",
+        "provider_credential_assignment",
+        "secret_match_limit_exceeded",
+        "secret_scan_input_too_large",
+        "unsafe_control_sequence",
+        "uri_userinfo_credential",
+    }
 )
 
 PROVIDER_CREDENTIAL_NAMES = frozenset(
@@ -568,6 +669,9 @@ def _is_default_ignorable_codepoint(codepoint: int) -> bool:
 
 
 def _unsafe_persistent_control_offsets(text: str) -> Iterator[int]:
+    if text.isascii():
+        yield from (match.start() for match in UNSAFE_ASCII_CONTROL_RE.finditer(text))
+        return
     for index, character in enumerate(text):
         if character not in {"\t", "\n", "\r"} and unicodedata.category(character) in {"Cc", "Cf"}:
             yield index
@@ -1441,6 +1545,619 @@ def literal_secret_match_locations(text: str) -> list[tuple[str, int]]:
         if len(locations) >= MAX_SECRET_MATCH_LOCATIONS:
             return locations + [("secret_match_limit_exceeded", 0)]
     return sorted(locations, key=lambda item: (item[1], item[0]))
+
+
+def _package_semantic_string_locations(
+    value: str,
+    offset: int,
+) -> list[tuple[str, int]]:
+    """Scan one decoded source literal without treating escaped controls as bytes."""
+
+    if len(value) > MAX_SECRET_SCAN_CHARACTERS:
+        return [("secret_scan_input_too_large", offset)]
+    locations = [
+        (name, offset + start)
+        for name, start, _end in _credential_assignment_matches(value)
+    ]
+    lowered = value.casefold()
+    if any(marker in lowered for marker in PACKAGE_SEMANTIC_SECRET_MARKERS):
+        for name, pattern in SECRET_PATTERNS:
+            locations.extend((name, offset + match.start()) for match in pattern.finditer(value))
+        locations.extend((name, offset + start) for name, start, _ in _uri_credential_matches(value))
+    return _bounded_package_locations(locations)
+
+
+def _package_python_comment_locations(
+    text: str,
+    line_offsets: Sequence[int],
+) -> list[tuple[str, int]]:
+    """Scan decoded Python comments without treating source syntax as a value."""
+
+    locations: list[tuple[str, int]] = []
+    visited = 0
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(text).readline)
+        for token in tokens:
+            visited += 1
+            if visited > PACKAGE_PYTHON_TOKEN_MAX_COUNT:
+                return _bounded_package_locations(
+                    [*locations, ("secret_scan_structured_context_limit", 0)]
+                )
+            if token.type != tokenize.COMMENT:
+                continue
+            line_number, column = token.start
+            if not 1 <= line_number <= len(line_offsets):
+                return [("package_python_parse_failed", 0)]
+            token_offset = line_offsets[line_number - 1] + column
+            locations.extend(
+                (name, token_offset + start)
+                for name, start, _end in _credential_assignment_matches(token.string)
+            )
+            if len(locations) > MAX_SECRET_MATCH_LOCATIONS:
+                break
+    except (IndentationError, SyntaxError, tokenize.TokenError):
+        return [("package_python_parse_failed", 0)]
+    return _bounded_package_locations(locations)
+
+
+def _python_target_names(target: ast.AST, *, depth: int = 0) -> tuple[str, ...]:
+    if depth > PACKAGE_PYTHON_CONSTANT_MAX_DEPTH:
+        raise ValueError("secret_scan_structured_context_limit")
+    if isinstance(target, ast.Name):
+        return (target.id,)
+    if isinstance(target, ast.Attribute):
+        return (target.attr,)
+    if isinstance(target, ast.Subscript):
+        key = _bounded_python_constant_string(target.slice, depth=depth + 1)
+        return (key,) if isinstance(key, str) else ()
+    if isinstance(target, (ast.List, ast.Tuple)):
+        return tuple(
+            name
+            for item in target.elts
+            for name in _python_target_names(item, depth=depth + 1)
+        )
+    return ()
+
+
+def _python_target_value_bindings(
+    target: ast.AST,
+    value: ast.AST,
+    *,
+    depth: int = 0,
+) -> list[tuple[tuple[str, ...], ast.AST]]:
+    """Pair destructured Python targets with their corresponding value nodes."""
+
+    if depth > PACKAGE_PYTHON_CONSTANT_MAX_DEPTH:
+        raise ValueError("secret_scan_structured_context_limit")
+    if (
+        isinstance(target, (ast.List, ast.Tuple))
+        and isinstance(value, (ast.List, ast.Tuple))
+        and len(target.elts) == len(value.elts)
+    ):
+        bindings: list[tuple[tuple[str, ...], ast.AST]] = []
+        for target_item, value_item in zip(target.elts, value.elts):
+            bindings.extend(
+                _python_target_value_bindings(
+                    target_item,
+                    value_item,
+                    depth=depth + 1,
+                )
+            )
+        return bindings
+    return [(_python_target_names(target, depth=depth + 1), value)]
+
+
+def _python_argument_default_bindings(
+    arguments: ast.arguments,
+) -> list[tuple[tuple[str, ...], ast.AST]]:
+    positional = [*arguments.posonlyargs, *arguments.args]
+    bindings = [
+        ((argument.arg,), default)
+        for argument, default in zip(positional[-len(arguments.defaults) :], arguments.defaults)
+    ] if arguments.defaults else []
+    bindings.extend(
+        ((argument.arg,), default)
+        for argument, default in zip(arguments.kwonlyargs, arguments.kw_defaults)
+        if default is not None
+    )
+    return bindings
+
+
+def _python_call_binding_nodes(
+    node: ast.Call,
+) -> list[tuple[tuple[str, ...], ast.AST]]:
+    """Recognize fixed two-argument credential-setting APIs."""
+
+    function_name = ""
+    if isinstance(node.func, ast.Name):
+        function_name = node.func.id
+    elif isinstance(node.func, ast.Attribute):
+        function_name = node.func.attr
+    if function_name not in {"putenv", "setdefault", "setenv"}:
+        return []
+    if len(node.args) != 2 or node.keywords:
+        return []
+    key = _bounded_python_constant_string(node.args[0])
+    return [((key,), node.args[1])] if isinstance(key, str) else []
+
+
+def _python_node_offset(node: ast.AST, line_offsets: Sequence[int]) -> int:
+    line_number = getattr(node, "lineno", 1)
+    if not isinstance(line_number, int) or not 1 <= line_number <= len(line_offsets):
+        return 0
+    return line_offsets[line_number - 1]
+
+
+def _package_credential_binding_findings(name: str, value: str | bytes) -> list[str]:
+    """Preserve source-level credential-name aliases as non-secret placeholders."""
+
+    if isinstance(value, bytes):
+        try:
+            decoded = value.decode("utf-8")
+        except UnicodeDecodeError:
+            clean_name = name.strip()
+            if CREDENTIAL_NAME_FULL_RE.fullmatch(clean_name) is None or not value:
+                return []
+            canonical_name = _canonical_credential_name(clean_name)
+            if canonical_name == "AWS_SECRET_ACCESS_KEY":
+                return ["aws_secret_access_key"]
+            if canonical_name == "AWS_SESSION_TOKEN":
+                return ["aws_session_token"]
+            if canonical_name in PROVIDER_CREDENTIAL_NAMES:
+                return ["provider_credential_assignment"]
+            return ["generic_credential_assignment"]
+        value = decoded
+    canonical_name = _canonical_credential_name(name)
+    if value == canonical_name:
+        return []
+    return _credential_context_findings(name, value)
+
+
+def _is_bounded_python_literal_join(node: ast.AST) -> bool:
+    """Recognize only a literal str/bytes join over a literal sequence."""
+
+    return bool(
+        isinstance(node, ast.Call)
+        and not node.keywords
+        and len(node.args) == 1
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and isinstance(node.func.value, ast.Constant)
+        and isinstance(node.func.value.value, (str, bytes))
+        and isinstance(node.args[0], (ast.List, ast.Tuple))
+    )
+
+
+def _bounded_python_constant_string(
+    node: ast.AST,
+    *,
+    depth: int = 0,
+) -> str | bytes | None:
+    """Evaluate only side-effect-free constant text/bytes under strict bounds."""
+
+    if depth > PACKAGE_PYTHON_CONSTANT_MAX_DEPTH:
+        raise ValueError("secret_scan_structured_context_limit")
+    if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+        value = node.value
+    elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _bounded_python_constant_string(node.left, depth=depth + 1)
+        right = _bounded_python_constant_string(node.right, depth=depth + 1)
+        if left is None or right is None or type(left) is not type(right):
+            return None
+        value = left + right
+    elif isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        total = 0
+        for item in node.values:
+            if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                part = item.value
+            elif (
+                isinstance(item, ast.FormattedValue)
+                and item.conversion in {-1, ord("s")}
+                and item.format_spec is None
+                and isinstance(item.value, ast.Constant)
+                and isinstance(item.value.value, (str, int, float, bool))
+            ):
+                part = str(item.value.value)
+            else:
+                return None
+            total += len(part)
+            if total > PACKAGE_PYTHON_CONSTANT_MAX_CHARACTERS:
+                raise ValueError("secret_scan_structured_context_limit")
+            parts.append(part)
+        value = "".join(parts)
+    elif _is_bounded_python_literal_join(node):
+        assert isinstance(node, ast.Call)
+        assert isinstance(node.func, ast.Attribute)
+        assert isinstance(node.func.value, ast.Constant)
+        assert isinstance(node.args[0], (ast.List, ast.Tuple))
+        separator = node.func.value.value
+        elements = node.args[0].elts
+        if len(elements) > PACKAGE_PYTHON_CONSTANT_MAX_PARTS:
+            raise ValueError("secret_scan_structured_context_limit")
+        parts: list[str] | list[bytes]
+        parts = []
+        total = 0
+        for item in elements:
+            part = _bounded_python_constant_string(item, depth=depth + 1)
+            if part is None or type(part) is not type(separator):
+                return None
+            total += len(part)
+            if parts:
+                total += len(separator)
+            if total > PACKAGE_PYTHON_CONSTANT_MAX_CHARACTERS:
+                raise ValueError("secret_scan_structured_context_limit")
+            parts.append(part)
+        value = separator.join(parts)
+    else:
+        return None
+    if len(value) > PACKAGE_PYTHON_CONSTANT_MAX_CHARACTERS:
+        raise ValueError("secret_scan_structured_context_limit")
+    return value
+
+
+def _package_python_match_locations(text: str) -> list[tuple[str, int]]:
+    """Scan Python literals and credential bindings using the parsed source tree."""
+
+    locations = literal_secret_match_locations(text)
+    if any(_is_scan_limit_finding(name) for name, _offset in locations):
+        return _bounded_package_locations(locations)
+    try:
+        tree = ast.parse(text)
+    except (MemoryError, RecursionError, SyntaxError, ValueError):
+        return _bounded_package_locations([*locations, ("package_python_parse_failed", 0)])
+    line_offsets = array("I", [0])
+    line_offsets.extend(match.end() for match in re.finditer("\n", text))
+    locations.extend(_package_python_comment_locations(text, line_offsets))
+    if any(_is_scan_limit_finding(name) for name, _offset in locations):
+        return _bounded_package_locations(locations)
+    stack: list[ast.AST] = [tree]
+    visited = 0
+    while stack:
+        node = stack.pop()
+        visited += 1
+        if visited > MAX_STRUCTURED_CONTEXT_NODES:
+            locations.append(("secret_scan_structured_context_limit", 0))
+            break
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            semantic_locations = _package_semantic_string_locations(node.value, 0)
+            if semantic_locations:
+                offset = _python_node_offset(node, line_offsets)
+                locations.extend((name, offset + relative) for name, relative in semantic_locations)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, bytes):
+            offset = _python_node_offset(node, line_offsets)
+            locations.extend(
+                (name, offset + relative)
+                for name, relative in _package_binary_match_locations(node.value)
+            )
+        if isinstance(node, (ast.BinOp, ast.JoinedStr)) or _is_bounded_python_literal_join(node):
+            try:
+                expression_value = _bounded_python_constant_string(node)
+            except ValueError:
+                locations.append(
+                    ("secret_scan_structured_context_limit", _python_node_offset(node, line_offsets))
+                )
+            else:
+                expression_offset = _python_node_offset(node, line_offsets)
+                if isinstance(expression_value, str):
+                    locations.extend(
+                        (name, expression_offset + relative)
+                        for name, relative in _package_semantic_string_locations(
+                            expression_value,
+                            0,
+                        )
+                    )
+                elif isinstance(expression_value, bytes):
+                    locations.extend(
+                        (name, expression_offset + relative)
+                        for name, relative in _package_binary_match_locations(expression_value)
+                    )
+        bindings: list[tuple[str, str | bytes]] = []
+        binding_nodes: list[tuple[tuple[str, ...], ast.AST]] = []
+        try:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    binding_nodes.extend(_python_target_value_bindings(target, node.value))
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
+                binding_nodes.extend(_python_target_value_bindings(node.target, node.value))
+            elif isinstance(node, ast.Dict):
+                for key_node, value_node in zip(node.keys, node.values):
+                    if key_node is None:
+                        continue
+                    key = _bounded_python_constant_string(key_node)
+                    if isinstance(key, str):
+                        binding_nodes.append(((key,), value_node))
+            elif isinstance(node, ast.keyword) and node.arg is not None:
+                binding_nodes.append(((node.arg,), node.value))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                binding_nodes.extend(_python_argument_default_bindings(node.args))
+            elif isinstance(node, ast.Call):
+                binding_nodes.extend(_python_call_binding_nodes(node))
+        except ValueError:
+            locations.append(
+                ("secret_scan_structured_context_limit", _python_node_offset(node, line_offsets))
+            )
+            binding_nodes = []
+        for names, value_node in binding_nodes:
+            try:
+                value = _bounded_python_constant_string(value_node)
+            except ValueError:
+                locations.append(
+                    ("secret_scan_structured_context_limit", _python_node_offset(value_node, line_offsets))
+                )
+                continue
+            if value is not None:
+                bindings.extend((name, value) for name in names)
+        if bindings:
+            offset = _python_node_offset(node, line_offsets)
+        for name, value in bindings:
+            locations.extend(
+                (finding, offset)
+                for finding in _package_credential_binding_findings(name, value)
+            )
+        stack.extend(ast.iter_child_nodes(node))
+    return _bounded_package_locations(locations)
+
+
+def _package_json_match_locations(text: str) -> list[tuple[str, int]]:
+    """Scan a canonical JSON document after decoding strings and object structure."""
+
+    locations = literal_secret_match_locations(text)
+    if any(_is_scan_limit_finding(name) for name, _offset in locations):
+        return _bounded_package_locations(locations)
+    try:
+        value = json.loads(text, object_pairs_hook=_reject_duplicate_json_keys)
+    except (MemoryError, RecursionError, TypeError, ValueError, json.JSONDecodeError):
+        return _bounded_package_locations([*locations, ("package_json_parse_failed", 0)])
+    has_context_hint = bool(
+        CREDENTIAL_ASSIGNMENT_RE.search(text)
+        or PAIR_CONTEXT_LABEL_RE.search(text)
+        or "\\u" in text
+    )
+    if not has_context_hint:
+        return _bounded_package_locations(locations)
+    locations.extend((finding, 0) for finding in _structured_credential_findings(value))
+    stack: list[object] = [value]
+    visited = 0
+    while stack:
+        item = stack.pop()
+        visited += 1
+        if visited > MAX_STRUCTURED_CONTEXT_NODES:
+            locations.append(("secret_scan_structured_context_limit", 0))
+            break
+        if isinstance(item, str):
+            locations.extend(_package_semantic_string_locations(item, 0))
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return _bounded_package_locations(locations)
+
+
+def _package_shell_match_locations(text: str) -> list[tuple[str, int]]:
+    """Scan shell assignments line-by-line, including comment text."""
+
+    locations = literal_secret_match_locations(text)
+    if any(_is_scan_limit_finding(name) for name, _offset in locations):
+        return _bounded_package_locations(locations)
+    for offset, line in _iter_text_lines_keepends(text):
+        locations.extend(
+            (name, offset + start)
+            for name, start, _ in _credential_assignment_matches(line)
+        )
+    return _bounded_package_locations(locations)
+
+
+def _bounded_package_locations(
+    locations: list[tuple[str, int]],
+) -> list[tuple[str, int]]:
+    """Deduplicate package findings while keeping a hard metadata bound."""
+
+    ordered = sorted(set(locations), key=lambda item: (item[1], item[0]))
+    if len(ordered) <= MAX_SECRET_MATCH_LOCATIONS:
+        return ordered
+    return [
+        *ordered[: MAX_SECRET_MATCH_LOCATIONS - 1],
+        ("secret_match_limit_exceeded", 0),
+    ]
+
+
+def _package_direct_match_locations(text: str) -> list[tuple[str, int]]:
+    """Scan one offset-preserving byte projection without semantic expansion."""
+
+    if len(text) > MAX_SECRET_SCAN_CHARACTERS:
+        return [("secret_scan_input_too_large", 0)]
+    locations: list[tuple[str, int]] = [
+        ("unsafe_control_sequence", offset)
+        for offset in _unsafe_persistent_control_offsets(text)
+    ]
+    for name, pattern in SECRET_PATTERNS:
+        locations.extend((name, match.start()) for match in pattern.finditer(text))
+    locations.extend((name, start) for name, start, _ in _credential_assignment_matches(text))
+    locations.extend((name, start) for name, start, _ in _uri_credential_matches(text))
+    return _bounded_package_locations(locations)
+
+
+def _package_assignment_text_match_locations(text: str) -> list[tuple[str, int]]:
+    """Scan configuration and JavaScript-family assignment syntax explicitly."""
+
+    return _package_direct_match_locations(text)
+
+
+def _package_binary_match_locations(data: bytes) -> list[tuple[str, int]]:
+    """Scan arbitrary bytes in bounded overlapping, offset-preserving windows."""
+
+    locations: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for core_start in range(0, len(data), PACKAGE_BINARY_SCAN_WINDOW_BYTES):
+        core_end = min(len(data), core_start + PACKAGE_BINARY_SCAN_WINDOW_BYTES)
+        window_start = max(0, core_start - PACKAGE_BINARY_SCAN_OVERLAP_BYTES)
+        window_end = min(len(data), core_end + PACKAGE_BINARY_SCAN_OVERLAP_BYTES)
+        window = data[window_start:window_end]
+        def projections() -> Iterator[tuple[str, int, int]]:
+            yield (
+                window.translate(PACKAGE_BINARY_PROJECTION_TABLE).decode("ascii"),
+                0,
+                1,
+            )
+            le_pair_starts = {
+                match.start() % 2 for match in PACKAGE_UTF16_LE_ASCII_RUN_RE.finditer(window)
+            }
+            be_pair_starts = {
+                match.start() % 2 for match in PACKAGE_UTF16_BE_ASCII_RUN_RE.finditer(window)
+            }
+            for pair_start in le_pair_starts | be_pair_starts:
+                unit_count = (len(window) - pair_start) // 2
+                if unit_count <= 0:
+                    continue
+                unit_end = pair_start + unit_count * 2
+                first = window[pair_start:unit_end:2]
+                second = window[pair_start + 1 : unit_end : 2]
+                for characters, zero_guards, plausible_starts in (
+                    (first, second, le_pair_starts),
+                    (second, first, be_pair_starts),
+                ):
+                    if pair_start not in plausible_starts:
+                        continue
+                    projected = bytes(
+                        PACKAGE_BINARY_PROJECTION_TABLE[character]
+                        if guard == 0
+                        else 10
+                        for character, guard in zip(characters, zero_guards)
+                    ).decode("ascii")
+                    yield projected, pair_start, 2
+            le_quad_starts = {
+                match.start() % 4 for match in PACKAGE_UTF32_LE_ASCII_RUN_RE.finditer(window)
+            }
+            be_quad_starts = {
+                match.start() % 4 for match in PACKAGE_UTF32_BE_ASCII_RUN_RE.finditer(window)
+            }
+            for quad_start in le_quad_starts | be_quad_starts:
+                unit_count = (len(window) - quad_start) // 4
+                if unit_count <= 0:
+                    continue
+                unit_end = quad_start + unit_count * 4
+                lanes = tuple(
+                    window[quad_start + lane : unit_end : 4]
+                    for lane in range(4)
+                )
+                for characters, zero_guards, plausible_starts in (
+                    (lanes[0], lanes[1:], le_quad_starts),
+                    (lanes[3], lanes[:3], be_quad_starts),
+                ):
+                    if quad_start not in plausible_starts:
+                        continue
+                    projected = bytes(
+                        PACKAGE_BINARY_PROJECTION_TABLE[character]
+                        if all(guard == 0 for guard in guards)
+                        else 10
+                        for character, guards in zip(characters, zip(*zero_guards))
+                    ).decode("ascii")
+                    yield projected, quad_start, 4
+
+        for projected, projection_start, stride in projections():
+            for name, relative_offset in _package_direct_match_locations(projected):
+                absolute_offset = window_start + projection_start + stride * relative_offset
+                if not core_start <= absolute_offset < core_end:
+                    continue
+                item = (name, absolute_offset)
+                if item in seen:
+                    continue
+                seen.add(item)
+                locations.append(item)
+                if len(locations) >= MAX_SECRET_MATCH_LOCATIONS:
+                    return [
+                        *sorted(locations, key=lambda entry: (entry[1], entry[0]))[
+                            : MAX_SECRET_MATCH_LOCATIONS - 1
+                        ],
+                        ("secret_match_limit_exceeded", 0),
+                    ]
+    return sorted(locations, key=lambda item: (item[1], item[0]))
+
+
+def _package_secret_scan_policy_key() -> tuple[object, ...]:
+    return (
+        MAX_SECRET_SCAN_CHARACTERS,
+        MAX_SECRET_MATCH_LOCATIONS,
+        MAX_STRUCTURED_CONTEXT_NODES,
+        PACKAGE_BINARY_SCAN_WINDOW_BYTES,
+        PACKAGE_BINARY_SCAN_OVERLAP_BYTES,
+        PACKAGE_UTF16_MIN_ASCII_UNITS,
+        PACKAGE_UTF32_MIN_ASCII_UNITS,
+        PACKAGE_PYTHON_CONSTANT_MAX_CHARACTERS,
+        PACKAGE_PYTHON_CONSTANT_MAX_DEPTH,
+        PACKAGE_PYTHON_CONSTANT_MAX_PARTS,
+        PACKAGE_PYTHON_TOKEN_MAX_COUNT,
+        id(SECRET_PATTERNS),
+        id(CREDENTIAL_ASSIGNMENT_RE),
+    )
+
+
+def package_secret_match_locations(data: bytes, suffix: str) -> list[tuple[str, int]]:
+    """Return redacted secret metadata for one package payload.
+
+    Known text formats must be canonical UTF-8. Arbitrary or binary payloads
+    are scanned as bounded ASCII projections so undecodable bytes can never
+    turn into an implicit allow decision. Returned metadata contains only
+    detector labels and byte/character offsets, never matched content.
+    """
+
+    if not isinstance(data, bytes):
+        raise TypeError("package secret scan input must be bytes")
+    if not isinstance(suffix, str):
+        raise TypeError("package secret scan suffix must be text")
+    normalized_suffix = suffix.casefold()
+    cache_key = (
+        hashlib.sha256(data).digest(),
+        len(data),
+        normalized_suffix,
+        _package_secret_scan_policy_key(),
+    )
+    cached = _PACKAGE_SECRET_SCAN_CACHE.get(cache_key)
+    if cached is not None:
+        _PACKAGE_SECRET_SCAN_CACHE.move_to_end(cache_key)
+        return list(cached)
+    if normalized_suffix in PACKAGE_KNOWN_TEXT_SUFFIXES:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            locations = [("package_text_invalid_utf8", 0)]
+        else:
+            scanners = {
+                ".json": _package_json_match_locations,
+                ".py": _package_python_match_locations,
+                ".sh": _package_shell_match_locations,
+            }
+            scanners.update(
+                {
+                    suffix_name: _package_assignment_text_match_locations
+                    for suffix_name in PACKAGE_CONFIG_TEXT_SUFFIXES | PACKAGE_SCRIPT_TEXT_SUFFIXES
+                }
+            )
+            scanner = scanners.get(normalized_suffix, _package_direct_match_locations)
+            locations = _bounded_package_locations(scanner(text))
+    else:
+        locations = _package_binary_match_locations(data)
+    _PACKAGE_SECRET_SCAN_CACHE[cache_key] = tuple(locations)
+    _PACKAGE_SECRET_SCAN_CACHE.move_to_end(cache_key)
+    while len(_PACKAGE_SECRET_SCAN_CACHE) > PACKAGE_SECRET_SCAN_CACHE_MAX_ENTRIES:
+        _PACKAGE_SECRET_SCAN_CACHE.popitem(last=False)
+    return list(locations)
+
+
+def package_secret_path_match_locations(relative: str) -> list[tuple[str, int]]:
+    """Return redacted secret metadata for a package-relative path.
+
+    The caller must never serialize the original path after a finding. The
+    result contains only detector labels and character offsets.
+    """
+
+    if not isinstance(relative, str):
+        raise TypeError("package secret path scan input must be text")
+    if len(relative) > MAX_SECRET_SCAN_CHARACTERS:
+        return [("secret_scan_input_too_large", 0)]
+    return _package_direct_match_locations(relative)
 
 
 def has_secret_like(text: str) -> bool:

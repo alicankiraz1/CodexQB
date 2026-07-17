@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import time
 import tempfile
 import unittest
@@ -16,6 +17,10 @@ SAFETY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SAFETY)
 
 OUTPUT_SHA256 = "a" * 64
+
+
+def assemble_fixture(*parts: str) -> str:
+    return "".join(parts)
 
 
 def command(argv: list[str], **overrides: object) -> dict[str, object]:
@@ -62,16 +67,20 @@ class SafetyContractsTests(unittest.TestCase):
                 "https://hooks." + "slack.com/services/" + "R" * 10 + "/" + "S" * 10 + "/" + "T" * 32,
             ),
             ("jwt", "jwt", "eyJ" + "U" * 12 + "." + "V" * 16 + "." + "W" * 20),
-            ("private_key", "private_key", "-----BEGIN " + "PRIVATE KEY-----"),
+            ("private_key", "private_key", assemble_fixture("-----BEGIN ", "PRIVATE ", "KEY-----")),
             ("provider_assignment", "provider_credential_assignment", "HF_" + "TOKEN=" + "X" * 32),
             ("generic_assignment", "generic_credential_assignment", "password=" + "Y" * 32),
             (
                 "punctuated_password",
                 "generic_credential_assignment",
-                'password="P@ssw0rd!' + "Z" * 16 + '"',
+                assemble_fixture("pass", 'word="P@ssw0rd!', "Z" * 16, '"'),
             ),
             ("bearer", "authorization_bearer", "Authorization: Bearer " + "a" * 32),
-            ("basic", "authorization_basic", "Authorization: Basic " + "dXNlcjpwYXNz"),
+            (
+                "basic",
+                "authorization_basic",
+                assemble_fixture("Authorization: ", "Basic ", "dXNlcjpwYXNz"),
+            ),
             ("uri", "uri_userinfo_credential", "postgres://user:" + "p" * 16 + "@example.invalid/db"),
         ]
 
@@ -113,6 +122,430 @@ class SafetyContractsTests(unittest.TestCase):
                 SAFETY.assert_safe_persistent_text(oversized)
             self.assertEqual(SAFETY.safe_log_text(oversized), "<redacted:unsafe-diagnostic>")
 
+    def test_package_scanner_fails_closed_for_invalid_known_text(self) -> None:
+        fixtures = (
+            (b"print('safe')\n\xff", ".py"),
+            (("gl" + "pat-" + "U" * 32).encode("utf-16"), ".txt"),
+        )
+        for data, suffix in fixtures:
+            with self.subTest(suffix=suffix):
+                self.assertEqual(
+                    SAFETY.package_secret_match_locations(data, suffix),
+                    [("package_text_invalid_utf8", 0)],
+                )
+
+    def test_package_scanner_covers_binary_boundaries_and_suffixless_payloads(self) -> None:
+        fixture = ("sk-" + "Q" * 40).encode("ascii")
+        with (
+            mock.patch.object(SAFETY, "PACKAGE_BINARY_SCAN_WINDOW_BYTES", 64),
+            mock.patch.object(SAFETY, "PACKAGE_BINARY_SCAN_OVERLAP_BYTES", 64),
+        ):
+            payload = b"\xff" * 60 + fixture + b"\x00\xfe"
+            locations = SAFETY.package_secret_match_locations(payload, "")
+        self.assertIn(("openai_api_key", 60), locations)
+        self.assertNotIn(fixture.decode("ascii"), repr(locations))
+        self.assertEqual(
+            SAFETY.package_secret_match_locations(b"\x89PNG\r\n\x1a\n\x00\xffclean", ".png"),
+            [],
+        )
+
+    def test_package_scanner_covers_utf16_endianness_bom_and_alignment(self) -> None:
+        fixture = "sk-" + "U" * 40
+        prefix = b"\x81\x82\x83"
+        variants = (
+            ("le-no-bom", fixture.encode("utf-16-le"), len(prefix)),
+            ("be-no-bom", fixture.encode("utf-16-be"), len(prefix)),
+            ("le-bom", b"\xff\xfe" + fixture.encode("utf-16-le"), len(prefix) + 2),
+            ("be-bom", b"\xfe\xff" + fixture.encode("utf-16-be"), len(prefix) + 2),
+        )
+        for label, encoded, expected_offset in variants:
+            with self.subTest(label=label):
+                locations = SAFETY.package_secret_match_locations(prefix + encoded, "")
+                self.assertIn(("openai_api_key", expected_offset), locations)
+                self.assertNotIn(fixture, repr(locations))
+
+    def test_package_scanner_covers_utf32_endianness_bom_alignment_and_windows(self) -> None:
+        fixture = "sk-" + "U" * 40
+        variants = (
+            ("le-no-bom", b"", fixture.encode("utf-32-le")),
+            ("be-no-bom", b"", fixture.encode("utf-32-be")),
+            ("le-bom", b"\xff\xfe\x00\x00", fixture.encode("utf-32-le")),
+            ("be-bom", b"\x00\x00\xfe\xff", fixture.encode("utf-32-be")),
+        )
+        for label, bom, encoded in variants:
+            for phase in range(4):
+                for suffix in ("", ".bin", ".dat"):
+                    with self.subTest(label=label, phase=phase, suffix=suffix):
+                        prefix = b"\x81" * phase
+                        locations = SAFETY.package_secret_match_locations(
+                            prefix + bom + encoded,
+                            suffix,
+                        )
+                        self.assertIn(
+                            ("openai_api_key", len(prefix) + len(bom)),
+                            locations,
+                        )
+                        self.assertNotIn(fixture, repr(locations))
+
+        prefix = b"\x82" * 61
+        with (
+            mock.patch.object(SAFETY, "PACKAGE_BINARY_SCAN_WINDOW_BYTES", 64),
+            mock.patch.object(SAFETY, "PACKAGE_BINARY_SCAN_OVERLAP_BYTES", 256),
+        ):
+            locations = SAFETY.package_secret_match_locations(
+                prefix + fixture.encode("utf-32-le"),
+                "",
+            )
+        self.assertEqual(locations.count(("openai_api_key", len(prefix))), 1)
+        self.assertNotIn(fixture, repr(locations))
+
+    def test_package_scanner_covers_shortest_utf16_assignment_across_windows(self) -> None:
+        fixture = assemble_fixture("Api", "Key=x")
+        for endian in ("utf-16-le", "utf-16-be"):
+            with self.subTest(endian=endian), (
+                mock.patch.object(SAFETY, "PACKAGE_BINARY_SCAN_WINDOW_BYTES", 12)
+            ), mock.patch.object(SAFETY, "PACKAGE_BINARY_SCAN_OVERLAP_BYTES", 16):
+                prefix = b"\x80" * 7
+                locations = SAFETY.package_secret_match_locations(prefix + fixture.encode(endian), "")
+                self.assertIn(("generic_credential_assignment", len(prefix)), locations)
+                self.assertNotIn(fixture, repr(locations))
+
+    def test_known_source_text_scans_semantic_credentials_and_preserves_placeholders(self) -> None:
+        fixture = "this-is-a-real-long-password-value"
+        unsafe = (
+            (".py", "PASSWORD = " + repr(fixture)),
+            (".json", '{"password":' + json.dumps(fixture) + "}"),
+            (".sh", "export PASSWORD=" + repr(fixture) + "\n"),
+        )
+        for suffix, text in unsafe:
+            with self.subTest(suffix=suffix):
+                locations = SAFETY.package_secret_match_locations(text.encode("utf-8"), suffix)
+                self.assertTrue(
+                    any(name == "generic_credential_assignment" for name, _offset in locations)
+                )
+                self.assertNotIn(fixture, repr(locations))
+
+        safe = (
+            (".py", 'PASSWORD = "${PASSWORD}"\n'),
+            (".json", '{"password":"${PASSWORD}"}\n'),
+            (".sh", 'export PASSWORD="${PASSWORD}"\n'),
+        )
+        for suffix, text in safe:
+            with self.subTest(placeholder_suffix=suffix):
+                self.assertEqual(
+                    SAFETY.package_secret_match_locations(text.encode("utf-8"), suffix),
+                    [],
+                )
+
+    def test_python_constant_join_credentials_are_scanned_and_placeholders_remain_safe(self) -> None:
+        fixture = "sk-" + "J" * 40
+        source = "API_KEY = ''.join((" + repr("sk-") + ", " + repr("J" * 40) + "))\n"
+        locations = SAFETY.package_secret_match_locations(source.encode("utf-8"), ".py")
+        self.assertIn(("openai_api_key", 0), locations)
+        self.assertNotIn(fixture, repr(locations))
+
+        bytes_source = (
+            "API_KEY = b''.join(["
+            + repr(b"sk-")
+            + ", "
+            + repr(b"J" * 40)
+            + "])\n"
+        )
+        bytes_locations = SAFETY.package_secret_match_locations(
+            bytes_source.encode("utf-8"),
+            ".py",
+        )
+        self.assertTrue(any(name == "openai_api_key" for name, _ in bytes_locations))
+        self.assertNotIn(fixture, repr(bytes_locations))
+
+        tail = "N" * 40
+        neutral_sources = (
+            "message = ''.join((" + repr("sk-") + ", " + repr(tail) + "))\n",
+            "print(''.join((" + repr("sk-") + ", " + repr(tail) + ")))\n",
+            "message = b''.join((" + repr(b"sk-") + ", " + repr(tail.encode()) + "))\n",
+            "print(b''.join((" + repr(b"sk-") + ", " + repr(tail.encode()) + ")))\n",
+        )
+        neutral_fixture = "sk-" + tail
+        for neutral_source in neutral_sources:
+            with self.subTest(context=neutral_source.split("=", 1)[0].strip()):
+                neutral_locations = SAFETY.package_secret_match_locations(
+                    neutral_source.encode("utf-8"),
+                    ".py",
+                )
+                self.assertTrue(
+                    any(name == "openai_api_key" for name, _ in neutral_locations)
+                )
+                self.assertNotIn(neutral_fixture, repr(neutral_locations))
+
+        placeholder = "API_KEY = ''.join(('${', 'API_KEY', '}'))\n"
+        self.assertEqual(
+            SAFETY.package_secret_match_locations(placeholder.encode("utf-8"), ".py"),
+            [],
+        )
+        neutral_placeholder = "print(''.join(('${', 'API_KEY', '}')))\n"
+        self.assertEqual(
+            SAFETY.package_secret_match_locations(
+                neutral_placeholder.encode("utf-8"),
+                ".py",
+            ),
+            [],
+        )
+
+    def test_semantic_generic_assignments_are_scanned_in_comments_literals_and_json_notes(self) -> None:
+        fixture = "semantic-credential-value"
+        assignment = "PASSWORD=" + fixture
+        unsafe = (
+            ("python-comment", ".py", "# " + assignment + "\n"),
+            (
+                "python-docstring",
+                ".py",
+                "def fixture():\n    \"\"\"" + assignment + "\"\"\"\n",
+            ),
+            ("shell-comment", ".sh", "# " + assignment + "\n"),
+            ("shell-heredoc", ".sh", "cat <<'EOF'\n" + assignment + "\nEOF\n"),
+            ("json-note", ".json", json.dumps({"note": assignment}) + "\n"),
+            (
+                "json-escaped-note",
+                ".json",
+                '{"note":"P\\u0041SSWORD\\u003d' + fixture + '"}\n',
+            ),
+            (
+                "python-constant-concat",
+                ".py",
+                'print("PASS" + "WORD=" + ' + repr(fixture) + ")\n",
+            ),
+            (
+                "python-constant-fstring",
+                ".py",
+                assemble_fixture('print(f"PASS', "WORD={", repr(fixture), '}\")\n'),
+            ),
+        )
+        for label, suffix, text in unsafe:
+            with self.subTest(label=label):
+                locations = SAFETY.package_secret_match_locations(text.encode("utf-8"), suffix)
+                self.assertTrue(
+                    any(name == "generic_credential_assignment" for name, _ in locations)
+                )
+                self.assertNotIn(fixture, repr(locations))
+
+        placeholder = "PASSWORD=" + "${PASSWORD}"
+        safe = (
+            (".py", "# " + placeholder + "\n"),
+            (
+                ".py",
+                "def fixture():\n    \"\"\"" + placeholder + "\"\"\"\n",
+            ),
+            (".sh", "# " + placeholder + "\n"),
+            (".sh", "cat <<'EOF'\n" + placeholder + "\nEOF\n"),
+            (".json", json.dumps({"note": placeholder}) + "\n"),
+            (
+                ".py",
+                'print("PASS" + "WORD=" + ' + repr("${PASSWORD}") + ")\n",
+            ),
+            (
+                ".py",
+                assemble_fixture(
+                    'print(f"PASS',
+                    "WORD={",
+                    repr("${PASSWORD}"),
+                    '}\")\n',
+                ),
+            ),
+        )
+        for suffix, text in safe:
+            with self.subTest(placeholder_suffix=suffix, text_hash=hash(text)):
+                self.assertEqual(
+                    SAFETY.package_secret_match_locations(text.encode("utf-8"), suffix),
+                    [],
+                )
+
+    def test_package_python_ast_closes_constant_obfuscation_and_aliases(self) -> None:
+        provider_fixture = "sk-" + "V" * 40
+        generic_fixture = "this-is-a-real-long-password-value"
+        payloads = (
+            ("adjacent", 'TOKEN = "sk-" "' + "V" * 40 + '"\n', "openai_api_key"),
+            ("hex", 'TOKEN = "\\x73\\x6b\\x2d' + "V" * 40 + '"\n', "openai_api_key"),
+            ("secret-key", "secret_key = " + repr(generic_fixture) + "\n", "generic_credential_assignment"),
+            ("camel", "accessToken = " + repr(generic_fixture) + "\n", "generic_credential_assignment"),
+            (
+                "concat",
+                "PASSWORD = " + repr("this-is-a-real-") + " + " + repr("long-password-value") + "\n",
+                "generic_credential_assignment",
+            ),
+            (
+                "constant-fstring",
+                assemble_fixture("PASS", 'WORD = f"', generic_fixture, '"\n'),
+                "generic_credential_assignment",
+            ),
+        )
+        for label, source, expected in payloads:
+            with self.subTest(label=label):
+                locations = SAFETY.package_secret_match_locations(source.encode("utf-8"), ".py")
+                self.assertTrue(any(name == expected for name, _offset in locations))
+                self.assertNotIn(provider_fixture, repr(locations))
+                self.assertNotIn(generic_fixture, repr(locations))
+
+        placeholder_source = "PASSWORD = " + repr("${") + " + " + repr("PASSWORD}") + "\n"
+        self.assertEqual(
+            SAFETY.package_secret_match_locations(placeholder_source.encode("utf-8"), ".py"),
+            [],
+        )
+
+    def test_package_python_ast_covers_defaults_keys_destructuring_and_setters(self) -> None:
+        fixture = "python-context-credential-value"
+        unsafe = (
+            "def f(password=" + repr(fixture) + "):\n    pass\n",
+            "async def f(*, password=" + repr(fixture) + "):\n    pass\n",
+            "handler = lambda password=" + repr(fixture) + ": None\n",
+            'config["PASS" + "WORD"] = ' + repr(fixture) + "\n",
+            'config = {"PASS" + "WORD": ' + repr(fixture) + "}\n",
+            "(password, other) = (" + repr(fixture) + ", 'safe')\n",
+            "config.setdefault('PASSWORD', " + repr(fixture) + ")\n",
+            "os.putenv('PASSWORD', " + repr(fixture) + ")\n",
+            "setenv('PASSWORD', " + repr(fixture.encode("utf-8")) + ")\n",
+        )
+        for index, source in enumerate(unsafe):
+            with self.subTest(unsafe=index):
+                locations = SAFETY.package_secret_match_locations(source.encode("utf-8"), ".py")
+                self.assertTrue(
+                    any(name == "generic_credential_assignment" for name, _ in locations)
+                )
+                self.assertNotIn(fixture, repr(locations))
+
+        placeholder = "${PASSWORD}"
+        safe = (
+            "def f(password=" + repr(placeholder) + "):\n    pass\n",
+            'config["PASS" + "WORD"] = ' + repr(placeholder) + "\n",
+            'config = {"PASS" + "WORD": ' + repr(placeholder) + "}\n",
+            "(password, other) = (" + repr(placeholder) + ", 'safe')\n",
+            "config.setdefault('PASSWORD', " + repr(placeholder) + ")\n",
+            "os.putenv('PASSWORD', " + repr(placeholder) + ")\n",
+        )
+        for index, source in enumerate(safe):
+            with self.subTest(placeholder=index):
+                self.assertEqual(
+                    SAFETY.package_secret_match_locations(source.encode("utf-8"), ".py"),
+                    [],
+                )
+
+    def test_package_python_bytes_literals_and_constant_concatenation(self) -> None:
+        fixture = "this-is-a-real-long-password-value"
+        variants = (
+            "PASSWORD = " + repr(fixture.encode("utf-8")) + "\n",
+            (
+                "PASSWORD = "
+                + repr("this-is-a-real-".encode("utf-8"))
+                + " + "
+                + repr("long-password-value".encode("utf-8"))
+                + "\n"
+            ),
+        )
+        for index, source in enumerate(variants):
+            with self.subTest(index=index):
+                locations = SAFETY.package_secret_match_locations(source.encode("utf-8"), ".py")
+                self.assertTrue(
+                    any(name == "generic_credential_assignment" for name, _ in locations)
+                )
+                self.assertNotIn(fixture, repr(locations))
+
+        placeholders = (
+            "PASSWORD = " + repr(b"${PASSWORD}") + "\n",
+            "PASSWORD = " + repr(b"${") + " + " + repr(b"PASSWORD}") + "\n",
+        )
+        for index, source in enumerate(placeholders):
+            with self.subTest(placeholder=index):
+                self.assertEqual(
+                    SAFETY.package_secret_match_locations(source.encode("utf-8"), ".py"),
+                    [],
+                )
+
+    def test_package_path_scanner_rejects_secret_file_and_directory_names(self) -> None:
+        fixture = "sk-" + "P" * 40
+        variants = (f"{fixture}.txt", f"safe/{fixture}/payload.txt")
+        for relative in variants:
+            with self.subTest(relative_hash=hash(relative)):
+                locations = SAFETY.package_secret_path_match_locations(relative)
+                self.assertTrue(any(name == "openai_api_key" for name, _ in locations))
+                self.assertNotIn(fixture, repr(locations))
+        self.assertEqual(
+            SAFETY.package_secret_path_match_locations("safe/${TOKEN}/payload.txt"),
+            [],
+        )
+
+    def test_config_and_javascript_assignments_and_placeholders(self) -> None:
+        fixture = "this-is-a-real-long-password-value"
+        config_suffixes = (".cfg", ".conf", ".ini", ".toml", ".yaml", ".yml")
+        script_suffixes = (".js", ".jsx", ".ts", ".tsx")
+        for suffix in config_suffixes:
+            with self.subTest(unsafe_suffix=suffix):
+                unsafe = "password = " + json.dumps(fixture) + "\n"
+                locations = SAFETY.package_secret_match_locations(unsafe.encode("utf-8"), suffix)
+                self.assertTrue(any(name == "generic_credential_assignment" for name, _ in locations))
+                self.assertNotIn(fixture, repr(locations))
+            with self.subTest(placeholder_suffix=suffix):
+                safe = 'password = "${PASSWORD}"\n'
+                self.assertEqual(SAFETY.package_secret_match_locations(safe.encode("utf-8"), suffix), [])
+        for suffix in script_suffixes:
+            with self.subTest(unsafe_suffix=suffix):
+                unsafe = "const accessToken = " + json.dumps(fixture) + ";\n"
+                locations = SAFETY.package_secret_match_locations(unsafe.encode("utf-8"), suffix)
+                self.assertTrue(any(name == "generic_credential_assignment" for name, _ in locations))
+                self.assertNotIn(fixture, repr(locations))
+            with self.subTest(placeholder_suffix=suffix):
+                safe = 'const accessToken = "${ACCESS_TOKEN}";\n'
+                self.assertEqual(SAFETY.package_secret_match_locations(safe.encode("utf-8"), suffix), [])
+
+    def test_package_known_text_oversize_short_circuits_parsers(self) -> None:
+        with mock.patch.object(SAFETY, "MAX_SECRET_SCAN_CHARACTERS", 64):
+            SAFETY._PACKAGE_SECRET_SCAN_CACHE.clear()
+            oversized = ("Z" * 65).encode("utf-8")
+            started = time.monotonic()
+            with mock.patch.object(SAFETY.ast, "parse", side_effect=AssertionError("AST parser called")):
+                self.assertEqual(
+                    SAFETY.package_secret_match_locations(oversized, ".py"),
+                    [("secret_scan_input_too_large", 0)],
+                )
+            with mock.patch.object(SAFETY.json, "loads", side_effect=AssertionError("JSON parser called")):
+                self.assertEqual(
+                    SAFETY.package_secret_match_locations(oversized, ".json"),
+                    [("secret_scan_input_too_large", 0)],
+                )
+            with mock.patch.object(
+                SAFETY,
+                "_credential_assignment_matches",
+                side_effect=AssertionError("shell parser called"),
+            ):
+                self.assertEqual(
+                    SAFETY.package_secret_match_locations(oversized, ".sh"),
+                    [("secret_scan_input_too_large", 0)],
+                )
+            self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_package_fstring_constant_evaluation_is_linear_and_bounded(self) -> None:
+        joined = SAFETY.ast.JoinedStr(values=[SAFETY.ast.Constant(value="x") for _ in range(20_000)])
+        with mock.patch.object(SAFETY, "PACKAGE_PYTHON_CONSTANT_MAX_CHARACTERS", 25_000):
+            started = time.monotonic()
+            self.assertEqual(len(SAFETY._bounded_python_constant_string(joined)), 20_000)
+            self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_package_scan_cache_reuses_only_redacted_metadata(self) -> None:
+        source = ("PASSWORD = " + repr("this-is-a-real-long-password-value") + "\n").encode("utf-8")
+        SAFETY._PACKAGE_SECRET_SCAN_CACHE.clear()
+        with mock.patch.object(
+            SAFETY,
+            "_package_python_match_locations",
+            wraps=SAFETY._package_python_match_locations,
+        ) as scanner:
+            first = SAFETY.package_secret_match_locations(source, ".py")
+            for _ in range(4):
+                self.assertEqual(SAFETY.package_secret_match_locations(source, ".py"), first)
+            self.assertEqual(scanner.call_count, 1)
+        first.append(("caller_mutation", 0))
+        self.assertNotIn(
+            ("caller_mutation", 0),
+            SAFETY.package_secret_match_locations(source, ".py"),
+        )
+
     def test_secret_scanner_preserves_documentation_placeholders_and_common_safe_shapes(self) -> None:
         safe_values = [
             "task-spec.yaml",
@@ -134,7 +567,7 @@ class SafetyContractsTests(unittest.TestCase):
             "BEGIN PRIVATE KEY",
             "a" * 64,
             "password=<redacted>",
-            "OPENROUTER_" + "API_KEY=your_openrouter_api_key",
+            assemble_fixture("OPENROUTER_", "API_", "KEY=your_openrouter_api_key"),
         ]
         for index, value in enumerate(safe_values):
             with self.subTest(case=index):
@@ -227,15 +660,36 @@ class SafetyContractsTests(unittest.TestCase):
             ("generic_credential_assignment", "MY_API_KEY=" + "A" * 32),
             ("generic_credential_assignment", "DATABASE_PASSWORD=" + "B" * 32),
             ("generic_credential_assignment", "GITHUB_CLIENT_SECRET=" + "C" * 40),
-            ("aws_secret_access_key", '{"SecretAccessKey":"' + "D" * 40 + '"}'),
-            ("aws_session_token", '{"SessionToken":"' + "E" * 48 + '"}'),
+            (
+                "aws_secret_access_key",
+                assemble_fixture('{"Secret', 'AccessKey":"', "D" * 40, '"}'),
+            ),
+            (
+                "aws_session_token",
+                assemble_fixture('{"Session', 'Token":"', "E" * 48, '"}'),
+            ),
             ("provider_credential_assignment", "SLACK_SIGNING_SECRET=" + "F" * 32),
             ("generic_credential_assignment", "SERVICE_API_KEY_PROD=" + "G" * 32),
-            ("generic_credential_assignment", '"databasePassword":"' + "H" * 32 + '"'),
-            ("generic_credential_assignment", '"myApiKey":"' + "I" * 32 + '"'),
-            ("generic_credential_assignment", '"githubClientSecret":"' + "J" * 40 + '"'),
-            ("provider_credential_assignment", '"slackSigningSecret":"' + "K" * 32 + '"'),
-            ("provider_credential_assignment", '"openaiApiKey":"' + "L" * 32 + '"'),
+            (
+                "generic_credential_assignment",
+                assemble_fixture('"database', "Pass", 'word":"', "H" * 32, '"'),
+            ),
+            (
+                "generic_credential_assignment",
+                assemble_fixture('"my', "Api", 'Key":"', "I" * 32, '"'),
+            ),
+            (
+                "generic_credential_assignment",
+                assemble_fixture('"github', "Client", 'Secret":"', "J" * 40, '"'),
+            ),
+            (
+                "provider_credential_assignment",
+                assemble_fixture('"slack', "Signing", 'Secret":"', "K" * 32, '"'),
+            ),
+            (
+                "provider_credential_assignment",
+                assemble_fixture('"openai', "Api", 'Key":"', "L" * 32, '"'),
+            ),
             ("generic_credential_assignment", "SECRET_KEY=" + "M" * 40),
             ("generic_credential_assignment", "DJANGO_SECRET_KEY=" + "N" * 40),
             ("generic_credential_assignment", "SECRET_KEY_BASE=" + "O" * 40),
@@ -357,8 +811,8 @@ class SafetyContractsTests(unittest.TestCase):
             "headers=[(b'Authorization', b'Basic dXNlcjpwYXNz')]",
             "failure=('password', bytearray(b'hunter2'))",
             "failure=('password', bytes(b'hunter2'))",
-            "password='''hunter2'''",
-            'API_KEY="""abcd1234"""',
+            assemble_fixture("pass", "word='''hunter2'''"),
+            assemble_fixture("API_", 'KEY="""abcd1234"""'),
             "failure=('password', '''hunter2''')",
             "failure=('password', `hunter2`)",
         ]
@@ -520,7 +974,11 @@ class SafetyContractsTests(unittest.TestCase):
         long_assignment_value = "Q" * 5000
         long_uri_value = "R" * 600
         fixtures = [
-            ("generic_credential_assignment", 'password="' + long_assignment_value + '"', long_assignment_value[-128:]),
+            (
+                "generic_credential_assignment",
+                assemble_fixture("pass", 'word="', long_assignment_value, '"'),
+                long_assignment_value[-128:],
+            ),
             (
                 "uri_userinfo_credential",
                 "postgres://user:" + long_uri_value + "@example.invalid/db",
@@ -546,7 +1004,15 @@ class SafetyContractsTests(unittest.TestCase):
 
     def test_full_private_key_block_is_fully_redacted(self) -> None:
         body = "M" * 96
-        fixture = "-----BEGIN " + "PRIVATE KEY-----\n" + body + "\n-----END " + "PRIVATE KEY-----"
+        fixture = assemble_fixture(
+            "-----BEGIN ",
+            "PRIVATE ",
+            "KEY-----\n",
+            body,
+            "\n-----END ",
+            "PRIVATE ",
+            "KEY-----",
+        )
         diagnostic = SAFETY.safe_log_text("failure=" + fixture)
         if body in diagnostic or "-----END " in diagnostic:
             self.fail("private-key body or footer leaked from safe log")

@@ -143,6 +143,7 @@ done
 python3 scripts/validate_openai_yaml.py
 
 python3 - <<'PY'
+import hashlib
 from pathlib import Path
 import sys
 
@@ -178,17 +179,21 @@ for path in Path(".").rglob("*"):
         continue
     for needle in needles:
         if needle in text:
-            findings.append(f"{path}: contains stale invocation text")
+            findings.append(hashlib.sha256(path.as_posix().encode("utf-8")).hexdigest())
             break
 
 if findings:
     print("stale_invocation_references_found")
-    for finding in findings:
-        print(finding)
+    for index, path_sha256 in enumerate(findings, start=1):
+        print(
+            f"stale_invocation_finding=index-{index}:"
+            f"path_sha256:{path_sha256}:rule:stale_invocation_text"
+        )
     sys.exit(1)
 PY
 
 python3 - <<'PY'
+import hashlib
 from pathlib import Path
 import os
 import subprocess
@@ -196,7 +201,10 @@ import sys
 
 safety_dir = Path("plugins/codexqb/skills/codexqb/scripts").resolve()
 sys.path.insert(0, safety_dir.as_posix())
-from safety_contracts import literal_secret_match_locations, secret_match_locations  # noqa: E402
+from safety_contracts import (  # noqa: E402
+    package_secret_match_locations,
+    package_secret_path_match_locations,
+)
 
 GIT = os.environ["CODEXQB_TRUSTED_GIT"]
 
@@ -246,29 +254,35 @@ else:
     failure_label = "package_secret_hygiene_failed"
     print("package_secret_hygiene_mode=filesystem")
 
-# Shared provider labels include openrouter_api_key. Canonical placeholders such
-# as OPENROUTER_API_KEY=${OPENROUTER_API_KEY} are handled by the shared policy.
+# Shared provider labels include openrouter_api_key. Canonical environment
+# references and redaction placeholders are handled by the shared policy.
 
-findings: list[str] = []
+findings: list[tuple[str, int, str]] = []
 for path in paths:
+    path_sha256 = hashlib.sha256(path.as_posix().encode("utf-8")).hexdigest()
+    for name, offset in package_secret_path_match_locations(path.as_posix()):
+        findings.append((path_sha256, offset, f"package_path_{name}"))
     try:
-        text = path.read_text(encoding="utf-8")
-    except (UnicodeDecodeError, OSError):
+        data = path.read_bytes()
+    except OSError:
+        findings.append((path_sha256, 0, "package_payload_unreadable"))
         continue
 
-    scanner = literal_secret_match_locations if path.suffix.lower() in {".py", ".sh", ".json"} else secret_match_locations
-    for name, offset in scanner(text):
-        line_number = text.count("\n", 0, offset) + 1
-        findings.append(f"{path}:{line_number}: {name}")
+    for name, offset in package_secret_match_locations(data, path.suffix):
+        findings.append((path_sha256, offset, name))
 
 if findings:
     print(failure_label)
-    for finding in findings:
-        print(finding)
+    for index, (path_sha256, offset, rule) in enumerate(findings, start=1):
+        print(
+            f"secret_hygiene_finding=index-{index}:"
+            f"path_sha256:{path_sha256}:offset:{offset}:rule:{rule}"
+        )
     sys.exit(1)
 PY
 
 python3 - <<'PY'
+import hashlib
 import io
 import os
 from pathlib import Path
@@ -329,8 +343,9 @@ else:
 
 if offenders:
     print(failure_label)
-    for offender in offenders:
-        print(offender)
+    for index, offender in enumerate(offenders, start=1):
+        path_sha256 = hashlib.sha256(offender.encode("utf-8")).hexdigest()
+        print(f"archive_hygiene_finding=index-{index}:path_sha256:{path_sha256}:rule:blocked_path")
     sys.exit(1)
 PY
 fi
@@ -368,6 +383,7 @@ test -f "$TMPDIR_VALIDATE/plugin-extracted/skills/codexqb/SKILL.md"
 test ! -e "$TMPDIR_VALIDATE/plugin-extracted/tests"
 test ! -e "$TMPDIR_VALIDATE/source-extracted/CodexQB/.git"
 CODEXQB_PACKAGE_ZIPS="$PLUGIN_PACKAGE:$SOURCE_PACKAGE" python3 - <<'PY'
+import hashlib
 import os
 import re
 import sys
@@ -376,14 +392,16 @@ from pathlib import Path
 
 safety_dir = Path("plugins/codexqb/skills/codexqb/scripts").resolve()
 sys.path.insert(0, safety_dir.as_posix())
-from safety_contracts import literal_secret_match_locations, secret_match_locations  # noqa: E402
+from safety_contracts import (  # noqa: E402
+    package_secret_match_locations,
+    package_secret_path_match_locations,
+)
 
 bad = re.compile(
     r"(^|/)(\.git|\.codexqb|__pycache__|\.env|artifacts|logs|tmp|__MACOSX)(/|$)"
     r"|\.pyc$|\.pem$|\.key$|\.local($|\.)"
 )
-offenders: list[str] = []
-secret_offenders: list[str] = []
+findings: list[tuple[str, int, str]] = []
 for archive_name in os.environ["CODEXQB_PACKAGE_ZIPS"].split(":"):
     archive_path = Path(archive_name)
     with zipfile.ZipFile(archive_path) as archive:
@@ -394,33 +412,34 @@ for archive_name in os.environ["CODEXQB_PACKAGE_ZIPS"].split(":"):
             else "CodexQB/PACKAGE-MANIFEST.json"
         )
         if expected_manifest not in names:
-            offenders.append(f"{archive_path.name}:missing_package_manifest")
+            findings.append(
+                (
+                    hashlib.sha256(expected_manifest.encode("utf-8")).hexdigest(),
+                    0,
+                    "missing_package_manifest",
+                )
+            )
         for info in archive.infolist():
             name = info.filename
+            path_sha256 = hashlib.sha256(name.encode("utf-8")).hexdigest()
+            for rule, offset in package_secret_path_match_locations(name):
+                findings.append((path_sha256, offset, f"package_path_{rule}"))
             if bad.search(name):
-                offenders.append(f"{archive_path.name}:{name}")
+                findings.append((path_sha256, 0, "blocked_path"))
                 continue
             if info.is_dir():
                 continue
             data = archive.read(info)
-            try:
-                text = data.decode("utf-8")
-            except UnicodeDecodeError:
-                continue
-            scanner = (
-                literal_secret_match_locations
-                if Path(name).suffix.lower() in {".py", ".sh", ".json"}
-                else secret_match_locations
-            )
-            if scanner(text):
-                secret_offenders.append(f"{archive_path.name}:{name}")
+            for rule, offset in package_secret_match_locations(data, Path(name).suffix):
+                findings.append((path_sha256, offset, rule))
 
-if offenders or secret_offenders:
+if findings:
     print("sanitized_zip_hygiene_failed")
-    for offender in offenders:
-        print(f"blocked_path={offender}")
-    for offender in secret_offenders:
-        print(f"secret_like_content={offender}")
+    for index, (path_sha256, offset, rule) in enumerate(findings, start=1):
+        print(
+            f"zip_hygiene_finding=index-{index}:"
+            f"path_sha256:{path_sha256}:offset:{offset}:rule:{rule}"
+        )
     sys.exit(1)
 print("sanitized_zip_hygiene=passed")
 PY

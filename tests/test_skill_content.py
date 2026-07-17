@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -573,7 +575,8 @@ class SkillContentTests(unittest.TestCase):
             "package_secret_hygiene_failed",
             "package_secret_hygiene_mode=filesystem",
             "openrouter_api_key",
-            "OPENROUTER_API_KEY",
+            "package_secret_path_match_locations",
+            "package_path_",
             "CODEXQB_TRUSTED_GIT",
             "[GIT, \"archive\"",
             "archive_hygiene_failed",
@@ -599,6 +602,16 @@ class SkillContentTests(unittest.TestCase):
             "docs/release-audits/0.3.0-feedback-closure.md",
         ]:
             self.assertIn(phrase, validate_script)
+        for phrase in (
+            "secret_hygiene_finding=index-",
+            "archive_hygiene_finding=index-",
+            "zip_hygiene_finding=index-",
+            "path_sha256:",
+        ):
+            self.assertIn(phrase, validate_script)
+        self.assertNotIn('findings.append(f"{path}:', validate_script)
+        self.assertNotIn('print(f"blocked_path={offender}")', validate_script)
+        self.assertNotIn('print(f"secret_like_content={offender}")', validate_script)
 
         closure_audit = (REPO_ROOT / "docs/FEEDBACK-CLOSURE-AUDIT.md").read_text(encoding="utf-8")
         for phrase in [
@@ -692,7 +705,7 @@ class SkillContentTests(unittest.TestCase):
         self.assertNotIn("0.3.0 final release", combined.lower())
         self.assertNotIn("apply-subagent_serial-f794", combined)
         self.assertNotIn("AR-apply-subagent_serial-f794", combined)
-        self.assertNotRegex(combined, r"/Users/|/private/(?:tmp|var)|\\.codex/attachments")
+        self.assertNotRegex(combined, r"/Us" r"ers/|/private/(?:tmp|var)|\\.codex/attachments")
         self.assertNotRegex(combined, r"\b019e[a-f0-9]{28}\b")
 
     def test_shared_safety_contracts_are_wired(self) -> None:
@@ -905,6 +918,7 @@ class SkillContentTests(unittest.TestCase):
 
     def test_ci_and_export_sanitized_are_hardened(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/validate.yml").read_text(encoding="utf-8")
+        dependabot = (REPO_ROOT / ".github/dependabot.yml").read_text(encoding="utf-8")
         makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
         validate_script = (REPO_ROOT / "scripts/validate.sh").read_text(encoding="utf-8")
         privacy_checker = (REPO_ROOT / "scripts/check_public_privacy.py").read_text(encoding="utf-8")
@@ -916,6 +930,21 @@ class SkillContentTests(unittest.TestCase):
         self.assertIn("push:", workflow)
         self.assertIn("pull_request:", workflow)
         self.assertNotIn("branches: [main]", workflow)
+        self.assertNotIn("actions/checkout@v6", workflow)
+        self.assertNotIn("actions/setup-python@v6", workflow)
+        self.assertEqual(
+            workflow.count("actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10"),
+            4,
+        )
+        self.assertEqual(
+            workflow.count("actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1"),
+            4,
+        )
+        self.assertEqual(workflow.count("fetch-depth: 0"), 4)
+        self.assertIn("name: required / CodexQB", workflow)
+        self.assertIn("needs: [portability, behavior, package]", workflow)
+        self.assertIn("package-ecosystem: github-actions", dependabot)
+        self.assertIn("package-ecosystem: pip", dependabot)
         self.assertIn("matrix:", workflow)
         for os_name, version in (
             ("ubuntu-24.04", "3.12"),
@@ -974,6 +1003,7 @@ class SkillContentTests(unittest.TestCase):
         ):
             self.assertIn(target, makefile)
         self.assertIn("check-public-privacy", makefile)
+        self.assertIn("--scope all --require-empty-baseline", makefile)
         self.assertIn("check: check-static check-unit check-platform check-behavior check-package", makefile)
         check_fast = makefile.split("check-fast:", 1)[1].split("\n\n", 1)[0]
         self.assertIn("scripts/run_test_suite.py fast", check_fast)
@@ -1013,6 +1043,9 @@ class SkillContentTests(unittest.TestCase):
         )
         self.assertIn('"docs/FEEDBACK-CLOSURE-AUDIT.md"', privacy_checker)
         self.assertIn('"docs/revision/CODEXQB-0.3-RELEASE-FOUNDATION.md"', privacy_checker)
+        self.assertIn('choices=("current", "history", "all")', privacy_checker)
+        self.assertIn('choices=("text", "json")', privacy_checker)
+        self.assertIn("history_scan_shallow_repository", privacy_checker)
         self.assertNotIn("0.2.1", bug_template)
         self.assertIn("vX.Y.Z or commit SHA", bug_template)
         export_script = (REPO_ROOT / "scripts/export_sanitized.py").read_text(encoding="utf-8")
@@ -1187,7 +1220,38 @@ class SkillContentTests(unittest.TestCase):
             self.assertIn("behavior_smokes_skipped=1", result.stdout)
             self.assertNotIn("apply_behavior_smoke=passed", result.stdout)
 
+            fixture = "sk-" + "V" * 40
+            secret_path = package_root / f"{fixture}.txt"
+            secret_path.write_text("safe file body\n", encoding="utf-8")
             (package_root / "PACKAGE-MANIFEST.json").unlink()
+            subprocess.run(
+                ["git", "init", "-q"],
+                cwd=package_root,
+                capture_output=True,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "add", "."],
+                cwd=package_root,
+                capture_output=True,
+                check=True,
+            )
+            path_result = subprocess.run(
+                ["bash", "scripts/validate.sh", "static"],
+                cwd=package_root,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(path_result.returncode, 0)
+            self.assertIn("tracked_secret_hygiene_failed", path_result.stdout)
+            self.assertIn("package_path_openai_api_key", path_result.stdout)
+            self.assertNotIn(fixture, path_result.stdout + path_result.stderr)
+            shutil.rmtree(package_root / ".git")
+            secret_path.unlink()
+
             missing_manifest = subprocess.run(
                 ["bash", "scripts/validate.sh"],
                 cwd=package_root,
@@ -1236,7 +1300,8 @@ class SkillContentTests(unittest.TestCase):
             root = Path(temp_dir)
             evidence = root / "docs" / "release-evidence"
             evidence.mkdir(parents=True)
-            (evidence / "leak.md").write_text("path: /Users/example/private\n", encoding="utf-8")
+            private_path = "/Us" + "ers/example/private"
+            (evidence / "leak.md").write_text(f"path: {private_path}\n", encoding="utf-8")
             result = subprocess.run(
                 [os.environ.get("PYTHON", "python3"), str(REPO_ROOT / "scripts/check_public_privacy.py"), "--root", str(root)],
                 text=True,
@@ -1245,8 +1310,13 @@ class SkillContentTests(unittest.TestCase):
             )
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("docs/release-evidence/leak.md:1:mac_user_path", result.stdout)
-            self.assertNotIn("/Users/example/private", result.stdout)
+            path_hash = hashlib.sha256(b"docs/release-evidence/leak.md").hexdigest()
+            self.assertIn(
+                f"path_sha256:{path_hash}:line:1:rule:mac_user_path",
+                result.stdout,
+            )
+            self.assertNotIn("docs/release-evidence/leak.md", result.stdout)
+            self.assertNotIn(private_path, result.stdout)
 
     def test_untracked_explicit_public_report_is_privacy_scanned(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1274,7 +1344,8 @@ class SkillContentTests(unittest.TestCase):
             )
             report = root / "docs" / "revision" / "CODEXQB-0.3-RELEASE-FOUNDATION.md"
             report.parent.mkdir(parents=True)
-            report.write_text("path: /Users/example/private\n", encoding="utf-8")
+            private_path = "/Us" + "ers/example/private"
+            report.write_text(f"path: {private_path}\n", encoding="utf-8")
 
             result = subprocess.run(
                 [os.environ.get("PYTHON", "python3"), str(REPO_ROOT / "scripts/check_public_privacy.py"), "--root", str(root)],
@@ -1284,11 +1355,14 @@ class SkillContentTests(unittest.TestCase):
             )
 
             self.assertNotEqual(result.returncode, 0)
+            relative = "docs/revision/CODEXQB-0.3-RELEASE-FOUNDATION.md"
+            path_hash = hashlib.sha256(relative.encode("utf-8")).hexdigest()
             self.assertIn(
-                "docs/revision/CODEXQB-0.3-RELEASE-FOUNDATION.md:1:mac_user_path",
+                f"path_sha256:{path_hash}:line:1:rule:mac_user_path",
                 result.stdout,
             )
-            self.assertNotIn("/Users/example/private", result.stdout)
+            self.assertNotIn(relative, result.stdout)
+            self.assertNotIn(private_path, result.stdout)
 
     def test_autopsy_validator_mode_is_documented(self) -> None:
         validator = (SKILL_ROOT / "scripts/validate_planner_docs.py").read_text(encoding="utf-8")

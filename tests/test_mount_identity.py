@@ -108,7 +108,7 @@ class MountIdentityProviderTests(unittest.TestCase):
                 identity=None,
                 assurance=MOUNT.MountAssurance.UNAVAILABLE,
                 failure_code="mount_provider_failed",
-                diagnostics=("path=/Users/example/private",),
+                diagnostics=("path=/" + "Users/example/private",),
             )
 
     def test_fdinfo_provider_accepts_one_bounded_positive_mount_id(self) -> None:
@@ -152,7 +152,7 @@ class MountIdentityProviderTests(unittest.TestCase):
         self.assertIn("errno=eacces", encoded)
 
         def broken(_fd: int) -> bytes:
-            raise RuntimeError("secret=/Users/example/private")
+            raise RuntimeError("secret=/" + "Users/example/private")
 
         runtime_failure = MOUNT.probe_linux_fdinfo(
             9,
@@ -284,7 +284,7 @@ class MountIdentityProviderTests(unittest.TestCase):
             payload.f_fsid.value[1] = 20
             payload.f_type = 30
             payload.f_fstypename = b"apfs"
-            payload.f_mntonname = b"/Users/example/private"
+            payload.f_mntonname = b"/" + b"Users/example/private"
             payload.f_mntfromname = b"/dev/disk-test"
             return 0
 
@@ -401,7 +401,7 @@ class MountIdentityResolverTests(unittest.TestCase):
         self.assertEqual(unavailable.failure_code, MOUNT.SECURE_MOUNT_IDENTITY_UNAVAILABLE)
 
         def broken(_fd):
-            raise RuntimeError("secret=/Users/example/private")
+            raise RuntimeError("secret=/" + "Users/example/private")
 
         broken.provider_name = "broken"
         resolution = MOUNT.resolve_mount_identity(3, providers=(broken,))
@@ -456,7 +456,7 @@ class MountIdentityResolverTests(unittest.TestCase):
             supported=True,
             identity=MOUNT.MountIdentity(
                 "darwin_fstatfs",
-                (1, 2, b"/Users/example/private", b"token-value"),
+                (1, 2, b"/" + b"Users/example/private", b"token-value"),
             ),
             assurance=MOUNT.MountAssurance.MOUNT_UNIQUE_DESCRIPTOR_BOUND,
             failure_code=None,

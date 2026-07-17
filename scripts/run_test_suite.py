@@ -42,6 +42,7 @@ PRIMARY_SUITE_STEMS = {
     "package": {
         "test_export_sanitized",
         "test_package_manifest",
+        "test_package_privacy",
         # This module contains the extracted-package integration contract in
         # addition to content assertions, so it belongs to the package gate.
         "test_skill_content",

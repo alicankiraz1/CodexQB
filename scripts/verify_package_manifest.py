@@ -51,6 +51,10 @@ from package_policy import (  # noqa: E402
     plugin_activation_contract_errors,
     plugin_skill_contract_errors,
 )
+from safety_contracts import (  # noqa: E402
+    package_secret_match_locations,
+    package_secret_path_match_locations,
+)
 from mount_identity import (  # noqa: E402
     MountIdentityError,
     MountResolution,
@@ -228,6 +232,9 @@ def manifest_entries(manifest: dict[str, object]) -> tuple[list[dict[str, str]],
             continue
         if artifact_type in ARTIFACT_TYPES and denied_path_reason(path, artifact_type) is not None:
             errors.append(f"package_manifest_denied_path=index-{index}")
+            continue
+        if package_secret_path_match_locations(path):
+            errors.append(f"package_manifest_secret_path=index-{index}")
             continue
         if path == PACKAGE_MANIFEST_NAME or path in seen:
             errors.append(f"package_manifest_file_duplicate=index-{index}")
@@ -506,7 +513,7 @@ def manifest_contract_errors(manifest: dict[str, object]) -> list[str]:
 def zip_member_evidence(
     archive: zipfile.ZipFile,
     info: zipfile.ZipInfo,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, bool]:
     digest = hashlib.sha256()
     payload = bytearray()
     with archive.open(info, "r") as handle:
@@ -516,7 +523,11 @@ def zip_member_evidence(
                 break
             digest.update(chunk)
             payload.extend(chunk)
-    return digest.hexdigest(), payload_is_zip_archive(payload)
+    return (
+        digest.hexdigest(),
+        payload_is_zip_archive(payload),
+        bool(package_secret_match_locations(bytes(payload), Path(info.filename).suffix)),
+    )
 
 
 def zip_member_sha256(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> str:
@@ -1050,7 +1061,10 @@ def _verify_zip_after_preflight(
             manifest_info = archive.getinfo(manifest_name)
             if manifest_info.file_size > MAX_MANIFEST_BYTES:
                 return [*errors, "package_manifest_too_large"]
-            manifest, parse_errors = parse_manifest(archive.read(manifest_name))
+            manifest_data = archive.read(manifest_name)
+            if package_secret_match_locations(manifest_data, ".json"):
+                errors.append("package_manifest_secret_content_rejected")
+            manifest, parse_errors = parse_manifest(manifest_data)
             errors.extend(parse_errors)
             if manifest is None:
                 return errors
@@ -1080,12 +1094,15 @@ def _verify_zip_after_preflight(
             member_records: list[tuple[str, bool]] = []
             actual_files: set[str] = set()
             member_evidence: dict[str, tuple[str, bool]] = {}
-            for info in infos:
+            for member_index, info in enumerate(infos, start=1):
                 safe_name = safe_archive_name(info.filename, prefix)
                 if safe_name is None:
                     errors.append("package_zip_entry_path_invalid")
                     continue
                 normalized, is_directory = safe_name
+                if package_secret_path_match_locations(normalized):
+                    errors.append(f"package_zip_secret_path_rejected=index-{member_index}")
+                    continue
                 portable = portable_path_key(normalized)
                 if normalized in normalized_names or portable in portable_names:
                     errors.append("package_zip_entry_collision")
@@ -1119,6 +1136,8 @@ def _verify_zip_after_preflight(
                             member_evidence[normalized] = evidence
                             if evidence[1]:
                                 errors.append("package_zip_nested_zip_rejected")
+                            if evidence[2]:
+                                errors.append("package_zip_secret_content_rejected")
                 if is_directory:
                     errors.append("package_zip_directory_entry_rejected")
                 if info.compress_type != zipfile.ZIP_STORED:
@@ -1342,10 +1361,10 @@ def regular_file_evidence(
     relative: str,
     maximum_bytes: int,
     root_resolution: MountResolution | None = None,
-) -> tuple[str | None, int, str | None, FileIdentity | None, bool]:
+) -> tuple[str | None, int, str | None, FileIdentity | None, bool, bool]:
     opened = open_regular_descriptor(root_descriptor, relative, root_resolution)
     if opened is None:
-        return None, 0, None, None, False
+        return None, 0, None, None, False, False
     descriptor, before = opened
     if before.st_size > maximum_bytes:
         os.close(descriptor)
@@ -1354,6 +1373,7 @@ def regular_file_evidence(
             0,
             f"{stat.S_IMODE(before.st_mode):04o}",
             metadata_identity(before),
+            False,
             False,
         )
     digest = hashlib.sha256()
@@ -1372,20 +1392,21 @@ def regular_file_evidence(
                 payload.extend(chunk)
             after = os.fstat(handle.fileno())
     except OSError:
-        return None, total, None, None, False
+        return None, total, None, None, False, False
     mode = f"{stat.S_IMODE(after.st_mode):04o}"
     if (
         total > maximum_bytes
         or total != after.st_size
         or metadata_identity(before) != metadata_identity(after)
     ):
-        return None, total, mode, metadata_identity(after), False
+        return None, total, mode, metadata_identity(after), False, False
     return (
         digest.hexdigest(),
         total,
         mode,
         metadata_identity(after),
         payload_is_zip_archive(payload),
+        bool(package_secret_match_locations(bytes(payload), Path(relative).suffix)),
     )
 
 
@@ -1396,7 +1417,7 @@ def regular_file_sha256(
 ) -> tuple[str | None, int, str | None, FileIdentity | None]:
     """Compatibility wrapper for callers that only need digest evidence."""
 
-    digest, total, mode, identity, _nested_zip = regular_file_evidence(
+    digest, total, mode, identity, _nested_zip, _secret_content = regular_file_evidence(
         root_descriptor,
         relative,
         maximum_bytes,
@@ -1469,6 +1490,9 @@ def directory_inventory(
             relative = f"{prefix}/{name}" if prefix else name
             if canonical_relative_path(relative) is None:
                 errors.append("package_directory_path_invalid")
+                continue
+            if package_secret_path_match_locations(relative):
+                errors.append("package_directory_secret_path_rejected")
                 continue
             try:
                 metadata = os.stat(
@@ -1642,6 +1666,8 @@ def verify_directory(
             return ["package_manifest_missing_or_invalid"]
         manifest_data, manifest_mode, manifest_identity = manifest_result
         manifest, parse_errors = parse_manifest(manifest_data)
+        if package_secret_match_locations(manifest_data, ".json"):
+            parse_errors = [*parse_errors, "package_manifest_secret_content_rejected"]
         if manifest is None:
             return parse_errors
         entries, entry_errors = manifest_entries(manifest)
@@ -1701,6 +1727,7 @@ def verify_directory(
                     actual_mode,
                     opened_identity,
                     nested_zip,
+                    secret_content,
                 ) = regular_file_evidence(
                     root_descriptor,
                     item["path"],
@@ -1710,6 +1737,8 @@ def verify_directory(
                 remaining_bytes = max(0, remaining_bytes - bytes_read)
                 if nested_zip:
                     errors.append(f"package_file_nested_zip_rejected=index-{index}")
+                if secret_content:
+                    errors.append(f"package_file_secret_content_rejected=index-{index}")
                 if digest is None:
                     errors.append(f"package_file_unreadable_or_oversized=index-{index}")
                     continue

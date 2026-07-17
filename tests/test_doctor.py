@@ -79,7 +79,7 @@ class DoctorReportTests(unittest.TestCase):
                     supported=True,
                     identity=("linux_mount_id", 42),
                     assurance="mount_unique_descriptor_bound",
-                    diagnostics={"raw": "/Users/alice/private/repository"},
+                    diagnostics={"raw": "/" + "Users/alice/private/repository"},
                 ),
                 provider(
                     "linux_statx_mnt_id",
@@ -148,18 +148,18 @@ class DoctorReportTests(unittest.TestCase):
         hostile = resolution(
             (
                 provider(
-                    "/Users/alice/private/provider",
+                    "/" + "Users/alice/private/provider",
                     supported=True,
                     identity={"trust_key": secret},
                     assurance="filesystem_identity_only",
                     failure_code=secret,
                     diagnostics={
-                        "repository": "/Users/alice/private/repository",
+                        "repository": "/" + "Users/alice/private/repository",
                         "trust_key": secret,
                     },
                 ),
             ),
-            selected_provider="/Users/alice/private/provider",
+            selected_provider="/" + "Users/alice/private/provider",
             identity={"trust_key": secret},
             assurance="filesystem_identity_only",
             failure_code=secret,
@@ -171,7 +171,7 @@ class DoctorReportTests(unittest.TestCase):
         )
         rendered = DOCTOR.render_json(report) + DOCTOR.render_human(report)
         self.assertNotIn(secret, rendered)
-        self.assertNotIn("/Users/alice", rendered)
+        self.assertNotIn("/" + "Users/alice", rendered)
         self.assertNotIn("trust_key", rendered)
         self.assertNotIn('\n    "identity":', rendered)
         self.assertNotIn('"diagnostics"', rendered)

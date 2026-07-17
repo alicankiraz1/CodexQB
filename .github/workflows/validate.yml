@@ -41,8 +41,10 @@ jobs:
           - os: macos-15
             python-version: "3.14"
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
       - name: Run the short dependency-free gate
@@ -67,8 +69,10 @@ jobs:
       matrix:
         python-version: ["3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
       - name: Run Goal and Apply behavior gates
@@ -78,8 +82,10 @@ jobs:
     name: package / Ubuntu / Python 3.13
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.13"
       - name: Run package contract and extraction gates
@@ -128,18 +134,34 @@ jobs:
             CODEXQB_VALIDATE_SKIP_BEHAVIOR_SMOKE=1 \
             bash scripts/validate.sh
 
+  required:
+    name: required / CodexQB
+    if: ${{ always() }}
+    needs: [portability, behavior, package]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every public validation lane
+        env:
+          PORTABILITY_RESULT: ${{ needs.portability.result }}
+          BEHAVIOR_RESULT: ${{ needs.behavior.result }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
+        run: |
+          test "$PORTABILITY_RESULT" = success
+          test "$BEHAVIOR_RESULT" = success
+          test "$PACKAGE_RESULT" = success
+
   release:
     name: strict release gate
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
       (github.event_name == 'workflow_dispatch' && inputs.run_release_gate)
-    needs: [portability, behavior, package]
+    needs: [required]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.13"
       - name: Install release validation dependencies

@@ -1894,7 +1894,8 @@ class ExportSanitizedTests(unittest.TestCase):
             root = base / "source"
             root.mkdir()
             write_minimal_codexqb_tree(root)
-            secret_marker = "sk-" + "proj-" + "DO_NOT_ECHO_1234567890"
+            project_prefix = "proj-"
+            secret_marker = "sk-" + project_prefix + "DO_NOT_ECHO_1234567890"
             output = base / f"missing-{secret_marker}-\x1b[31m" / "package.zip"
 
             result = subprocess.run(
@@ -2272,7 +2273,7 @@ class ExportSanitizedTests(unittest.TestCase):
             git_commit_all(root)
             (root / "notes.txt").write_text("leaked sk-" + "A" * 40 + "\n", encoding="utf-8")
 
-            with self.assertRaisesRegex(ValueError, "secret_like_content=notes.txt"):
+            with self.assertRaisesRegex(ValueError, "^secret_like_content$"):
                 EXPORT_MODULE.create_zip(
                     root,
                     root / "CodexQB-sanitized.zip",
@@ -2280,6 +2281,203 @@ class ExportSanitizedTests(unittest.TestCase):
                     allow_dirty=True,
                     allow_head_mismatch=True,
                 )
+
+    def test_export_rejects_invalid_utf8_text_and_binary_secret_without_replacing_output(self) -> None:
+        utf32_fixture = "sk-" + "U" * 40
+        fixtures = (
+            ("invalid.py", b"print('safe')\n\xff"),
+            ("payload.bin", b"\xff" + ("sk-" + "B" * 40).encode("ascii")),
+            ("payload-utf32.bin", utf32_fixture.encode("utf-32-le")),
+        )
+        for name, data in fixtures:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                write_minimal_codexqb_tree(root)
+                (root / name).write_bytes(data)
+                output = root.parent / f"{name}.zip"
+                original = b"existing-output"
+                output.write_bytes(original)
+
+                with self.assertRaisesRegex(ValueError, "^secret_like_content$") as caught:
+                    EXPORT_MODULE.create_zip(root, output, source_package=True)
+
+                self.assertEqual(output.read_bytes(), original)
+                self.assertNotIn(utf32_fixture, str(caught.exception))
+
+    def test_source_export_rejects_semantic_credential_assignments_without_disclosure(self) -> None:
+        fixture = "this-is-a-real-long-password-value"
+        joined_fixture = "sk-" + "J" * 40
+        neutral_join_tail = "N" * 40
+        neutral_join_fixture = "sk-" + neutral_join_tail
+        assignment = "PASSWORD=" + fixture
+        variants = (
+            ("settings.py", "PASSWORD = " + repr(fixture) + "\n"),
+            ("settings-bytes.py", "PASSWORD = " + repr(fixture.encode("utf-8")) + "\n"),
+            (
+                "settings-bytes-concat.py",
+                "PASSWORD = "
+                + repr("this-is-a-real-".encode("utf-8"))
+                + " + "
+                + repr("long-password-value".encode("utf-8"))
+                + "\n",
+            ),
+            ("settings.json", json.dumps({"password": fixture}) + "\n"),
+            ("default.py", "def f(password=" + repr(fixture) + "):\n    pass\n"),
+            ("comment.py", "# " + assignment + "\n"),
+            (
+                "docstring.py",
+                "def fixture():\n    \"\"\"" + assignment + "\"\"\"\n",
+            ),
+            ("comment.sh", "# " + assignment + "\n"),
+            ("note.json", json.dumps({"note": assignment}) + "\n"),
+            (
+                "constant-join.py",
+                "API_KEY = ''.join(("
+                + repr("sk-")
+                + ", "
+                + repr("J" * 40)
+                + "))\n",
+            ),
+            (
+                "neutral-join.py",
+                "message = ''.join(("
+                + repr("sk-")
+                + ", "
+                + repr(neutral_join_tail)
+                + "))\n",
+            ),
+            (
+                "argument-join.py",
+                "print(''.join(("
+                + repr("sk-")
+                + ", "
+                + repr(neutral_join_tail)
+                + ")))\n",
+            ),
+            (
+                "neutral-bytes-join.py",
+                "message = b''.join(("
+                + repr(b"sk-")
+                + ", "
+                + repr(neutral_join_tail.encode())
+                + "))\n",
+            ),
+            (
+                "argument-bytes-join.py",
+                "print(b''.join(("
+                + repr(b"sk-")
+                + ", "
+                + repr(neutral_join_tail.encode())
+                + ")))\n",
+            ),
+        )
+        for name, text in variants:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_dir:
+                base = Path(temp_dir)
+                root = base / "source"
+                root.mkdir()
+                write_minimal_codexqb_tree(root)
+                (root / name).write_text(text, encoding="utf-8")
+                output = base / "package.zip"
+
+                with self.assertRaisesRegex(ValueError, "^secret_like_content$") as caught:
+                    EXPORT_MODULE.create_zip(root, output, source_package=True)
+
+                self.assertNotIn(fixture, str(caught.exception))
+                self.assertNotIn(joined_fixture, str(caught.exception))
+                self.assertNotIn(neutral_join_fixture, str(caught.exception))
+                self.assertFalse(output.exists())
+
+    def test_source_export_rejects_secret_file_and_directory_names_before_manifest(self) -> None:
+        fixture = "sk-" + "P" * 40
+        variants = (f"{fixture}.txt", f"safe/{fixture}/payload.txt")
+        for relative in variants:
+            with self.subTest(path_hash=hashlib.sha256(relative.encode()).hexdigest()), tempfile.TemporaryDirectory() as temp_dir:
+                base = Path(temp_dir)
+                root = base / "source"
+                root.mkdir()
+                write_minimal_codexqb_tree(root)
+                payload = root / relative
+                payload.parent.mkdir(parents=True, exist_ok=True)
+                payload.write_text("safe file body\n", encoding="utf-8")
+                output = base / "package.zip"
+
+                with self.assertRaisesRegex(ValueError, "^secret_like_path$") as caught:
+                    EXPORT_MODULE.create_zip(root, output, source_package=True)
+
+                self.assertNotIn(fixture, str(caught.exception))
+                self.assertFalse(output.exists())
+
+    def test_source_export_accepts_bytes_credential_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            root = base / "source"
+            root.mkdir()
+            write_minimal_codexqb_tree(root)
+            (root / "settings.py").write_text(
+                "PASSWORD = " + repr(b"${PASSWORD}") + "\n",
+                encoding="utf-8",
+            )
+            output = base / "package.zip"
+
+            EXPORT_MODULE.create_zip(root, output, source_package=True)
+
+            self.assertTrue(output.is_file())
+
+    def test_source_export_rejects_secret_shaped_git_branch_before_temp_write(self) -> None:
+        generic_value = "branch-credential-value"
+        variants = (
+            ("provider", "sk-" + "B" * 40),
+            ("generic", "PASSWORD=" + generic_value),
+        )
+        for label, fixture in variants:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+                base = Path(temp_dir)
+                root = base / "source"
+                root.mkdir()
+                git(root, "init")
+                write_minimal_codexqb_tree(root)
+                git_commit_all(root)
+                git(root, "checkout", "-q", "-b", fixture)
+                output = base / "package.zip"
+
+                with self.assertRaisesRegex(ValueError, "^secret_like_manifest$") as caught:
+                    EXPORT_MODULE.create_zip(root, output, source_package=True)
+
+                self.assertNotIn(fixture, str(caught.exception))
+                self.assertFalse(output.exists())
+
+    def test_cli_secret_content_failure_never_discloses_secret_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            root = base / "source"
+            root.mkdir()
+            write_minimal_codexqb_tree(root)
+            fixture = "sk-" + "R" * 40
+            (root / f"{fixture}.txt").write_text(fixture + "\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(EXPORTER),
+                    "--root",
+                    str(root),
+                    "--output",
+                    str(base / "package.zip"),
+                    "--provenance-mode",
+                    "filesystem",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+
+            combined = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("error_code=secret_like_path", result.stdout)
+            self.assertNotIn(fixture, combined)
+            self.assertNotIn("Traceback", combined)
 
     def test_worktree_export_can_include_scanned_untracked_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

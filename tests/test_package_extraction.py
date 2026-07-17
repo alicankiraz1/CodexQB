@@ -76,6 +76,30 @@ class PackageExtractionTests(unittest.TestCase):
         self.assertFalse((parent / output_name).exists())
         self.assertEqual(list(parent.glob(f".{output_name}.extract-*")), [])
 
+    def test_extractor_rejects_secret_bearing_verified_manifest_before_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            package = create_source_package(base)
+            forged = base / "forged-secret.zip"
+            fixture = b"\xff" + ("sk-" + "D" * 40).encode("ascii")
+            rewrite_manifest_bound_file(
+                package,
+                forged,
+                artifact_type="source",
+                relative_path="README.md",
+                data=fixture,
+            )
+            output = base / "unpacked"
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "^package_zip_secret_content_rejected$",
+            ):
+                EXTRACT_MODULE.extract_verified_package(forged, output, "source")
+
+            self.assertFalse(output.exists())
+            self.assert_no_extraction_residue(base, output.name)
+
     def test_valid_plugin_and_source_artifacts_restore_modes_and_verify_strictly(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -186,7 +210,7 @@ class PackageExtractionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
             _plugin_source, package = create_plugin_package(base)
-            secret_shaped = "".join(("sk", "-proj-", "DO_NOT_ECHO_1234567890"))
+            secret_shaped = "sk-proj-" + "D" * 24
             output_name = f"plugin-output-\x1b[31m{secret_shaped}\x1b[0m"
             output = base / output_name
 

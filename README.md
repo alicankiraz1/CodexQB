@@ -284,6 +284,8 @@ git diff --check
 
 The repository also includes GitHub Actions at `.github/workflows/validate.yml`, which runs validation on pushes and pull requests, then adds the pinned schema gate, public privacy scan, and a Gitless extracted-package smoke test.
 
+`make check-public-privacy` is the repository-wide metadata-privacy gate: it detects local filesystem paths and machine/run identifiers in current public documentation and every regular blob reachable from public Git refs, while emitting only path/blob hashes and rule labels. Known text formats fail closed on invalid UTF-8; opaque binary formats use a byte-preserving scan for high-context path and run tokens, while context-free container UUIDs are not classified as local-machine identifiers. Credential and package-secret detection is a separate byte-safe package hygiene contract exercised by exporter, ZIP, extracted-root, and validation checks. This metadata gate does not replace a credential-oriented full-history scanner such as Gitleaks; that independent zero-finding proof remains a release-closure requirement.
+
 Use an explicit artifact target instead of Finder or generic directory compression:
 
 ```bash

@@ -35,8 +35,8 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from safety_contracts import (  # noqa: E402
-    literal_secret_match_locations,
-    secret_match_locations,
+    package_secret_match_locations,
+    package_secret_path_match_locations,
 )
 from git_evidence import trusted_git_executable  # noqa: E402
 from mount_identity import (  # noqa: E402
@@ -107,7 +107,7 @@ GIT_COMMAND_TIMEOUT_SECONDS = 10
 MAX_GIT_COMMAND_OUTPUT_BYTES = 16 * 1024 * 1024
 GIT_OUTPUT_CHUNK_BYTES = 64 * 1024
 SOURCE_WALK_TIMEOUT_SECONDS = 60
-SAFE_EXPORT_FAILURE_CODE_RE = re.compile(r"[a-z][a-z0-9_]*(?:=[a-z0-9_-]+)?")
+SAFE_EXPORT_FAILURE_CODE_RE = re.compile(r"[a-z][a-z0-9_]*")
 GitRoot = Path | RepositoryRootAnchor
 
 
@@ -1173,6 +1173,8 @@ def _included_candidate_paths(
             raise ValueError("package_manifest_preflight_failed=path_not_portable") from exc
         if normalized != rel:
             raise ValueError("package_manifest_preflight_failed=path_not_portable")
+        if package_secret_path_match_locations(rel):
+            raise ValueError("secret_like_path")
         if output_key is not None and portable_path_key(rel) == output_key:
             continue
         if rel == PACKAGE_MANIFEST_NAME:
@@ -1246,19 +1248,12 @@ def collect_anchored_payloads(
     modes: dict[Path, int] = {}
     for payload in anchored_payloads:
         path = anchor.path / payload.path
+        if package_secret_path_match_locations(payload.path):
+            raise ValueError("secret_like_path")
         if payload_is_zip_archive(payload.data):
             raise ValueError(f"package_nested_zip_rejected={payload.path}")
-        try:
-            text = payload.data.decode("utf-8")
-        except UnicodeDecodeError:
-            text = ""
-        scanner = (
-            literal_secret_match_locations
-            if path.suffix.lower() in {".py", ".sh", ".json"}
-            else secret_match_locations
-        )
-        if text and scanner(text):
-            raise ValueError(f"secret_like_content={payload.path}")
+        if package_secret_match_locations(payload.data, path.suffix):
+            raise ValueError("secret_like_content")
         files.append(path)
         payloads[path] = payload.data
         modes[path] = payload.mode
@@ -1793,6 +1788,8 @@ def _create_zip_from_anchor(
     manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
     if len(manifest_bytes) > MAX_MANIFEST_BYTES:
         raise ValueError("package_manifest_size_limit_exceeded")
+    if package_secret_match_locations(manifest_bytes, ".json"):
+        raise ValueError("secret_like_manifest")
     if counters["payload_bytes"] + len(manifest_bytes) > MAX_PACKAGE_UNCOMPRESSED_BYTES:
         raise ValueError("package_uncompressed_size_limit_exceeded")
     if len(files) + 1 > MAX_CANONICAL_ZIP_MEMBERS:
@@ -2150,8 +2147,8 @@ def _create_zip_from_anchor(
 
 
 def safe_export_failure_code(exc: BaseException) -> str:
-    value = str(exc)
-    if len(value) <= 160 and SAFE_EXPORT_FAILURE_CODE_RE.fullmatch(value):
+    value = str(exc).partition("=")[0]
+    if len(value) <= 80 and SAFE_EXPORT_FAILURE_CODE_RE.fullmatch(value):
         return value
     return "sanitized_export_failed"
 

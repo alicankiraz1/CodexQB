@@ -50,7 +50,7 @@ check-package:
 	$(NO_BYTECODE) bash scripts/validate.sh package
 
 check-public-privacy:
-	$(NO_BYTECODE) $(PYTHON) scripts/check_public_privacy.py --root .
+	$(NO_BYTECODE) $(PYTHON) scripts/check_public_privacy.py --root . --scope all
 
 # Keep release-only provenance out of check/check-fast. The strict export runs
 # first so an Unreleased changelog or missing tag fails before the long gates.
@@ -58,6 +58,7 @@ check-release:
 	@set -euo pipefail; \
 	tmpdir="$$(mktemp -d)"; \
 	trap 'rm -rf "$$tmpdir"' EXIT; \
+	$(NO_BYTECODE) $(PYTHON) scripts/check_public_privacy.py --root . --scope all --require-empty-baseline; \
 	$(NO_BYTECODE) $(PYTHON) scripts/export_sanitized.py --root . --artifact-type plugin --provenance-mode strict-release --output "$$tmpdir/codexqb-plugin-release.zip"; \
 	$(NO_BYTECODE) $(PYTHON) scripts/export_sanitized.py --root . --artifact-type source --provenance-mode strict-release --output "$$tmpdir/CodexQB-source-release.zip"; \
 	$(MAKE) check; \

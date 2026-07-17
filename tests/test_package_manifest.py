@@ -46,6 +46,7 @@ def load_verifier_module():
 
 
 VERIFY_MODULE = load_verifier_module()
+PACKAGE_SAFETY = sys.modules[VERIFY_MODULE.package_secret_match_locations.__module__]
 
 
 def create_source_package(base: Path, *, git_checkout: bool = False) -> tuple[Path, Path]:
@@ -1773,6 +1774,293 @@ class PackageManifestTests(unittest.TestCase):
                 "package_directory_file_size_limit_exceeded",
                 directory_errors,
             )
+
+    def test_zip_and_extracted_verifiers_reject_manifest_bound_secret_bytes(self) -> None:
+        credential = "this-is-a-real-long-password-value"
+        utf32_fixture = "sk-" + "U" * 40
+        joined_fixture = "sk-" + "J" * 40
+        neutral_join_tail = "N" * 40
+        neutral_join_fixture = "sk-" + neutral_join_tail
+        fixtures = (
+            ("payload.bin", b"\xff" + ("sk-" + "C" * 40).encode("ascii"), None),
+            ("payload-utf32.bin", utf32_fixture.encode("utf-32-be"), utf32_fixture),
+            ("invalid.py", b"print('safe')\n\xff", None),
+            ("settings-bytes.py", ("PASSWORD = " + repr(credential.encode("utf-8")) + "\n").encode("utf-8"), credential),
+            (
+                "settings-bytes-concat.py",
+                (
+                    "PASSWORD = "
+                    + repr("this-is-a-real-".encode("utf-8"))
+                    + " + "
+                    + repr("long-password-value".encode("utf-8"))
+                    + "\n"
+                ).encode("utf-8"),
+                credential,
+            ),
+            (
+                "constant-join.py",
+                (
+                    "API_KEY = ''.join(("
+                    + repr("sk-")
+                    + ", "
+                    + repr("J" * 40)
+                    + "))\n"
+                ).encode("utf-8"),
+                joined_fixture,
+            ),
+            (
+                "neutral-join.py",
+                (
+                    "message = ''.join(("
+                    + repr("sk-")
+                    + ", "
+                    + repr(neutral_join_tail)
+                    + "))\n"
+                ).encode("utf-8"),
+                neutral_join_fixture,
+            ),
+            (
+                "argument-join.py",
+                (
+                    "print(''.join(("
+                    + repr("sk-")
+                    + ", "
+                    + repr(neutral_join_tail)
+                    + ")))\n"
+                ).encode("utf-8"),
+                neutral_join_fixture,
+            ),
+            (
+                "neutral-bytes-join.py",
+                (
+                    "message = b''.join(("
+                    + repr(b"sk-")
+                    + ", "
+                    + repr(neutral_join_tail.encode())
+                    + "))\n"
+                ).encode("utf-8"),
+                neutral_join_fixture,
+            ),
+            (
+                "argument-bytes-join.py",
+                (
+                    "print(b''.join(("
+                    + repr(b"sk-")
+                    + ", "
+                    + repr(neutral_join_tail.encode())
+                    + ")))\n"
+                ).encode("utf-8"),
+                neutral_join_fixture,
+            ),
+        )
+        for relative_path, data, fixture in fixtures:
+            with self.subTest(path=relative_path), tempfile.TemporaryDirectory() as temp_dir:
+                base = Path(temp_dir)
+                _root, original = create_source_package(base)
+                forged = base / "forged.zip"
+                append_manifest_bound_file(
+                    original,
+                    forged,
+                    artifact_type="source",
+                    relative_path=relative_path,
+                    data=data,
+                )
+                extracted = base / "extracted"
+                extract_with_modes(forged, extracted)
+
+                zip_errors = VERIFY_MODULE.verify_zip(forged)
+                directory_errors = VERIFY_MODULE.verify_directory(
+                    extracted / "CodexQB",
+                    strict_artifact=True,
+                )
+                self.assertIn(
+                    "package_zip_secret_content_rejected",
+                    zip_errors,
+                )
+                self.assertTrue(
+                    any(
+                        error.startswith("package_file_secret_content_rejected=")
+                        for error in directory_errors
+                    )
+                )
+                for secret in (credential, fixture):
+                    if secret is not None:
+                        self.assertNotIn(secret, repr(zip_errors) + repr(directory_errors))
+
+    def test_zip_and_extracted_verifiers_reject_secret_paths_and_accept_bytes_placeholder(self) -> None:
+        fixture = "sk-" + "P" * 40
+        variants = (f"{fixture}.txt", f"safe/{fixture}/payload.txt")
+        for relative_path in variants:
+            with self.subTest(path_hash=hashlib.sha256(relative_path.encode()).hexdigest()), tempfile.TemporaryDirectory() as temp_dir:
+                base = Path(temp_dir)
+                _root, original = create_source_package(base)
+                forged = base / "forged.zip"
+                append_manifest_bound_file(
+                    original,
+                    forged,
+                    artifact_type="source",
+                    relative_path=relative_path,
+                    data=b"safe file body\n",
+                )
+                extracted = base / "extracted"
+                extract_with_modes(forged, extracted)
+
+                zip_errors = VERIFY_MODULE.verify_zip(forged)
+                directory_errors = VERIFY_MODULE.verify_directory(
+                    extracted / "CodexQB",
+                    strict_artifact=True,
+                )
+
+                self.assertTrue(
+                    any("secret_path" in error for error in zip_errors),
+                    zip_errors,
+                )
+                self.assertTrue(
+                    any("secret_path" in error for error in directory_errors),
+                    directory_errors,
+                )
+                self.assertNotIn(fixture, repr(zip_errors) + repr(directory_errors))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            _root, original = create_source_package(base)
+            forged = base / "placeholder.zip"
+            append_manifest_bound_file(
+                original,
+                forged,
+                artifact_type="source",
+                relative_path="settings.py",
+                data=("PASSWORD = " + repr(b"${PASSWORD}") + "\n").encode("utf-8"),
+            )
+            extracted = base / "placeholder-extracted"
+            extract_with_modes(forged, extracted)
+            self.assertNotIn("package_zip_secret_content_rejected", VERIFY_MODULE.verify_zip(forged))
+            self.assertFalse(
+                any(
+                    "secret_content" in error
+                    for error in VERIFY_MODULE.verify_directory(
+                        extracted / "CodexQB",
+                        strict_artifact=True,
+                    )
+                )
+            )
+
+    def test_zip_and_extracted_verifiers_scan_complete_manifest_provenance(self) -> None:
+        generic_value = "manifest-credential-value"
+        variants = (
+            ("provider", "sk-" + "M" * 40),
+            ("generic", "PASSWORD=" + generic_value),
+        )
+        for label, fixture in variants:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+                base = Path(temp_dir)
+                _root, original = create_source_package(base)
+                forged = base / "secret-manifest.zip"
+
+                def mutate(manifest: dict[str, object]) -> None:
+                    manifest["git_branch"] = fixture
+
+                rewrite_zip(
+                    original,
+                    forged,
+                    replacements={MANIFEST_MEMBER: manifest_bytes_with_mutation(original, mutate)},
+                )
+                extracted = base / "secret-manifest-extracted"
+                extract_with_modes(forged, extracted)
+
+                zip_errors = VERIFY_MODULE.verify_zip(forged)
+                directory_errors = VERIFY_MODULE.verify_directory(
+                    extracted / "CodexQB",
+                    strict_artifact=True,
+                )
+
+                self.assertIn("package_manifest_secret_content_rejected", zip_errors)
+                self.assertIn("package_manifest_secret_content_rejected", directory_errors)
+                self.assertNotIn(fixture, repr(zip_errors) + repr(directory_errors))
+
+    def test_zip_verifier_rejects_utf16_secret_across_binary_scan_windows(self) -> None:
+        fixture = "sk-" + "W" * 40
+        variants = (
+            ("le", b"\xff\xfe" + fixture.encode("utf-16-le")),
+            ("be", b"\xfe\xff" + fixture.encode("utf-16-be")),
+        )
+        for label, encoded in variants:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+                base = Path(temp_dir)
+                _root, original = create_source_package(base)
+                forged = base / f"forged-{label}.zip"
+                data = b"\x81" * 60 + encoded + b"\x82"
+                append_manifest_bound_file(
+                    original,
+                    forged,
+                    artifact_type="source",
+                    relative_path=f"payload-{label}.bin",
+                    data=data,
+                )
+                with (
+                    mock.patch.object(PACKAGE_SAFETY, "PACKAGE_BINARY_SCAN_WINDOW_BYTES", 64),
+                    mock.patch.object(PACKAGE_SAFETY, "PACKAGE_BINARY_SCAN_OVERLAP_BYTES", 64),
+                ):
+                    errors = VERIFY_MODULE.verify_zip(forged)
+
+                self.assertIn("package_zip_secret_content_rejected", errors)
+                self.assertNotIn(fixture, repr(errors))
+
+    def test_zip_verifier_rejects_manifest_bound_source_credentials(self) -> None:
+        fixture = "this-is-a-real-long-password-value"
+        variants = (
+            ("settings.py", "PASSWORD = " + repr(fixture) + "\n"),
+            ("settings.json", json.dumps({"password": fixture}) + "\n"),
+            ("default.py", "def f(password=" + repr(fixture) + "):\n    pass\n"),
+        )
+        for relative_path, text in variants:
+            with self.subTest(path=relative_path), tempfile.TemporaryDirectory() as temp_dir:
+                base = Path(temp_dir)
+                _root, original = create_source_package(base)
+                forged = base / "forged.zip"
+                append_manifest_bound_file(
+                    original,
+                    forged,
+                    artifact_type="source",
+                    relative_path=relative_path,
+                    data=text.encode("utf-8"),
+                )
+
+                errors = VERIFY_MODULE.verify_zip(forged)
+
+                self.assertIn("package_zip_secret_content_rejected", errors)
+                self.assertNotIn(fixture, repr(errors))
+
+    def test_regular_file_evidence_returns_structured_failure_when_identity_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            payload = root / "payload.txt"
+            payload.write_text("safe\n", encoding="utf-8")
+            identity = VERIFY_MODULE.metadata_identity(payload.stat())
+            changed_identity = (*identity[:-4], identity[-4] + 1, *identity[-3:])
+            root_descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with mock.patch.object(
+                    VERIFY_MODULE,
+                    "metadata_identity",
+                    side_effect=(identity, changed_identity, changed_identity),
+                ):
+                    result = VERIFY_MODULE.regular_file_evidence(
+                        root_descriptor,
+                        payload.name,
+                        1024,
+                    )
+            finally:
+                os.close(root_descriptor)
+
+            self.assertEqual(len(result), 6)
+            digest, total, mode, observed_identity, nested_zip, secret_content = result
+            self.assertIsNone(digest)
+            self.assertEqual(total, len(b"safe\n"))
+            self.assertEqual(mode, "0644")
+            self.assertEqual(observed_identity, changed_identity)
+            self.assertFalse(nested_zip)
+            self.assertFalse(secret_content)
 
     def test_boolean_type_tricks_and_forged_strict_provenance_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
