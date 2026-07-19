@@ -160,12 +160,18 @@ def redact_output(value: str) -> str:
     return SECRET_OUTPUT_RE.sub("<redacted>", value)
 
 
-def run_validator(root: Path, mode: str, strict: bool = False) -> ValidatorResult:
+def run_validator(
+    root: Path, mode: str, strict: bool = False, require_targets_exist: bool = False
+) -> ValidatorResult:
+    # Doc-validation checks well-formedness only unless the opt-in
+    # --require-targets-exist gate (the SAST static I-2 gate) is set, so fixtures
+    # deliberately exercise "proposed" targets that do not exist on disk — the
+    # plan-first CodexQB workflow.
     stdout = io.StringIO()
     stderr = io.StringIO()
     with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
         try:
-            code = VALIDATOR_MODULE.run_validation(root, mode, strict)
+            code = VALIDATOR_MODULE.run_validation(root, mode, strict, require_targets_exist)
         except SystemExit as exc:
             code = int(exc.code or 0) if isinstance(exc.code, int) else 1
     return ValidatorResult(code, stdout.getvalue(), stderr.getvalue())
@@ -176,10 +182,13 @@ def run_validator_cli(
     mode: str,
     strict: bool = False,
     timeout: int = CLI_TIMEOUT_SECONDS,
+    require_targets_exist: bool = False,
 ) -> ValidatorResult:
     command = [sys.executable, str(VALIDATOR), "--root", str(root), "--mode", mode]
     if strict:
         command.append("--strict")
+    if require_targets_exist:
+        command.append("--require-targets-exist")
     try:
         completed = subprocess.run(command, text=True, capture_output=True, check=False, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
@@ -568,6 +577,11 @@ def write_valid_step2_fixture(root: Path, relative_refs: bool = False) -> Path:
     write_index(docs, relative_refs=relative_refs)
     write_subplan(docs / "Faz-1-Plans/Faz1.1-local-contract.md", 1, 1)
     write_subplan(docs / "Faz-2-Plans/Faz2.1-live-gateway.md", 2, 1)
+    # NOTE: intentionally do NOT materialize the validation targets here.  With
+    # existence scoped to execute-time / strict doc-validation, create-time
+    # Apply-run and step4 queue validation accept the "proposed" (not-yet-written)
+    # targets — this fixture must exercise that plan-first path.  Strict VPD tests
+    # get their targets materialized by run_validator/run_validator_cli instead.
     return docs
 
 
@@ -1120,6 +1134,56 @@ class ValidatePlannerDocsTests(unittest.TestCase):
                 result = run_validator(root, "step2", strict=True)
 
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_strict_step2_accepts_repo_bound_vitest_validation_profile(self) -> None:
+        canonical = json.dumps(
+            ["python3", "-B", "-m", "pytest", "-p", "no:cacheprovider", "tests/test_feature_1_1.py", "-q"]
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            docs = write_valid_step2_fixture(root)
+            # The hardened target check requires a real regular-file `.test.ts`.
+            (root / "tests").mkdir(exist_ok=True)
+            (root / "tests" / "example.test.ts").write_text("// test\n", encoding="utf-8")
+            subplan = docs / "Faz-1-Plans" / "Faz1.1-local-contract.md"
+            text = subplan.read_text(encoding="utf-8")
+            self.assertIn(canonical, text)
+            subplan.write_text(
+                text.replace(canonical, json.dumps(["vitest", "run", "tests/example.test.ts"])),
+                encoding="utf-8",
+            )
+
+            result = run_validator(root, "step2", strict=True)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_require_targets_exist_flag_is_the_sast_static_i2_gate(self) -> None:
+        # The dedicated --require-targets-exist flag (SAST static I-2 gate) rejects
+        # nonexistent validation targets; WITHOUT it, plan-first validation (goal
+        # compile, create_apply_run) accepts still-"proposed" targets, so --strict
+        # alone never demands existence.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            # write_valid_step2_fixture references tests/test_feature_{1_1,2_1}.py
+            # WITHOUT materializing them — i.e. proposed, plan-first targets.
+            write_valid_step2_fixture(root)
+
+            plan_first = run_validator(root, "step2", strict=True)
+            self.assertEqual(plan_first.returncode, 0, plan_first.stdout + plan_first.stderr)
+
+            sast_gate = run_validator(root, "step2", strict=True, require_targets_exist=True)
+            self.assertNotEqual(sast_gate.returncode, 0, sast_gate.stdout + sast_gate.stderr)
+            self.assertIn(
+                "subplan_missing_exact_validation_command=Planner-docs/Faz-1-Plans/Faz1.1-local-contract.md",
+                sast_gate.stdout,
+            )
+
+            # Once the referenced targets exist, the SAST gate accepts them.
+            (root / "tests").mkdir(exist_ok=True)
+            for name in ("test_feature_1_1.py", "test_feature_2_1.py"):
+                (root / "tests" / name).write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+            post_impl = run_validator(root, "step2", strict=True, require_targets_exist=True)
+            self.assertEqual(post_impl.returncode, 0, post_impl.stdout + post_impl.stderr)
 
     def test_strict_step2_rejects_mutating_validation_command_intent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

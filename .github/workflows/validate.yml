@@ -62,12 +62,21 @@ jobs:
         run: make check-schema
 
   behavior:
-    name: behavior / Python ${{ matrix.python-version }}
-    runs-on: ubuntu-24.04
+    name: behavior / ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
+        include:
+          - os: ubuntu-24.04
+            python-version: "3.12"
+          - os: ubuntu-24.04
+            python-version: "3.13"
+          # macos-15 exercises the sandbox-exec seatbelt path for the
+          # js_validation profile (deny network* + repo-write-deny), which the
+          # Linux-only lane cannot cover.
+          - os: macos-15
+            python-version: "3.13"
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -75,6 +84,10 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
+      # Node is required by the JavaScript-validation behavior tests; GitHub's
+      # ubuntu-24.04 and macos-15 runners ship a modern Node on PATH.
+      - name: Report Node availability
+        run: node --version
       - name: Run Goal and Apply behavior gates
         run: make check-behavior
 

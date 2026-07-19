@@ -219,6 +219,37 @@ class EvidenceContractsTests(unittest.TestCase):
         tampered_mac[EVIDENCE.RECEIPT_MAC_FIELD] = sha("0")
         self.assertFalse(EVIDENCE.verify_validation_receipt(tampered_mac, MASTER_KEY))
 
+    def test_validation_receipt_accepts_js_network_enforcement_proofs(self) -> None:
+        # The JS validation profile kernel-denies outbound INET sockets, so a
+        # validation receipt may promote `network_enforcement_proof` to a
+        # recognized enforced value while every other proof stays not_observed.
+        for proof in (
+            EVIDENCE.ENFORCED_SECCOMP_INET_DENY,
+            EVIDENCE.ENFORCED_SEATBELT_DENY_NETWORK,
+        ):
+            with self.subTest(proof=proof):
+                payload = validation_receipt()
+                payload["network_enforcement_proof"] = proof
+                self.assertEqual([], EVIDENCE.validation_receipt_errors(payload, require_mac=False))
+                signed = EVIDENCE.sign_validation_receipt(payload, MASTER_KEY)
+                self.assertEqual([], EVIDENCE.validation_receipt_errors(signed))
+                self.assertTrue(EVIDENCE.verify_validation_receipt(signed, MASTER_KEY))
+
+        # The other two proof fields stay fail-closed even on a validation receipt.
+        for field in ("host_sandbox_proof", "approval_proof"):
+            with self.subTest(field=field):
+                payload = validation_receipt()
+                payload[field] = EVIDENCE.ENFORCED_SEATBELT_DENY_NETWORK
+                self.assertIn(f"invalid_nonclaim={field}", EVIDENCE.validation_receipt_errors(payload, require_mac=False))
+
+        # Review-completion receipts may never claim network enforcement.
+        review = review_completion_receipt()
+        review["network_enforcement_proof"] = EVIDENCE.ENFORCED_SECCOMP_INET_DENY
+        self.assertIn(
+            "invalid_nonclaim=network_enforcement_proof",
+            EVIDENCE.review_completion_receipt_errors(review, require_mac=False),
+        )
+
     def test_review_receipt_sign_verify_and_hmac_domains_are_separate(self) -> None:
         payload = review_completion_receipt()
         self.assertEqual([], EVIDENCE.review_completion_receipt_errors(payload, require_mac=False))

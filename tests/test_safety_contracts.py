@@ -1038,6 +1038,9 @@ class SafetyContractsTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            # Default (create-time / plan-first) validation checks well-formedness
+            # only — the "proposed" targets need not exist yet; existence is gated
+            # on require_target_exists (execute time / strict doc-validation).
             for argv in positive:
                 with self.subTest(argv=argv):
                     self.assertTrue(SAFETY.safe_validation_command_item(command(argv), root=root))
@@ -1045,6 +1048,145 @@ class SafetyContractsTests(unittest.TestCase):
             evidence = command(positive[0], exit_code=0, output_sha256=OUTPUT_SHA256)
             self.assertFalse(SAFETY.safe_validation_command_item(evidence, root=root))
             self.assertTrue(SAFETY.safe_validation_command_item(evidence, root=root, evidence=True))
+
+    def test_validation_target_existence_is_scoped_to_execute_and_strict(self) -> None:
+        # I-2 (scoped): well-formedness by default (plan-first "proposed" targets
+        # need not exist at create time); existence is enforced only when
+        # require_target_exists=True — execute time and strict doc-validation,
+        # which is exactly where I-2 is closed.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "tests").mkdir()
+            # Default: a well-formed but nonexistent target is accepted (proposed).
+            self.assertTrue(SAFETY._safe_validation_target("tests/missing.py", root=root, cwd="."))
+            # require_target_exists: the same nonexistent target is rejected (I-2).
+            self.assertFalse(
+                SAFETY._safe_validation_target(
+                    "tests/missing.py", root=root, cwd=".", require_target_exists=True
+                )
+            )
+            (root / "tests" / "present.py").write_text(
+                "def test_ok():\n    assert True\n", encoding="utf-8"
+            )
+            self.assertTrue(
+                SAFETY._safe_validation_target(
+                    "tests/present.py", root=root, cwd=".", require_target_exists=True
+                )
+            )
+            # A directory is a valid pytest/ruff/unittest target under the gate,
+            # but rejected when a regular file is required (vitest).
+            self.assertTrue(
+                SAFETY._safe_validation_target("tests", root=root, cwd=".", require_target_exists=True)
+            )
+            self.assertFalse(
+                SAFETY._safe_validation_target(
+                    "tests", root=root, cwd=".", require_regular_file=True, require_target_exists=True
+                )
+            )
+            # Through the command item: a nonexistent pytest target passes create-time
+            # validation (default) but fails the execute/strict existence gate.
+            cmd = command(
+                ["python3", "-B", "-m", "pytest", "-p", "no:cacheprovider", "tests/missing.py", "-q"]
+            )
+            self.assertTrue(SAFETY.safe_validation_command_item(cmd, root=root))
+            self.assertFalse(
+                SAFETY.safe_validation_command_item(cmd, root=root, require_target_exists=True)
+            )
+
+    def test_structured_validation_accepts_repo_bound_vitest_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "tests").mkdir()
+            (root / "tests" / "example.test.ts").write_text("// t\n", encoding="utf-8")
+            (root / "tests" / "second.spec.tsx").write_text("// t\n", encoding="utf-8")
+            web_tests = root / "apps" / "web" / "tests"
+            web_tests.mkdir(parents=True)
+            (web_tests / "unit.test.ts").write_text("// t\n", encoding="utf-8")
+            positive = [
+                (["vitest", "run"], "."),
+                (["vitest", "run", "tests/example.test.ts"], "."),
+                (["vitest", "run", "tests/example.test.ts", "tests/second.spec.tsx"], "."),
+                (["vitest", "run", "tests/unit.test.ts"], "apps/web"),
+            ]
+            for argv, cwd in positive:
+                with self.subTest(argv=argv, cwd=cwd):
+                    self.assertTrue(
+                        SAFETY.safe_validation_command_item(command(argv, cwd=cwd), root=root)
+                    )
+
+    def test_structured_validation_rejects_unsafe_vitest_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "tests").mkdir()
+            (root / "tests" / "example.test.ts").write_text("// t\n", encoding="utf-8")
+            (root / "package.json").write_text("{}\n", encoding="utf-8")
+            (root / "weird.test.ts").mkdir()  # a directory shaped like a test file
+            unsafe = [
+                ["vitest"],  # missing run subcommand
+                ["vitest", "build"],  # wrong subcommand
+                ["vitest", "test"],  # wrong subcommand
+                ["vitest", "run", "--watch"],
+                ["vitest", "run", "-w"],
+                ["vitest", "run", "--update"],
+                ["vitest", "run", "-u"],
+                ["vitest", "run", "--outputFile", "reports/results.json"],
+                ["vitest", "run", "--config", "vitest.config.ts"],
+                ["vitest", "run", "--reporter=json"],
+                ["vitest", "run", "--"],  # bare double dash, no targets
+                ["vitest", "run", "--silent"],
+                ["vitest", "run", "--prefix", "apps/web"],
+                ["vitest", "run", "tests"],  # directory target (fails the regex)
+                ["vitest", "run", "package.json"],  # non-test regular file
+                ["vitest", "run", "../outside.test.ts"],  # escapes the repo
+                ["vitest", "run", "tests/example.js"],  # not a .test/.spec file
+            ]
+            for argv in unsafe:
+                with self.subTest(argv=argv):
+                    self.assertFalse(
+                        SAFETY.safe_validation_command_item(command(argv), root=root)
+                    )
+
+    def test_structured_validation_gates_nonexistent_or_dir_vitest_targets_on_existence(self) -> None:
+        # `tests/missing.test.ts` (nonexistent) and a directory shaped like a
+        # `.test.ts` are WELL-FORMED, so they pass create-time validation but are
+        # rejected once existence + regular-file are required (execute/strict).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "tests").mkdir()
+            (root / "tests" / "example.test.ts").write_text("// t\n", encoding="utf-8")
+            (root / "weird.test.ts").mkdir()  # directory shaped like a target
+            for argv in (
+                ["vitest", "run", "tests/missing.test.ts"],
+                ["vitest", "run", "weird.test.ts"],
+            ):
+                with self.subTest(argv=argv):
+                    self.assertTrue(SAFETY.safe_validation_command_item(command(argv), root=root))
+                    self.assertFalse(
+                        SAFETY.safe_validation_command_item(
+                            command(argv), root=root, require_target_exists=True
+                        )
+                    )
+            # An existing regular `.test.ts` is accepted under the existence gate.
+            self.assertTrue(
+                SAFETY.safe_validation_command_item(
+                    command(["vitest", "run", "tests/example.test.ts"]),
+                    root=root,
+                    require_target_exists=True,
+                )
+            )
+
+    def test_structured_validation_rejects_vitest_when_node_is_shadowed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "tests").mkdir()
+            (root / "tests" / "example.test.ts").write_text("// t\n", encoding="utf-8")
+            (root / "node").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            self.assertFalse(
+                SAFETY.safe_validation_command_item(
+                    command(["vitest", "run", "tests/example.test.ts"]), root=root
+                ),
+                "a repo-local `node` shadow must fail the vitest runner closed",
+            )
 
     def test_structured_validation_rejects_mutation_output_and_opaque_command_profiles(self) -> None:
         unsafe_argv = [

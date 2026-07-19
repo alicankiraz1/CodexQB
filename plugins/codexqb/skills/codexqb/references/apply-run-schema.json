@@ -1575,9 +1575,17 @@
         "issued_at": { "$ref": "#/$defs/IsoTimestamp" },
         "observer": { "const": "codexqb_controller" },
         "observation_scope": { "const": "controller_observed_process_result_and_local_hashes" },
-        "host_sandbox_proof": { "const": "not_observed" },
+        "host_sandbox_proof": {
+          "enum": [
+            "not_observed",
+            "enforced_seatbelt_repo_write_deny",
+            "enforced_landlock_repo_write_deny"
+          ]
+        },
         "approval_proof": { "const": "not_observed" },
-        "network_enforcement_proof": { "const": "not_observed" },
+        "network_enforcement_proof": {
+          "enum": ["not_observed", "enforced_seccomp_inet_deny", "enforced_seatbelt_deny_network"]
+        },
         "run_binding": { "$ref": "#/$defs/RunBinding" },
         "task_binding": { "$ref": "#/$defs/TaskBinding" },
         "producer_binding": { "$ref": "#/$defs/ProducerBinding" },

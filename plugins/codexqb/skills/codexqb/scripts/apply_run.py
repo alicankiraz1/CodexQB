@@ -71,6 +71,10 @@ from artifact_io import (  # noqa: E402
 )
 from evidence_contracts import (  # noqa: E402
     CONTROLLER_OBSERVER,
+    ENFORCED_LANDLOCK_REPO_WRITE_DENY,
+    ENFORCED_SEATBELT_DENY_NETWORK,
+    ENFORCED_SEATBELT_REPO_WRITE_DENY,
+    ENFORCED_SECCOMP_INET_DENY,
     NOT_OBSERVED,
     REVIEW_COMPLETION_OBSERVATION_SCOPE,
     REVIEW_COMPLETION_RECEIPT_KIND,
@@ -130,6 +134,45 @@ WORKSPACE_INVENTORY_TIMEOUT_SECONDS = DEFAULT_WORKSPACE_INVENTORY_TIMEOUT_SECOND
 MACOS_VALIDATION_SANDBOX = Path("/usr/bin/sandbox-exec")
 MACOS_VALIDATION_SANDBOX_PROFILE = (
     "(version 1)(allow default)(deny process-fork)"
+)
+# JavaScript (Vitest) validation profile.  Unlike the pytest/unittest profile,
+# it PERMITS bounded child spawning (node worker threads plus real child
+# processes such as git/bash/python3) but ENFORCES network denial at the kernel
+# level (macOS seatbelt ``(deny network*)`` / Linux seccomp INET-socket denial)
+# and denies repository writes (macOS seatbelt file-write-deny; Linux Landlock
+# best-effort backed by the post-hoc repository-digest compare).
+VITEST_LOGICAL_RUNNER = "vitest"
+VITEST_RUNNER_RELPATH = "node_modules/vitest/vitest.mjs"
+NODE_INTERPRETER = "node"
+# Candidate Vitest/Vite config filenames, resolved by descriptor under the
+# pinned cwd; the first that exists as a regular file is descriptor-pinned and
+# passed via ``--config``.
+VITEST_CONFIG_CANDIDATES = (
+    "vitest.config.ts",
+    "vitest.config.mts",
+    "vitest.config.cts",
+    "vitest.config.js",
+    "vitest.config.mjs",
+    "vitest.config.cjs",
+    "vite.config.ts",
+    "vite.config.mts",
+    "vite.config.cts",
+    "vite.config.js",
+    "vite.config.mjs",
+    "vite.config.cjs",
+)
+# Executor-injected Vitest flags (the planner supplies none).  ``--no-cache``
+# stops Vitest writing ``node_modules/.vite/vitest/results.json`` into the
+# repository (which the repo-write-deny profile forbids); ``--pool=threads``
+# with ``--no-file-parallelism`` pins deterministic in-process execution.
+VITEST_INJECTED_RUN_FLAGS = (
+    "run",
+    "--root",
+    ".",
+    "--pool=threads",
+    "--no-file-parallelism",
+    "--reporter=default",
+    "--no-cache",
 )
 LINUX_CLONE_THREAD = 0x00010000
 
@@ -6089,6 +6132,8 @@ class ValidationProcessResult:
     timed_out: bool
     output_limit_exceeded: bool
     termination_reason: str
+    network_enforcement_proof: str = NOT_OBSERVED
+    host_sandbox_proof: str = NOT_OBSERVED
 
 
 def validation_subprocess_environment(root: Path) -> dict[str, str]:
@@ -6215,13 +6260,329 @@ def _linux_validation_seccomp_spec() -> tuple[int, list[_SockFilter]]:
     return audit_arch, instructions
 
 
+def _js_validation_seccomp_spec() -> tuple[int, list[_SockFilter]]:
+    """Return an architecture-bound filter that permits spawning but denies egress.
+
+    The JavaScript validation profile inverts the pytest model: ``fork``,
+    ``vfork``, ``clone`` and ``clone3`` are all allowed (node's runtime and real
+    child processes such as git/bash/python3 must spawn).  Network egress is
+    denied at the *syscall* level with ``EACCES`` (never KILL — libuv must see
+    the errno and fall back to its threadpool):
+
+    * ``socket(domain, ...)`` is denied whenever ``domain`` is ``AF_UNIX`` (1),
+      ``AF_INET`` (2) or ``AF_INET6`` (10).  Denying ``AF_UNIX`` closes the
+      "connect to a local resolver / proxy / docker.sock to exfiltrate" path;
+      ``socketpair()`` is a *separate* syscall (allowed by the terminal ALLOW),
+      so fork/thread IPC is unaffected.  ``AF_NETLINK`` (16) stays allowed
+      (kernel-local; some libc resolvers enumerate interfaces).
+    * ``io_uring_setup`` (425), ``io_uring_enter`` (426) and
+      ``io_uring_register`` (427) are denied so a target cannot drive
+      ``IORING_OP_SOCKET``/``CONNECT``/``SEND`` to reach the network with zero
+      ``socket()`` calls (same numbers on x86_64 and aarch64).
+
+    The filter is inherited across ``fork``/``exec`` (installed with
+    ``NO_NEW_PRIVS``), so every descendant is equally unable to open an egress
+    socket or an io_uring ring.  An unexpected ABI is killed, not reinterpreted.
+    """
+
+    if not sys.platform.startswith("linux") or not hasattr(os, "uname"):
+        raise ValueError("secure_js_validation_isolation_not_supported")
+    machine = os.uname().machine.lower()
+    specs: dict[str, tuple[int, int, bool]] = {
+        "x86_64": (0xC000003E, 41, True),
+        "amd64": (0xC000003E, 41, True),
+        "aarch64": (0xC00000B7, 198, False),
+        "arm64": (0xC00000B7, 198, False),
+    }
+    spec = specs.get(machine)
+    if spec is None:
+        raise ValueError("secure_js_validation_isolation_not_supported")
+    audit_arch, socket_nr, reject_x32 = spec
+
+    load_word_absolute = 0x20
+    jump_equal = 0x15
+    jump_bits_set = 0x45
+    return_constant = 0x06
+    seccomp_kill_process = 0x80000000
+    seccomp_errno = 0x00050000
+    seccomp_allow = 0x7FFF0000
+    af_unix = 1
+    af_inet = 2
+    af_inet6 = 10
+    io_uring_setup, io_uring_enter, io_uring_register = 425, 426, 427
+    # seccomp_data layout: nr@0, arch@4, args[0] low word @16.
+    instructions: list[_SockFilter] = [
+        _SockFilter(load_word_absolute, 0, 0, 4),
+        _SockFilter(jump_equal, 1, 0, audit_arch),
+        _SockFilter(return_constant, 0, 0, seccomp_kill_process),
+        _SockFilter(load_word_absolute, 0, 0, 0),
+    ]
+    if reject_x32:
+        # x32 shares AUDIT_ARCH_X86_64 but sets bit 30 on syscall numbers.
+        instructions.extend(
+            [
+                _SockFilter(jump_bits_set, 0, 1, 0x40000000),
+                _SockFilter(return_constant, 0, 0, seccomp_kill_process),
+            ]
+        )
+    # Fixed tail layout (indices relative to `base`, the first io_uring check):
+    #   +0 JEQ io_uring_setup     -> DENY
+    #   +1 JEQ io_uring_enter     -> DENY
+    #   +2 JEQ io_uring_register  -> DENY
+    #   +3 JEQ socket_nr          -> fall through (domain check); else ALLOW_ns
+    #   +4 LD  args[0]
+    #   +5 JEQ AF_UNIX            -> DENY
+    #   +6 JEQ AF_INET           -> DENY
+    #   +7 JEQ AF_INET6          -> DENY
+    #   +8 RET ALLOW              (socket, non-egress domain e.g. AF_NETLINK)
+    #   +9 RET EACCES             (DENY: io_uring or egress socket)
+    #  +10 RET ALLOW              (ALLOW_ns: every other syscall)
+    base = len(instructions)
+    deny_index = base + 9
+    allow_ns_index = base + 10
+    instructions.extend(
+        [
+            _SockFilter(jump_equal, deny_index - (base + 0) - 1, 0, io_uring_setup),
+            _SockFilter(jump_equal, deny_index - (base + 1) - 1, 0, io_uring_enter),
+            _SockFilter(jump_equal, deny_index - (base + 2) - 1, 0, io_uring_register),
+            _SockFilter(jump_equal, 0, allow_ns_index - (base + 3) - 1, socket_nr),
+            _SockFilter(load_word_absolute, 0, 0, 16),
+            _SockFilter(jump_equal, deny_index - (base + 5) - 1, 0, af_unix),
+            _SockFilter(jump_equal, deny_index - (base + 6) - 1, 0, af_inet),
+            _SockFilter(jump_equal, deny_index - (base + 7) - 1, 0, af_inet6),
+            _SockFilter(return_constant, 0, 0, seccomp_allow),  # AF_NETLINK / other
+            _SockFilter(return_constant, 0, 0, seccomp_errno | errno.EACCES),  # DENY
+            _SockFilter(return_constant, 0, 0, seccomp_allow),  # every non-socket syscall
+        ]
+    )
+    return audit_arch, instructions
+
+
+def _macos_js_validation_profile(root: Path) -> str:
+    """Build the sandbox-exec seatbelt profile for JavaScript validation.
+
+    Spawning is permitted (``allow default``); all network is denied; and every
+    write under the realpath of the repository root is denied (tmpdir writes,
+    which live outside the repo, remain allowed).  When ``.git`` is a GITFILE
+    (linked worktree/submodule), the EXTERNAL gitdir lives outside the root but
+    its ``hooks/``/``config`` execute against this tree — so it is denied too,
+    otherwise a target could plant a hook there and escape the sandbox.  Every
+    path is escaped for the seatbelt string literal.
+    """
+
+    def _escape(value: str) -> str:
+        return value.replace("\\", "\\\\").replace('"', '\\"')
+
+    resolved = os.path.realpath(root)
+    denies = [f'(deny file-write* (subpath "{_escape(resolved)}"))']
+    resolved_prefix = resolved.rstrip(os.sep) + os.sep
+    for git_dir in _resolve_git_control_surface_dirs(lexical_absolute(root)):
+        git_real = os.path.realpath(git_dir)
+        # Only add EXTERNAL gitdirs; an in-tree ``.git`` dir is already covered by
+        # the root subpath deny above.
+        if git_real == resolved or git_real.startswith(resolved_prefix):
+            continue
+        denies.append(f'(deny file-write* (subpath "{_escape(git_real)}"))')
+    return (
+        "(version 1)"
+        "(allow default)"
+        "(deny network*)"
+        + "".join(denies)
+    )
+
+
+def _linux_landlock_abi() -> int:
+    """Return the Landlock ABI version (>=1) or 0 when unavailable. Best-effort.
+
+    ``landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)`` reports
+    the ABI without creating a ruleset; -ENOSYS / any error maps to 0.
+    """
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        syscall = libc.syscall
+        syscall.restype = ctypes.c_long
+        landlock_create_ruleset_version = 1
+        abi = syscall(
+            ctypes.c_long(444),
+            None,
+            ctypes.c_size_t(0),
+            ctypes.c_uint32(landlock_create_ruleset_version),
+        )
+        return int(abi) if abi and abi > 0 else 0
+    except (OSError, AttributeError, ValueError):
+        return 0
+
+
+def _install_linux_validation_landlock_best_effort(root: Path) -> None:
+    """Restrict filesystem writes to outside the repository, if Landlock exists.
+
+    This is defense-in-depth only: absence or failure is non-fatal because the
+    post-hoc repository-digest compare (which for validation includes the VCS
+    control dirs) is the authoritative repo-write control.  Any error silently
+    leaves that digest backstop in force.
+    """
+
+    try:
+        abi = _linux_landlock_abi()
+        if abi < 1:
+            return
+        libc = ctypes.CDLL(None, use_errno=True)
+        # Landlock syscalls share these numbers on x86_64 and aarch64.
+        nr_create, nr_add_rule, nr_restrict = 444, 445, 446
+
+        class _RulesetAttr(ctypes.Structure):
+            _fields_ = [("handled_access_fs", ctypes.c_uint64)]
+
+        class _PathBeneathAttr(ctypes.Structure):
+            _fields_ = [
+                ("allowed_access", ctypes.c_uint64),
+                ("parent_fd", ctypes.c_int32),
+            ]
+
+        syscall = libc.syscall
+        syscall.restype = ctypes.c_long
+
+        # *Write-shaped* access rights ONLY (never READ_FILE/READ_DIR/EXECUTE):
+        # WRITE_FILE(1), REMOVE_DIR(4), REMOVE_FILE(5), MAKE_CHAR(6), MAKE_DIR(7),
+        # MAKE_REG(8), MAKE_SOCK(9), MAKE_FIFO(10), MAKE_BLOCK(11), MAKE_SYM(12).
+        # Handling only write rights leaves reads/executes unaffected everywhere,
+        # so node can still read node_modules.  REFER(13, ABI>=2) closes the
+        # cross-directory rename()/link() route into the repo; TRUNCATE(14,
+        # ABI>=3) closes truncate()-based modification of repo files.  Both are
+        # added only when the running kernel supports them (else the ruleset
+        # create would EINVAL and drop us to the digest backstop).
+        handled = 0
+        for bit in (1, 4, 5, 6, 7, 8, 9, 10, 11, 12):
+            handled |= 1 << bit
+        if abi >= 2:
+            handled |= 1 << 13  # LANDLOCK_ACCESS_FS_REFER
+        if abi >= 3:
+            handled |= 1 << 14  # LANDLOCK_ACCESS_FS_TRUNCATE
+        attr = _RulesetAttr(handled)
+        ruleset_fd = syscall(
+            ctypes.c_long(nr_create),
+            ctypes.byref(attr),
+            ctypes.c_size_t(ctypes.sizeof(attr)),
+            ctypes.c_uint32(0),
+        )
+        if ruleset_fd < 0:
+            return
+        # Landlock rejects (EINVAL) a path_beneath rule on a *file* whose
+        # allowed_access includes directory-only rights (MAKE_*/REMOVE_*/REFER),
+        # silently dropping the rule.  So grant directories the full handled set
+        # but grant device FILES only the file-applicable rights.
+        file_access = 1 << 1  # WRITE_FILE
+        if abi >= 3:
+            file_access |= 1 << 14  # TRUNCATE
+        try:
+            for writable in _js_validation_landlock_writable_paths():
+                path_fd = -1
+                try:
+                    access = handled if os.path.isdir(writable) else file_access
+                    path_fd = os.open(writable, os.O_PATH if hasattr(os, "O_PATH") else os.O_RDONLY)
+                    rule = _PathBeneathAttr(access, path_fd)
+                    syscall(
+                        ctypes.c_long(nr_add_rule),
+                        ctypes.c_int(int(ruleset_fd)),
+                        ctypes.c_uint32(1),  # LANDLOCK_RULE_PATH_BENEATH
+                        ctypes.byref(rule),
+                        ctypes.c_uint32(0),
+                    )
+                except OSError:
+                    continue
+                finally:
+                    if path_fd >= 0:
+                        os.close(path_fd)
+            pr_set_no_new_privs = 38
+            libc.prctl(pr_set_no_new_privs, 1, 0, 0, 0)
+            syscall(
+                ctypes.c_long(nr_restrict),
+                ctypes.c_int(int(ruleset_fd)),
+                ctypes.c_uint32(0),
+            )
+        finally:
+            os.close(int(ruleset_fd))
+    except (OSError, AttributeError, ValueError):
+        return
+
+
+def _js_validation_landlock_writable_paths() -> list[str]:
+    # Only what child processes actually need to WRITE, all OUTSIDE any repo:
+    # the OS temporary directories plus a few character devices (git/bash/node
+    # open /dev/null and friends for write).  Broad /proc and /dev grants are
+    # deliberately dropped.  Reads/executes are never in the handled set, so
+    # they remain permitted everywhere regardless of this allowlist.
+    candidates = [
+        os.environ.get("TMPDIR"),
+        "/tmp",
+        "/var/tmp",
+        "/dev/null",
+        "/dev/zero",
+        "/dev/full",
+        "/dev/tty",
+        "/dev/random",
+        "/dev/urandom",
+    ]
+    seen: set[str] = set()
+    paths: list[str] = []
+    for value in candidates:
+        if not value or not os.path.exists(value):
+            continue
+        real = os.path.realpath(value)
+        if real not in seen:
+            seen.add(real)
+            paths.append(real)
+    return paths
+
+
+def _open_validation_regular_file_fd(cwd_fd: int, relpath: str) -> tuple[int, os.stat_result]:
+    """Open ``relpath`` beneath ``cwd_fd`` with no symlink component, as a file.
+
+    Walks each path component with ``O_NOFOLLOW`` directory opens and opens the
+    final component ``O_RDONLY|O_NOFOLLOW`` as a regular file, returning the
+    held descriptor (CLOEXEC) and its stat metadata for inode-equality binding.
+    """
+
+    parts = [part for part in relpath.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError("validation_js_target_invalid")
+    intermediate: list[int] = []
+    current = cwd_fd
+    try:
+        for name in parts[:-1]:
+            child_fd, _ = open_child_directory(current, name)
+            intermediate.append(child_fd)
+            current = child_fd
+        leaf = parts[-1]
+        before = os.stat(leaf, dir_fd=current, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("validation_js_target_not_regular_file")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        file_fd = os.open(leaf, flags, dir_fd=current)
+        try:
+            after = os.fstat(file_fd)
+        except OSError:
+            os.close(file_fd)
+            raise
+        if not stat.S_ISREG(after.st_mode) or not same_file_identity(before, after):
+            os.close(file_fd)
+            raise ValueError("validation_js_target_identity_changed")
+        return file_fd, after
+    finally:
+        for fd in intermediate:
+            os.close(fd)
+
+
 def _install_linux_validation_process_filter(
     expected_audit_arch: int,
     instructions: list[_SockFilter],
+    *,
+    spec_fn=_linux_validation_seccomp_spec,
 ) -> None:
     """Install the already architecture-checked seccomp filter in the child."""
 
-    current_arch, expected_instructions = _linux_validation_seccomp_spec()
+    current_arch, expected_instructions = spec_fn()
     if current_arch != expected_audit_arch or [
         (item.code, item.jt, item.jf, item.k) for item in expected_instructions
     ] != [(item.code, item.jt, item.jf, item.k) for item in instructions]:
@@ -6257,8 +6618,20 @@ def _install_linux_validation_process_filter(
 
 def _validation_containment_command(
     argv: list[str],
-) -> tuple[list[str], tuple[int, list[_SockFilter]] | None]:
-    """Bind validation to a host mechanism that prevents descendant escape."""
+    *,
+    js_profile: bool = False,
+    root: Path | None = None,
+) -> tuple[list[str], tuple[int, list[_SockFilter]] | None, str, str]:
+    """Bind validation to a host mechanism that prevents descendant escape.
+
+    Returns ``(contained_argv, linux_seccomp_spec_or_None,
+    network_enforcement_proof, host_sandbox_proof)``.  For the JavaScript profile
+    (``js_profile``) spawning is permitted while network is kernel-denied; the
+    proofs record the real enforcement — ``host_sandbox_proof`` states whether
+    repo writes are *preventively* denied (seatbelt on macOS; Landlock on Linux
+    when the kernel supports it) or only caught by the post-hoc digest backstop.
+    The non-JS profile makes no such claims.
+    """
 
     if sys.platform == "darwin":
         try:
@@ -6271,18 +6644,44 @@ def _validation_containment_command(
             or stat.S_IMODE(metadata.st_mode) & 0o022
         ):
             raise ValueError("secure_validation_process_isolation_not_supported")
+        if js_profile:
+            if root is None:
+                raise ValueError("secure_js_validation_isolation_not_supported")
+            profile = _macos_js_validation_profile(root)
+            network_proof = ENFORCED_SEATBELT_DENY_NETWORK
+            host_sandbox_proof = ENFORCED_SEATBELT_REPO_WRITE_DENY
+        else:
+            profile = MACOS_VALIDATION_SANDBOX_PROFILE
+            network_proof = NOT_OBSERVED
+            host_sandbox_proof = NOT_OBSERVED
         return (
-            [
-                str(MACOS_VALIDATION_SANDBOX),
-                "-p",
-                MACOS_VALIDATION_SANDBOX_PROFILE,
-                *argv,
-            ],
+            [str(MACOS_VALIDATION_SANDBOX), "-p", profile, *argv],
             None,
+            network_proof,
+            host_sandbox_proof,
         )
     if sys.platform.startswith("linux"):
-        return list(argv), _linux_validation_seccomp_spec()
-    raise ValueError("secure_validation_process_isolation_not_supported")
+        if js_profile:
+            # The JS profile PERMITS spawning, so seccomp alone cannot stop a
+            # descendant from writing the tree.  Repo-write PREVENTION therefore
+            # relies on Landlock.  Without it, an unconfined target could forge a
+            # MAC'd success receipt into ``.codexqb/`` BEFORE the post-hoc digest
+            # ever runs, so the digest backstop is not a sufficient substitute —
+            # fail closed: do not execute and publish no receipt.
+            if _linux_landlock_abi() < 1:
+                raise ValueError("secure_js_validation_isolation_not_supported")
+            return (
+                list(argv),
+                _js_validation_seccomp_spec(),
+                ENFORCED_SECCOMP_INET_DENY,
+                ENFORCED_LANDLOCK_REPO_WRITE_DENY,
+            )
+        return list(argv), _linux_validation_seccomp_spec(), NOT_OBSERVED, NOT_OBSERVED
+    raise ValueError(
+        "secure_js_validation_isolation_not_supported"
+        if js_profile
+        else "secure_validation_process_isolation_not_supported"
+    )
 
 
 def _terminate_validation_process(process: subprocess.Popen[bytes]) -> None:
@@ -6300,16 +6699,102 @@ def _terminate_validation_process(process: subprocess.Popen[bytes]) -> None:
             pass
 
 
+def _linux_session_member_pids(session_id: int) -> list[int]:
+    """PIDs whose session id equals ``session_id`` (Linux ``/proc`` sweep, else [])."""
+
+    if not sys.platform.startswith("linux"):
+        return []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return []
+    pids: list[int] = []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", "rb") as handle:
+                data = handle.read()
+        except OSError:
+            continue
+        # `pid (comm) state ppid pgrp session ...` — comm may contain spaces and
+        # parentheses, so parse the fields AFTER the final ')'.
+        rparen = data.rfind(b")")
+        if rparen == -1:
+            continue
+        fields = data[rparen + 2 :].split()
+        if len(fields) < 4:
+            continue
+        try:
+            if int(fields[3]) == session_id:
+                pids.append(int(entry))
+        except ValueError:
+            continue
+    return pids
+
+
+def _reap_validation_process_tree(
+    process: subprocess.Popen[bytes], *, rounds: int = 5, pause: float = 0.05
+) -> None:
+    """Best-effort SIGKILL of the validation's whole process group/session.
+
+    ``start_new_session=True`` makes the leader a session+group leader, so
+    ``killpg(leader)`` reaps children that stayed in that group.  A descendant that
+    calls ``setpgid()`` moves to a NEW group in the SAME session; on Linux we
+    additionally sweep ``/proc`` by session id to reap those before the caller
+    takes its post-run snapshot, so a straggler cannot mutate the tree AFTER the
+    snapshot is captured.
+
+    RESIDUAL: a descendant that calls ``setsid()`` starts a brand-new session and,
+    once its ancestors exit, becomes an orphan reparented to init with no reliable
+    back-link — unavoidable for a spawning profile, and unreachable on macOS
+    (no ``/proc``).  Such an orphan still inherited the seccomp filter under
+    NO_NEW_PRIVS (INET/AF_UNIX/io_uring denied — it cannot exfiltrate), and any
+    repo write it manages before the after-snapshot is caught by the
+    content-inclusive control-surface digest, which fails the validation closed.
+    """
+
+    if os.name != "posix":
+        return
+    leader = process.pid
+    for _ in range(max(1, rounds)):
+        killed_any = False
+        try:
+            os.killpg(leader, signal.SIGKILL)
+            killed_any = True
+        except (ProcessLookupError, OSError):
+            pass
+        for pid in _linux_session_member_pids(leader):
+            if pid == leader:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed_any = True
+            except (ProcessLookupError, OSError):
+                pass
+        if not killed_any:
+            break
+        time.sleep(pause)
+
+
 def _validation_child_setup(
     cwd_fd: int,
     linux_seccomp: tuple[int, list[_SockFilter]] | None,
+    *,
+    js_profile: bool = False,
+    root: Path | None = None,
 ) -> None:
     """Enter the anchored cwd and enable process containment before exec."""
 
     os.fchdir(cwd_fd)
     os.close(cwd_fd)
     if linux_seccomp is not None:
-        _install_linux_validation_process_filter(*linux_seccomp)
+        spec_fn = _js_validation_seccomp_spec if js_profile else _linux_validation_seccomp_spec
+        _install_linux_validation_process_filter(*linux_seccomp, spec_fn=spec_fn)
+    if js_profile and sys.platform.startswith("linux") and root is not None:
+        # Defense-in-depth repo-write denial; the authoritative control remains
+        # the post-hoc repository-digest compare, so failure here is non-fatal.
+        _install_linux_validation_landlock_best_effort(root)
 
 
 def _promote_validation_fd(cwd_fd: int) -> int:
@@ -6454,6 +6939,107 @@ def _open_validation_cwd_fd(
                 os.close(opened_root_fd)
 
 
+def _resolve_validation_node_interpreter(root: Path) -> str:
+    """Resolve an absolute ``node`` from the scrubbed PATH, never inside the repo."""
+
+    env_path = validation_subprocess_environment(root).get("PATH", "")
+    canonical_root = os.path.realpath(root)
+    for entry in env_path.split(os.pathsep):
+        if not entry or not os.path.isabs(entry):
+            continue
+        candidate = os.path.join(entry, NODE_INTERPRETER)
+        if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
+            continue
+        real = os.path.realpath(candidate)
+        try:
+            if os.path.commonpath([canonical_root, real]) == canonical_root:
+                continue
+        except ValueError:
+            # Containment could not be determined -> fail closed on this
+            # candidate rather than executing a possibly-in-repo interpreter.
+            continue
+        return candidate
+    raise ValueError("validation_js_node_interpreter_unavailable")
+
+
+def _prepare_vitest_execution(
+    argv: list[str],
+    *,
+    cwd_fd: int,
+    root: Path,
+) -> tuple[list[str], list[int], list[tuple[str, int, int]]]:
+    """Resolve node+runner+config+targets by descriptor and build the node argv.
+
+    Every filesystem object (the ``vitest.mjs`` runner, an optional config and
+    each target) is opened O_NOFOLLOW as a regular file beneath the pinned cwd
+    descriptor; the descriptors are held (CLOEXEC) so their inodes cannot be
+    recycled, and ``(st_dev, st_ino)`` is recorded for a pre-launch equality
+    recheck.  Returns ``(node_argv, held_fds, inode_bindings)``.
+    """
+
+    if len(argv) < 2 or argv[0] != VITEST_LOGICAL_RUNNER or argv[1] != "run":
+        raise ValueError("validation_js_command_shape_invalid")
+    targets = list(argv[2:])
+    node_path = _resolve_validation_node_interpreter(root)
+    held: list[int] = []
+    bindings: list[tuple[str, int, int]] = []
+    config_relpath: str | None = None
+    try:
+        runner_fd, runner_meta = _open_validation_regular_file_fd(cwd_fd, VITEST_RUNNER_RELPATH)
+        held.append(runner_fd)
+        bindings.append((VITEST_RUNNER_RELPATH, runner_meta.st_dev, runner_meta.st_ino))
+        for candidate in VITEST_CONFIG_CANDIDATES:
+            try:
+                config_fd, config_meta = _open_validation_regular_file_fd(cwd_fd, candidate)
+            except (OSError, ValueError):
+                continue
+            held.append(config_fd)
+            bindings.append((candidate, config_meta.st_dev, config_meta.st_ino))
+            config_relpath = candidate
+            break
+        for target in targets:
+            if not isinstance(target, str) or target.startswith("-"):
+                raise ValueError("validation_js_target_invalid")
+            target_fd, target_meta = _open_validation_regular_file_fd(cwd_fd, target)
+            held.append(target_fd)
+            bindings.append((target, target_meta.st_dev, target_meta.st_ino))
+    except BaseException:
+        for fd in held:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+    node_argv = [node_path, VITEST_RUNNER_RELPATH, *VITEST_INJECTED_RUN_FLAGS]
+    if config_relpath is not None:
+        node_argv += ["--config", config_relpath]
+    if targets:
+        node_argv += ["--", *targets]
+    return node_argv, held, bindings
+
+
+def _recheck_vitest_inode_bindings(cwd_fd: int, bindings: list[tuple[str, int, int]]) -> None:
+    """Re-``fstatat`` each descriptor-verified path and assert the inode is stable."""
+
+    for relpath, dev, ino in bindings:
+        parts = [part for part in relpath.split("/") if part not in ("", ".")]
+        if not parts:
+            raise ValueError("validation_js_inode_binding_changed")
+        current = cwd_fd
+        intermediate: list[int] = []
+        try:
+            for name in parts[:-1]:
+                child_fd, _ = open_child_directory(current, name)
+                intermediate.append(child_fd)
+                current = child_fd
+            meta = os.stat(parts[-1], dir_fd=current, follow_symlinks=False)
+        finally:
+            for fd in intermediate:
+                os.close(fd)
+        if meta.st_dev != dev or meta.st_ino != ino or not stat.S_ISREG(meta.st_mode):
+            raise ValueError("validation_js_inode_binding_changed")
+
+
 def run_bounded_validation_process(
     argv: list[str],
     *,
@@ -6467,7 +7053,7 @@ def run_bounded_validation_process(
 
     if os.name != "posix" or threading.active_count() != 1:
         raise ValueError("secure_validation_process_isolation_not_supported")
-    contained_argv, linux_seccomp = _validation_containment_command(argv)
+    is_js_validation = bool(argv) and argv[0] == VITEST_LOGICAL_RUNNER
     cwd_fd = _open_validation_cwd_fd(
         root=root,
         cwd=cwd,
@@ -6476,9 +7062,26 @@ def run_bounded_validation_process(
     )
     process: subprocess.Popen[bytes] | None = None
     selector: selectors.BaseSelector | None = None
+    held_validation_fds: list[int] = []
     try:
+        if is_js_validation:
+            try:
+                exec_argv, held_validation_fds, inode_bindings = _prepare_vitest_execution(
+                    argv, cwd_fd=cwd_fd, root=root
+                )
+            except OSError as exc:
+                raise ValueError("validation_js_runner_resolution_failed") from exc
+        else:
+            exec_argv, inode_bindings = argv, []
+        contained_argv, linux_seccomp, network_proof, host_sandbox_proof = _validation_containment_command(
+            exec_argv, js_profile=is_js_validation, root=root
+        )
         try:
             try:
+                if is_js_validation:
+                    # Immediately before launch, prove the validated inode is the
+                    # inode that will execute (no swap during preparation).
+                    _recheck_vitest_inode_bindings(cwd_fd, inode_bindings)
                 process = subprocess.Popen(
                     contained_argv,
                     stdin=subprocess.DEVNULL,
@@ -6488,7 +7091,9 @@ def run_bounded_validation_process(
                     env=validation_subprocess_environment(root),
                     start_new_session=True,
                     pass_fds=(cwd_fd,),
-                    preexec_fn=lambda: _validation_child_setup(cwd_fd, linux_seccomp),
+                    preexec_fn=lambda: _validation_child_setup(
+                        cwd_fd, linux_seccomp, js_profile=is_js_validation, root=root
+                    ),
                 )
             except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
                 raise ValueError("validation_command_launch_failed") from exc
@@ -6554,8 +7159,10 @@ def run_bounded_validation_process(
                 timed_out = True
                 _terminate_validation_process(process)
             else:
-                # The host containment layer forbids new process trees.  The
-                # process-group kill remains defense in depth for the leader.
+                # The leader exited; reap its process group.  Unlike the pytest
+                # profile, the js_validation profile PERMITS spawning, so node
+                # workers and git/bash/python3 children are expected — the group
+                # kill (start_new_session=True) collects them.
                 _terminate_validation_process(process)
         try:
             process.wait(timeout=5)
@@ -6565,6 +7172,12 @@ def run_bounded_validation_process(
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired as exc:
                 raise ValueError("validation_process_termination_failed") from exc
+
+        # M-B: before the caller captures the post-run snapshot, best-effort reap
+        # the ENTIRE process group/session (incl. setpgid escapees on Linux) so a
+        # still-live descendant cannot mutate the tree AFTER the snapshot; the
+        # setsid-orphan residual is documented on the helper.
+        _reap_validation_process_tree(process)
 
         exit_code = int(process.returncode if process.returncode is not None else -1)
         if output_limit_exceeded:
@@ -6583,6 +7196,8 @@ def run_bounded_validation_process(
             timed_out=timed_out,
             output_limit_exceeded=output_limit_exceeded,
             termination_reason=termination_reason,
+            network_enforcement_proof=network_proof,
+            host_sandbox_proof=host_sandbox_proof,
         )
     except BaseException:
         if process is not None:
@@ -6599,12 +7214,239 @@ def run_bounded_validation_process(
     finally:
         if cwd_fd >= 0:
             os.close(cwd_fd)
+        # The runner/config/target descriptors are held open in the parent for
+        # the whole run so their inodes cannot be recycled; release them now.
+        for held_fd in held_validation_fds:
+            try:
+                os.close(held_fd)
+            except OSError:
+                pass
         if selector is not None:
             selector.close()
         if process is not None:
             for pipe in (process.stdout, process.stderr):
                 if pipe is not None and not pipe.closed:
                     pipe.close()
+
+
+VALIDATION_CONTROL_SURFACE_MAX_PATHS = 300_000
+VALIDATION_CONTROL_SURFACE_MAX_BYTES = 512 * 1024 * 1024
+
+
+def _git_worktree_common_dir(gitdir: Path) -> Path | None:
+    """Resolve ``<gitdir>/commondir`` (``$GIT_COMMON_DIR``) if present, else ``None``.
+
+    For a linked worktree git records the shared gitdir AUTHORITATIVELY in this
+    file — a path that is absolute, or relative to the gitdir — and sources the
+    shared ``hooks/``/``config`` from exactly there.  Covering this (rather than a
+    structural ``parent.parent`` guess) means the digest and the seatbelt cover
+    precisely where git executes hooks, even for a hand-crafted checkout whose
+    ``commondir`` points somewhere non-standard.
+    """
+
+    try:
+        text = (gitdir / "commondir").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    common = Path(text)
+    if not common.is_absolute():
+        common = gitdir / common
+    return lexical_absolute(common)
+
+
+def _resolve_git_control_surface_dirs(canonical_root: Path) -> list[Path]:
+    """Every directory whose contents form the git control surface for ``root``.
+
+    A plain ``.git`` directory is walked in place.  A ``.git`` GITFILE
+    (``gitdir: <path>`` — a linked worktree or submodule) points at an EXTERNAL
+    gitdir living OUTSIDE the repo root, whose ``hooks/``/``config`` still execute
+    against this working tree.  We resolve it and return both that gitdir and, for
+    a worktree, its common gitdir (where the shared hooks live) — otherwise a
+    hook planted in the external gitdir would be invisible to the digest.
+    """
+
+    dot_git = canonical_root / ".git"
+    dirs: list[Path] = []
+    try:
+        meta = os.lstat(dot_git)
+    except OSError:
+        return dirs
+    if stat.S_ISDIR(meta.st_mode):
+        return [dot_git]
+    if stat.S_ISREG(meta.st_mode):
+        try:
+            text = dot_git.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return dirs
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("gitdir:"):
+                continue
+            raw = stripped[len("gitdir:"):].strip()
+            if not raw:
+                break
+            gitdir = Path(raw)
+            if not gitdir.is_absolute():
+                gitdir = dot_git.parent / gitdir
+            gitdir = lexical_absolute(gitdir)
+            dirs.append(gitdir)
+            # Cover the shared common gitdir where git sources shared hooks/config.
+            # ``<gitdir>/commondir`` is the AUTHORITATIVE source git uses; prefer it
+            # over the structural ``<common>/worktrees/<name>`` -> ``<common>`` guess
+            # (an attacker-crafted checkout can point commondir at a non-standard
+            # dir the guess would miss).  Fall back to the structural guess only
+            # when commondir is absent.  A submodule (``<super>/.git/modules/<name>``)
+            # has no commondir and is its own gitdir -> already covered.
+            common = _git_worktree_common_dir(gitdir)
+            if common is not None:
+                dirs.append(common)
+            elif gitdir.parent.name == "worktrees":
+                dirs.append(gitdir.parent.parent)
+            break
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for candidate in dirs:
+        real = os.path.realpath(candidate)
+        if real not in seen:
+            seen.add(real)
+            unique.append(Path(real))
+    return unique
+
+
+def _validation_control_surface_digest(root: Path) -> str:
+    """Content digest of the VCS/control dirs that the normal baseline EXCLUDES.
+
+    ``repository_state_digest`` deliberately skips ``.git/``, ``.codexqb/``,
+    ``.pytest_cache/`` and ``__pycache__/``, so a validation target writing e.g.
+    ``.git/hooks/pre-push`` or ``.git/config`` (persistent, sandbox-escaping RCE)
+    would otherwise be invisible to the post-hoc mutation check.  For the
+    VALIDATION integrity check specifically we snapshot these prefixes
+    content-inclusive before and after the run — INCLUDING the external gitdir of
+    a linked worktree/submodule — so any change fails the validation closed
+    (``validation_command_mutated_repository``); a mutated repository can never
+    produce a signed success receipt.  ``.codexqb/`` (the Apply run's own tree,
+    written during validation and guaranteed by signed receipts / the hash-chained
+    event log) is excluded to avoid false positives.  The walk is bounded — a
+    pathological control surface fails closed (``validation_control_surface_unverifiable``)
+    rather than being silently truncated or DoS-ing the controller.
+    """
+
+    canonical_root = lexical_absolute(root)
+    bases: list[Path] = list(_resolve_git_control_surface_dirs(canonical_root))
+    for prefix in WORKSPACE_BASELINE_EXCLUDED_PREFIXES:
+        if prefix in (".codexqb/", ".git/"):
+            continue
+        bases.append(canonical_root / prefix.rstrip("/"))
+    # A worktree's common gitdir already CONTAINS ``worktrees/<name>`` — drop any
+    # base nested under another so its subtree is not walked (and byte-capped) twice.
+    resolved_bases: list[tuple[str, Path]] = sorted(
+        ((os.path.realpath(base), base) for base in bases), key=lambda item: len(item[0])
+    )
+    bases = []
+    kept_reals: list[str] = []
+    for real, base in resolved_bases:
+        if any(real == kept or real.startswith(kept.rstrip(os.sep) + os.sep) for kept in kept_reals):
+            continue
+        kept_reals.append(real)
+        bases.append(base)
+
+    hasher = hashlib.sha256()
+    entries: list[tuple[str, ...]] = []
+    paths_seen = 0
+    bytes_read = 0
+
+    def _record(path: Path) -> None:
+        nonlocal bytes_read
+        # Pass the remaining byte budget so an over-budget file fails closed
+        # BEFORE it is read (R2), then account the bytes actually hashed.
+        entry = _control_surface_entry(
+            canonical_root, path, max_bytes=VALIDATION_CONTROL_SURFACE_MAX_BYTES - bytes_read
+        )
+        if entry and entry[1] == "R" and len(entry) >= 4:
+            try:
+                bytes_read += int(entry[3])
+            except (ValueError, IndexError):
+                pass
+            if bytes_read > VALIDATION_CONTROL_SURFACE_MAX_BYTES:
+                raise ValueError("validation_control_surface_unverifiable")
+        entries.append(entry)
+
+    # Hash the ``.git`` node itself when it is a GITFILE/symlink (not a plain dir,
+    # whose contents are already walked), so a target that REWRITES ``.git`` to
+    # re-point at a different gitdir is caught directly.
+    dot_git = canonical_root / ".git"
+    try:
+        dot_git_meta = os.lstat(dot_git)
+    except OSError:
+        dot_git_meta = None
+    if dot_git_meta is not None and not stat.S_ISDIR(dot_git_meta.st_mode):
+        _record(dot_git)
+        paths_seen += 1
+    for base in bases:
+        try:
+            meta = os.lstat(base)
+        except OSError:
+            continue
+        if not stat.S_ISDIR(meta.st_mode):
+            _record(base)
+            paths_seen += 1
+            continue
+        for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+            dirnames.sort()
+            for name in sorted(dirnames) + sorted(filenames):
+                paths_seen += 1
+                if paths_seen > VALIDATION_CONTROL_SURFACE_MAX_PATHS:
+                    raise ValueError("validation_control_surface_unverifiable")
+                _record(Path(dirpath) / name)
+    for entry in sorted(entries):
+        # Length-prefixed, ASCII-safe field framing (no control-character
+        # separators) so the digest is unambiguous without embedding bytes that
+        # a secret/obfuscation scanner would flag.
+        for field in entry:
+            encoded = field.encode("utf-8", "surrogatepass")
+            hasher.update(str(len(encoded)).encode("ascii"))
+            hasher.update(b":")
+            hasher.update(encoded)
+        hasher.update(b";")
+    return hasher.hexdigest()
+
+
+def _control_surface_entry(
+    root: Path, path: Path, *, max_bytes: int | None = None
+) -> tuple[str, ...]:
+    try:
+        rel = path.relative_to(root).as_posix()
+    except ValueError:
+        rel = path.as_posix()
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return (rel, "E")
+    mode = str(stat.S_IMODE(st.st_mode))
+    if stat.S_ISLNK(st.st_mode):
+        try:
+            return (rel, "L", mode, os.readlink(path))
+        except OSError:
+            return (rel, "L", mode, "?")
+    if stat.S_ISDIR(st.st_mode):
+        return (rel, "D", mode)
+    if stat.S_ISREG(st.st_mode):
+        # R2: fail closed on a single file that alone would blow the remaining
+        # byte budget — BEFORE reading it — so the cap can never be overshot by
+        # one file's own size.
+        if max_bytes is not None and st.st_size > max_bytes:
+            raise ValueError("validation_control_surface_unverifiable")
+        file_hash = hashlib.sha256()
+        try:
+            with open(path, "rb", closefd=True) as handle:
+                for chunk in iter(lambda: handle.read(1 << 16), b""):
+                    file_hash.update(chunk)
+        except OSError:
+            return (rel, "R", mode, "unreadable")
+        return (rel, "R", mode, str(st.st_size), file_hash.hexdigest())
+    return (rel, "O", mode)
 
 
 def execute_planned_validation(
@@ -6638,7 +7480,9 @@ def execute_planned_validation(
         if len(commands) != 1:
             raise ValueError(f"validation_command_not_planned={task_id}:{validation_id}")
         command = commands[0]
-        if not command_is_safe(command, handle.root):
+        # EXECUTE time: the command is about to run, so its targets MUST exist
+        # (closes I-2 at the point of use).
+        if not command_is_safe(command, handle.root, require_target_exists=True):
             raise ValueError(f"unsafe_validation_command={task_id}:{validation_id}")
         change_set, repository_evidence = load_current_change_set(handle, task)
         normalized_cwd, command_cwd = normalized_command_cwd(handle.root, command.get("cwd"))
@@ -6650,6 +7494,9 @@ def execute_planned_validation(
             str(change_set["review_package_sha256"]),
             before_at,
         )
+        # Snapshot the control dirs (.git/, .codexqb/, ...) that repository_state_digest
+        # excludes, so a validation that writes e.g. .git/hooks is detected (C2).
+        control_surface_before = _validation_control_surface_digest(handle.root)
         start_event = append_event_at(
             handle,
             {
@@ -6714,6 +7561,12 @@ def execute_planned_validation(
         finished_at = utc_now()
         current_change_set, current_repository_evidence = load_current_change_set(handle, task)
         if current_change_set.get("repository_state_digest") != change_set.get("repository_state_digest"):
+            raise ValueError(f"validation_command_mutated_repository={task_id}:{validation_id}")
+        # C2: a mutation of the excluded control dirs (e.g. .git/hooks/pre-push,
+        # .git/config core.hooksPath) during validation fails closed — the signed
+        # receipt can never attest success over a tampered repository, even when
+        # Landlock preventive denial was unavailable.
+        if _validation_control_surface_digest(handle.root) != control_surface_before:
             raise ValueError(f"validation_command_mutated_repository={task_id}:{validation_id}")
         after_at = utc_now()
         after_snapshot = repository_receipt_snapshot(
@@ -6791,9 +7644,9 @@ def execute_planned_validation(
                 "issued_at": utc_now(),
                 "observer": CONTROLLER_OBSERVER,
                 "observation_scope": VALIDATION_OBSERVATION_SCOPE,
-                "host_sandbox_proof": NOT_OBSERVED,
+                "host_sandbox_proof": process_result.host_sandbox_proof,
                 "approval_proof": NOT_OBSERVED,
-                "network_enforcement_proof": NOT_OBSERVED,
+                "network_enforcement_proof": process_result.network_enforcement_proof,
                 "run_binding": receipt_run_binding(handle),
                 "task_binding": receipt_task_binding(task),
                 "producer_binding": producer_binding,
@@ -7860,8 +8713,20 @@ def finalize_apply_run(run_dir: Path, actor: str, evidence: list[str] | None = N
         return event
 
 
-def command_is_safe(command: object, root: Path | None = None, *, evidence: bool = False) -> bool:
-    return isinstance(command, dict) and safe_validation_command_item(command, root=root, evidence=evidence)
+def command_is_safe(
+    command: object,
+    root: Path | None = None,
+    *,
+    evidence: bool = False,
+    require_target_exists: bool = False,
+) -> bool:
+    # ``require_target_exists`` closes I-2 by demanding the validation targets
+    # exist — set only at execute time (they are about to run).  Create-time
+    # queue validation leaves it False so plan-first "proposed" targets pass
+    # well-formedness while their files are still to be written.
+    return isinstance(command, dict) and safe_validation_command_item(
+        command, root=root, evidence=evidence, require_target_exists=require_target_exists
+    )
 
 
 def validate_dispatch_packet(run_dir: Path, run: dict[str, object], task: dict[str, object], errors: list[str]) -> None:

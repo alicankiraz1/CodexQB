@@ -1,0 +1,33 @@
+# Reproducible Linux evidence for the js_validation containment profile.
+#
+# ubuntu-24.04 mirrors the CI behavior lane and ships Python 3.12; Node 22 is
+# added from NodeSource.  The container is *normally networked* on purpose: the
+# proof is that outbound INET sockets still fail closed once the seccomp filter
+# is installed (the filter needs NO_NEW_PRIVS, not a user namespace, so it works
+# under Docker's default profile without --privileged).
+#
+# Repo-write PREVENTION for the (spawning-permitted) js_validation profile relies
+# on Landlock, and the validation now FAILS CLOSED without it (C-B).  Docker's
+# default seccomp profile returns EPERM for the landlock_* syscalls, so run with
+# seccomp disabled so Landlock can be probed/installed:
+#
+#   docker build -f tests/docker/Dockerfile.js-validation -t codexqb-jsval .
+#   docker run --rm --security-opt seccomp=unconfined codexqb-jsval
+#
+# Add `-e CODEXQB_JS_REAL_VITEST=1` to also run the real upstream Vitest smoke
+# (B2) under the profile.  The kernel must be >= 5.13 (6.x reports ABI 3+).
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates curl git python3 xz-utils \
+ && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /repo
+COPY . /repo
+
+# Default: run the JavaScript-validation behavior tests (real exec, no mocks).
+CMD ["python3", "tests/docker/run_js_validation_proof.py"]

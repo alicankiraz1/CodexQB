@@ -28,6 +28,32 @@ REVIEW_COMPLETION_OBSERVATION_SCOPE = "controller_observed_reviewer_completion_a
 
 CONTROLLER_OBSERVER = "codexqb_controller"
 NOT_OBSERVED = "not_observed"
+# Network-enforcement proofs a *validation* receipt may carry when the
+# cross-platform JavaScript validation profile kernel-denies outbound INET
+# sockets: seccomp (Linux) or the sandbox-exec seatbelt (macOS).  Every other
+# receipt proof field — and every review-completion receipt — stays fail-closed
+# at ``not_observed``; arbitrary strings remain rejected.
+ENFORCED_SECCOMP_INET_DENY = "enforced_seccomp_inet_deny"
+ENFORCED_SEATBELT_DENY_NETWORK = "enforced_seatbelt_deny_network"
+JS_VALIDATION_NETWORK_ENFORCEMENT_PROOFS = frozenset(
+    {ENFORCED_SECCOMP_INET_DENY, ENFORCED_SEATBELT_DENY_NETWORK}
+)
+# Repository-write prevention status recorded in ``host_sandbox_proof`` of a
+# *validation* receipt, so an ``enforced_*`` network claim is never mistaken for
+# an *also*-enforced repo-write claim.  Repo writes must be PREVENTIVELY denied:
+# on macOS the seatbelt does so; on Linux Landlock does so, and when the kernel
+# lacks Landlock the JS validation FAILS CLOSED (no execution, no receipt) rather
+# than relying on the post-hoc digest as a substitute — so a JS validation receipt
+# can only ever attest to real prevention.  Every other proof field stays
+# ``not_observed``.
+ENFORCED_SEATBELT_REPO_WRITE_DENY = "enforced_seatbelt_repo_write_deny"
+ENFORCED_LANDLOCK_REPO_WRITE_DENY = "enforced_landlock_repo_write_deny"
+JS_VALIDATION_HOST_SANDBOX_PROOFS = frozenset(
+    {
+        ENFORCED_SEATBELT_REPO_WRITE_DENY,
+        ENFORCED_LANDLOCK_REPO_WRITE_DENY,
+    }
+)
 RECEIPT_MAC_FIELD = "receipt_mac"
 MASTER_KEY_BYTES = 32
 
@@ -347,9 +373,22 @@ def _validate_common(
         errors.append("invalid_receipt_observer")
     if value.get("observation_scope") != observation_scope:
         errors.append("invalid_observation_scope")
-    for field in ("host_sandbox_proof", "approval_proof", "network_enforcement_proof"):
-        if value.get(field) != NOT_OBSERVED:
-            errors.append(f"invalid_nonclaim={field}")
+    if value.get("approval_proof") != NOT_OBSERVED:
+        errors.append("invalid_nonclaim=approval_proof")
+    # A validation receipt may promote two fields beyond ``not_observed`` — and
+    # only to recognized JS-profile proofs: ``network_enforcement_proof`` to a
+    # kernel-network-denial proof, and ``host_sandbox_proof`` to a repo-write
+    # prevention status.  Review-completion receipts (and any other value) stay
+    # fail-closed.
+    allowed_network_proofs = {NOT_OBSERVED}
+    allowed_host_sandbox_proofs = {NOT_OBSERVED}
+    if kind == VALIDATION_RECEIPT_KIND:
+        allowed_network_proofs = allowed_network_proofs | JS_VALIDATION_NETWORK_ENFORCEMENT_PROOFS
+        allowed_host_sandbox_proofs = allowed_host_sandbox_proofs | JS_VALIDATION_HOST_SANDBOX_PROOFS
+    if value.get("network_enforcement_proof") not in allowed_network_proofs:
+        errors.append("invalid_nonclaim=network_enforcement_proof")
+    if value.get("host_sandbox_proof") not in allowed_host_sandbox_proofs:
+        errors.append("invalid_nonclaim=host_sandbox_proof")
     if require_mac and not _is_hash(value.get(RECEIPT_MAC_FIELD)):
         errors.append("invalid_receipt_mac")
     _validate_run_binding(value.get("run_binding"), errors)

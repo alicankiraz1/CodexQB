@@ -388,6 +388,11 @@ class ValidationState:
     root: Path
     mode: str
     strict: bool
+    # When True (only via the opt-in --require-targets-exist CLI flag), target-
+    # bearing validation commands must reference EXISTING targets — the SAST
+    # static I-2 gate.  Default False keeps plan-first validation (goal compile,
+    # create_apply_run) on well-formedness only, so "proposed" targets pass.
+    require_targets_exist: bool = False
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     metrics: dict[str, int | str] = field(default_factory=dict)
@@ -654,8 +659,16 @@ def implementation_surface_path(value: str) -> str | None:
     return target
 
 
-def exact_validation_command(value: str) -> bool:
-    return shared_exact_validation_command(value)
+def exact_validation_command(
+    value: str,
+    *,
+    root: Path | None = None,
+    cwd: str | None = None,
+    require_target_exists: bool = False,
+) -> bool:
+    return shared_exact_validation_command(
+        value, root=root, cwd=cwd, require_target_exists=require_target_exists
+    )
 
 
 def safe_validation_argv(argv: object) -> bool:
@@ -667,15 +680,24 @@ def safe_validation_command_item(
     *,
     root: Path | None = None,
     allow_legacy: bool = False,
+    require_target_exists: bool = False,
 ) -> bool:
-    return shared_safe_validation_command_item(item, root=root, allow_legacy=allow_legacy)
+    return shared_safe_validation_command_item(
+        item, root=root, allow_legacy=allow_legacy, require_target_exists=require_target_exists
+    )
 
 
-def validation_probe_is_safe(value: str) -> bool:
+def validation_probe_is_safe(
+    value: str,
+    *,
+    root: Path | None = None,
+    cwd: str | None = None,
+    require_target_exists: bool = False,
+) -> bool:
     probe = value.strip()
     if re.fullmatch(r"VAL-\d{2}", probe):
         return True
-    return exact_validation_command(probe)
+    return exact_validation_command(probe, root=root, cwd=cwd, require_target_exists=require_target_exists)
 
 
 def extract_fenced_json_after_heading(text: str, heading: str) -> tuple[object | None, str | None]:
@@ -959,7 +981,20 @@ def validate_implementation_contract(
             expected = item.get("expected_result", item.get("expected_exit_code", ""))
             if not re.fullmatch(r"VAL-\d{2}", command_id):
                 state.warning(f"subplan_invalid_validation_command_id={state.rel(path)}::{command_id or 'missing'}")
-            if safe_validation_command_item(item, root=state.root, allow_legacy=not state.strict):
+            # Existence is enforced ONLY via the opt-in --require-targets-exist flag
+            # (the SAST static I-2 gate), never merely because --strict is set: the
+            # CodexQB workflow runs strict validation at PLAN time over still-
+            # "proposed" targets — goal compile (stage_prerequisite_blockers ->
+            # validator --strict) and create_apply_run (step4 --strict) validate
+            # before the test files are written, and neither passes the flag.  I-2
+            # is additionally closed at execute time (command_is_safe
+            # require_target_exists=True) for CodexQB's own apply execution.
+            if safe_validation_command_item(
+                item,
+                root=state.root,
+                allow_legacy=not state.strict,
+                require_target_exists=state.require_targets_exist,
+            ):
                 exact_commands += 1
             else:
                 state.warning(f"subplan_missing_exact_validation_command={state.rel(path)}")
@@ -1576,7 +1611,9 @@ def validate_parent_traceability(
                 state.warning(f"parent_trace_invalid_subplan={state.rel(index_path)}::{covered_by or 'missing'}")
             elif resolved is not None:
                 covered_refs.add(state.rel(resolved))
-            if not exact_validation_command(command):
+            if not exact_validation_command(
+                command, root=state.root, cwd=".", require_target_exists=state.require_targets_exist
+            ):
                 state.warning(f"parent_trace_invalid_validation_command={state.rel(index_path)}::{signal or 'unknown'}")
             if not cell_has_evidence(status):
                 state.warning(f"parent_trace_missing_status={state.rel(index_path)}::{signal or 'unknown'}")
@@ -1652,9 +1689,19 @@ def validate_framework_matrix_rows(state: ValidationState, index_path: Path, hea
             state.warning(f"framework_matrix_missing_{column}={state.rel(index_path)}::{capability}")
         if wrapper and implementation_surface_path(wrapper) is None:
             state.warning(f"framework_matrix_invalid_wrapper_boundary={state.rel(index_path)}::{capability}")
-        if validation and not validation_probe_is_safe(validation):
+        if validation and not validation_probe_is_safe(
+            validation, root=state.root, cwd=".", require_target_exists=state.require_targets_exist
+        ):
             state.warning(f"framework_matrix_invalid_validation={state.rel(index_path)}::{capability}")
-        if not missing_columns and wrapper and validation and implementation_surface_path(wrapper) is not None and validation_probe_is_safe(validation):
+        if (
+            not missing_columns
+            and wrapper
+            and validation
+            and implementation_surface_path(wrapper) is not None
+            and validation_probe_is_safe(
+                validation, root=state.root, cwd=".", require_target_exists=state.require_targets_exist
+            )
+        ):
             valid_rows += 1
     return valid_rows
 
@@ -1685,12 +1732,16 @@ def validate_invariant_register_rows(state: ValidationState, index_path: Path, h
         ]:
             if not cell_has_evidence(value):
                 state.warning(f"algorithmic_invariant_missing_{column}={state.rel(index_path)}::{row_id}")
-        if probe and not validation_probe_is_safe(probe):
+        if probe and not validation_probe_is_safe(
+            probe, root=state.root, cwd=".", require_target_exists=state.require_targets_exist
+        ):
             state.warning(f"algorithmic_invariant_invalid_validation_probe={state.rel(index_path)}::{row_id}")
         if (
             re.fullmatch(r"INV-\d{3}", invariant_id)
             and all(cell_has_evidence(value) for value in [scope, condition, risk, probe])
-            and validation_probe_is_safe(probe)
+            and validation_probe_is_safe(
+                probe, root=state.root, cwd=".", require_target_exists=state.require_targets_exist
+            )
         ):
             valid_rows += 1
     return valid_rows
@@ -2238,11 +2289,29 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Validation scope.",
     )
     parser.add_argument("--strict", action="store_true", help="Treat quality warnings as failures.")
+    parser.add_argument(
+        "--require-targets-exist",
+        action="store_true",
+        help=(
+            "Require validation-command targets to exist on disk (SAST static I-2 "
+            "gate). Off by default so plan-first validation accepts proposed targets."
+        ),
+    )
     return parser.parse_args(argv)
 
 
-def run_validation(root: Path, mode: str, strict: bool = False) -> int:
-    state = ValidationState(root=root.resolve(), mode=mode, strict=strict)
+def run_validation(
+    root: Path,
+    mode: str,
+    strict: bool = False,
+    require_targets_exist: bool = False,
+) -> int:
+    state = ValidationState(
+        root=root.resolve(),
+        mode=mode,
+        strict=strict,
+        require_targets_exist=require_targets_exist,
+    )
 
     if mode == "step1":
         validate_step1(state)
@@ -2269,7 +2338,7 @@ def run_validation(root: Path, mode: str, strict: bool = False) -> int:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    return run_validation(Path(args.root), args.mode, args.strict)
+    return run_validation(Path(args.root), args.mode, args.strict, args.require_targets_exist)
 
 
 if __name__ == "__main__":

